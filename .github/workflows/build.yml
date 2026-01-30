@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ANDROID_SDK_ROOT: ${{ github.workspace }}/.android_sdk
+      ANDROID_LIB_DUMP_REPO: https://github.com/example/android-lib-dump
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,9 +40,15 @@ jobs:
 
       - name: Clone android libs dump
         run: |
-          git clone --depth 1 https://github.com/example/android-lib-dump "${GITHUB_WORKSPACE}/core/android-lib-dump"
+          set +e
+          git clone --depth 1 "${ANDROID_LIB_DUMP_REPO}" "${GITHUB_WORKSPACE}/core/android-lib-dump"
+          if [[ $? -ne 0 ]]; then
+            echo "ANDROID_LIB_DUMP_REPO clone failed, skip symbol generation" >&2
+            echo "SKIP_SYMBOLS=1" >> $GITHUB_ENV
+          fi
 
       - name: Generate compatibility header
+        if: ${{ env.SKIP_SYMBOLS != '1' }}
         run: |
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           python3 "${GITHUB_WORKSPACE}/core/scripts/gen_symbols.py" \
