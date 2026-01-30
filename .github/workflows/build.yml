@@ -68,13 +68,17 @@ jobs:
             -DMIDRAW_BUILD_OVERLAY=ON
           cmake --build "${GITHUB_WORKSPACE}/build"
 
+      - name: Collect artifacts
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          find "${GITHUB_WORKSPACE}/build" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" \) -exec cp {} "${GITHUB_WORKSPACE}/dist" \;
+          cp "${GITHUB_WORKSPACE}/include/generated_symbols.h" "${GITHUB_WORKSPACE}/dist" || true
+          echo "Collected files:"
+          ls -la "${GITHUB_WORKSPACE}/dist"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android-build
           path: |
-            build/libmidraw.so
-            build/libmidraw.a
-            build/overlay_engine
-            build/benchmark
-            include/generated_symbols.h
+            dist/*
