@@ -1,5 +1,6 @@
 #include "generated_symbols.h"
 
+#include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -15,7 +16,8 @@
 struct ASurfaceControl;
 struct ASurfaceTransaction;
 
-using PFN_ASurfaceControl_create = ASurfaceControl* (*)(const char* name, ASurfaceControl* parent);
+using PFN_ASurfaceControl_create = ASurfaceControl* (*)(ASurfaceControl* parent,
+                                                        const char* debug_name);
 using PFN_ASurfaceControl_release = void (*)(ASurfaceControl* control);
 using PFN_ASurfaceTransaction_create = ASurfaceTransaction* (*)();
 using PFN_ASurfaceTransaction_release = void (*)(ASurfaceTransaction* transaction);
@@ -30,6 +32,10 @@ using PFN_ASurfaceTransaction_setLayer = void (*)(ASurfaceTransaction* transacti
                                                  ASurfaceControl* control,
                                                  int32_t layer);
 using PFN_ASurfaceTransaction_apply = void (*)(ASurfaceTransaction* transaction);
+using PFN_ASurfaceTransaction_setBuffer = void (*)(ASurfaceTransaction* transaction,
+                                                   ASurfaceControl* control,
+                                                   AHardwareBuffer* buffer,
+                                                   int acquire_fence_fd);
 using PFN_ASurfaceTransaction_setAlpha = void (*)(ASurfaceTransaction* transaction,
                                                   ASurfaceControl* control,
                                                   float alpha);
@@ -46,6 +52,17 @@ using PFN_ANativeWindow_setBuffersGeometry = int32_t (*)(ANativeWindow* window,
                                                         int32_t width,
                                                         int32_t height,
                                                         int32_t format);
+using PFN_AHardwareBuffer_allocate = int (*)(const AHardwareBuffer_Desc* desc,
+                                             AHardwareBuffer** outBuffer);
+using PFN_AHardwareBuffer_describe = void (*)(const AHardwareBuffer* buffer,
+                                              AHardwareBuffer_Desc* outDesc);
+using PFN_AHardwareBuffer_release = void (*)(AHardwareBuffer* buffer);
+using PFN_AHardwareBuffer_lock = int (*)(AHardwareBuffer* buffer,
+                                         uint64_t usage,
+                                         int32_t fence,
+                                         const ARect* rect,
+                                         void** out);
+using PFN_AHardwareBuffer_unlock = int (*)(AHardwareBuffer* buffer, int32_t* fence);
 
 struct SpObject {
   void* ptr;
@@ -92,6 +109,7 @@ struct EngineSymbols {
   PFN_ASurfaceTransaction_setVisibility ASurfaceTransaction_setVisibility = nullptr;
   PFN_ASurfaceTransaction_setLayer ASurfaceTransaction_setLayer = nullptr;
   PFN_ASurfaceTransaction_apply ASurfaceTransaction_apply = nullptr;
+  PFN_ASurfaceTransaction_setBuffer ASurfaceTransaction_setBuffer = nullptr;
   PFN_ASurfaceTransaction_setAlpha ASurfaceTransaction_setAlpha = nullptr;
   PFN_ASurfaceTransaction_setOpaque ASurfaceTransaction_setOpaque = nullptr;
   PFN_ANativeWindow_fromSurfaceControl ANativeWindow_fromSurfaceControl = nullptr;
@@ -99,6 +117,11 @@ struct EngineSymbols {
   PFN_ANativeWindow_unlockAndPost ANativeWindow_unlockAndPost = nullptr;
   PFN_ANativeWindow_release ANativeWindow_release = nullptr;
   PFN_ANativeWindow_setBuffersGeometry ANativeWindow_setBuffersGeometry = nullptr;
+  PFN_AHardwareBuffer_allocate AHardwareBuffer_allocate = nullptr;
+  PFN_AHardwareBuffer_describe AHardwareBuffer_describe = nullptr;
+  PFN_AHardwareBuffer_release AHardwareBuffer_release = nullptr;
+  PFN_AHardwareBuffer_lock AHardwareBuffer_lock = nullptr;
+  PFN_AHardwareBuffer_unlock AHardwareBuffer_unlock = nullptr;
 
   PFN_String8_ctor String8_ctor = nullptr;
   PFN_String8_dtor String8_dtor = nullptr;
@@ -121,6 +144,9 @@ struct EngineState {
   EngineSymbols symbols;
   ANativeWindow* window = nullptr;
   ASurfaceControl* surface = nullptr;
+  AHardwareBuffer* buffer = nullptr;
+  AHardwareBuffer_Desc buffer_desc{};
+  bool use_ahb = false;
   int width = 0;
   int height = 0;
   int stride = 0;
@@ -300,6 +326,12 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceTransaction_apply : empty_list,
                         "ASurfaceTransaction_apply"));
+  s.ASurfaceTransaction_setBuffer = reinterpret_cast<PFN_ASurfaceTransaction_setBuffer>(
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ASurfaceTransaction_setBuffer"));
   s.ASurfaceTransaction_setAlpha = reinterpret_cast<PFN_ASurfaceTransaction_setAlpha>(
       load_symbol_multi(s.libgui,
                         s.libandroid,
@@ -331,6 +363,22 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ANativeWindow_setBuffersGeometry : empty_list,
                         "ANativeWindow_setBuffersGeometry"));
+
+  s.AHardwareBuffer_allocate = reinterpret_cast<PFN_AHardwareBuffer_allocate>(
+      load_symbol_multi(s.libandroid, s.libnativewindow, s.libgui, empty_list,
+                        "AHardwareBuffer_allocate"));
+  s.AHardwareBuffer_describe = reinterpret_cast<PFN_AHardwareBuffer_describe>(
+      load_symbol_multi(s.libandroid, s.libnativewindow, s.libgui, empty_list,
+                        "AHardwareBuffer_describe"));
+  s.AHardwareBuffer_release = reinterpret_cast<PFN_AHardwareBuffer_release>(
+      load_symbol_multi(s.libandroid, s.libnativewindow, s.libgui, empty_list,
+                        "AHardwareBuffer_release"));
+  s.AHardwareBuffer_lock = reinterpret_cast<PFN_AHardwareBuffer_lock>(
+      load_symbol_multi(s.libandroid, s.libnativewindow, s.libgui, empty_list,
+                        "AHardwareBuffer_lock"));
+  s.AHardwareBuffer_unlock = reinterpret_cast<PFN_AHardwareBuffer_unlock>(
+      load_symbol_multi(s.libandroid, s.libnativewindow, s.libgui, empty_list,
+                        "AHardwareBuffer_unlock"));
 
   if (s.libutils) {
     s.String8_ctor = reinterpret_cast<PFN_String8_ctor>(
@@ -409,16 +457,23 @@ static bool load_symbols(EngineSymbols& s) {
 
 static bool create_surface_asurface(EngineState& state, int width, int height) {
   EngineSymbols& s = state.symbols;
+  const bool can_window =
+      s.ANativeWindow_fromSurfaceControl && s.ANativeWindow_lock && s.ANativeWindow_unlockAndPost;
+  const bool can_ahb = s.ASurfaceTransaction_setBuffer && s.AHardwareBuffer_allocate &&
+                       s.AHardwareBuffer_lock && s.AHardwareBuffer_unlock &&
+                       s.AHardwareBuffer_release && s.AHardwareBuffer_describe;
   if (!s.ASurfaceControl_create || !s.ASurfaceTransaction_create ||
-      !s.ANativeWindow_fromSurfaceControl) {
-    fprintf(stderr, "ASurfaceControl symbols missing: create=%p tx=%p window=%p\n",
+      (!can_window && !can_ahb)) {
+    fprintf(stderr,
+            "ASurfaceControl symbols missing: create=%p tx=%p window=%p ahb=%p\n",
             reinterpret_cast<void*>(s.ASurfaceControl_create),
             reinterpret_cast<void*>(s.ASurfaceTransaction_create),
-            reinterpret_cast<void*>(s.ANativeWindow_fromSurfaceControl));
+            reinterpret_cast<void*>(s.ANativeWindow_fromSurfaceControl),
+            reinterpret_cast<void*>(s.ASurfaceTransaction_setBuffer));
     return false;
   }
 
-  state.surface = s.ASurfaceControl_create("SystemProfiler", nullptr);
+  state.surface = s.ASurfaceControl_create(nullptr, "SystemProfiler");
   if (!state.surface) {
     fprintf(stderr, "ASurfaceControl_create returned null\n");
     return false;
@@ -456,15 +511,37 @@ static bool create_surface_asurface(EngineState& state, int width, int height) {
     s.ASurfaceTransaction_release(tx);
   }
 
-  state.window = s.ANativeWindow_fromSurfaceControl(state.surface);
-  if (!state.window) {
-    fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
+  if (can_window && s.ANativeWindow_fromSurfaceControl) {
+    state.window = s.ANativeWindow_fromSurfaceControl(state.surface);
+    if (!state.window) {
+      fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
+      return false;
+    }
+    if (s.ANativeWindow_setBuffersGeometry) {
+      s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+    }
+    return true;
+  }
+
+  if (!can_ahb) {
     return false;
   }
 
-  if (s.ANativeWindow_setBuffersGeometry) {
-    s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+  memset(&state.buffer_desc, 0, sizeof(state.buffer_desc));
+  state.buffer_desc.width = static_cast<uint32_t>(width);
+  state.buffer_desc.height = static_cast<uint32_t>(height);
+  state.buffer_desc.layers = 1;
+  state.buffer_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+  state.buffer_desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                            AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+
+  if (s.AHardwareBuffer_allocate(&state.buffer_desc, &state.buffer) != 0 || !state.buffer) {
+    fprintf(stderr, "AHardwareBuffer_allocate failed\n");
+    return false;
   }
+  s.AHardwareBuffer_describe(state.buffer, &state.buffer_desc);
+  state.use_ahb = true;
   return true;
 }
 
@@ -540,6 +617,28 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
 }
 
 static bool lock_buffer(EngineState& state) {
+  if (state.use_ahb) {
+    if (!state.buffer || !state.symbols.AHardwareBuffer_lock) {
+      return false;
+    }
+    void* out = nullptr;
+    ARect rect{0, 0, static_cast<int32_t>(state.buffer_desc.width),
+               static_cast<int32_t>(state.buffer_desc.height)};
+    const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                           AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+    if (state.symbols.AHardwareBuffer_lock(state.buffer, usage, -1, &rect, &out) != 0) {
+      return false;
+    }
+    state.width = static_cast<int>(state.buffer_desc.width);
+    state.height = static_cast<int>(state.buffer_desc.height);
+    state.stride = static_cast<int>(state.buffer_desc.stride);
+    if (state.stride == 0) {
+      state.stride = state.width;
+    }
+    state.pixels = reinterpret_cast<uint32_t*>(out);
+    return state.pixels != nullptr;
+  }
+
   if (!state.window || !state.symbols.ANativeWindow_lock) {
     return false;
   }
@@ -554,6 +653,29 @@ static bool lock_buffer(EngineState& state) {
 }
 
 static void unlock_post(EngineState& state) {
+  if (state.use_ahb) {
+    int fence = -1;
+    if (state.symbols.AHardwareBuffer_unlock) {
+      state.symbols.AHardwareBuffer_unlock(state.buffer, &fence);
+      if (fence >= 0) {
+        close(fence);
+      }
+    }
+    if (state.symbols.ASurfaceTransaction_create && state.symbols.ASurfaceTransaction_apply &&
+        state.symbols.ASurfaceTransaction_setBuffer) {
+      ASurfaceTransaction* tx = state.symbols.ASurfaceTransaction_create();
+      if (tx) {
+        state.symbols.ASurfaceTransaction_setBuffer(tx, state.surface, state.buffer, -1);
+        state.symbols.ASurfaceTransaction_apply(tx);
+        if (state.symbols.ASurfaceTransaction_release) {
+          state.symbols.ASurfaceTransaction_release(tx);
+        }
+      }
+    }
+    state.pixels = nullptr;
+    return;
+  }
+
   if (state.window && state.symbols.ANativeWindow_unlockAndPost) {
     state.symbols.ANativeWindow_unlockAndPost(state.window);
   }
