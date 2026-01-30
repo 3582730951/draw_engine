@@ -2,19 +2,43 @@
 
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
+#include <cxxabi.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <sys/system_properties.h>
-#include <time.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include <unordered_map>
+#include <vector>
+#include <time.h>
 
 // Forward declarations to avoid compile-time linkage to SurfaceControl headers.
 struct ASurfaceControl;
 struct ASurfaceTransaction;
+
+namespace android {
+class Parcelable {
+ public:
+  virtual ~Parcelable() = default;
+};
+
+struct LayerMetadata : public Parcelable {
+  std::unordered_map<uint32_t, std::vector<uint8_t>> mMap;
+  LayerMetadata() = default;
+  LayerMetadata(const LayerMetadata&) = default;
+  LayerMetadata(LayerMetadata&&) = default;
+  LayerMetadata& operator=(const LayerMetadata&) = default;
+  LayerMetadata& operator=(LayerMetadata&&) = default;
+  ~LayerMetadata() override = default;
+};
+}  // namespace android
 
 using PFN_ASurfaceControl_create = ASurfaceControl* (*)(ASurfaceControl* parent,
                                                         const char* debug_name);
@@ -90,6 +114,48 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
                 void* parent,
                 int32_t window_type,
                 int32_t owner_uid);
+using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent =
+    int32_t (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                SpObject* out_surface,
+                int32_t flags,
+                void* parent,
+                const void* metadata);
+using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
+    int32_t (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                SpObject* out_surface,
+                int32_t flags,
+                void* parent,
+                const void* metadata,
+                uint32_t* out_transform_hint);
+using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
+    int32_t (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                SpObject* out_surface,
+                int32_t flags,
+                const SpObject* parent_handle,
+                const void* metadata);
+using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
+    int32_t (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                SpObject* out_surface,
+                int32_t flags,
+                const SpObject* parent_handle,
+                const void* metadata,
+                uint32_t* out_transform_hint);
 using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_setLayer = int32_t (*)(void* control, int32_t layer);
 using PFN_SurfaceControl_setPosition = int32_t (*)(void* control, float x, float y);
@@ -133,8 +199,16 @@ struct EngineSymbols {
       nullptr;
   PFN_SurfaceComposerClient_closeGlobalTransaction SurfaceComposerClient_closeGlobalTransaction =
       nullptr;
-  PFN_SurfaceComposerClient_createSurfaceChecked_v1 SurfaceComposerClient_createSurfaceChecked =
+  PFN_SurfaceComposerClient_createSurfaceChecked_v1 SurfaceComposerClient_createSurfaceChecked_v1 =
       nullptr;
+  PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent
+      SurfaceComposerClient_createSurfaceChecked_v2_parent = nullptr;
+  PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint
+      SurfaceComposerClient_createSurfaceChecked_v2_parent_hint = nullptr;
+  PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle
+      SurfaceComposerClient_createSurfaceChecked_v2_handle = nullptr;
+  PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint
+      SurfaceComposerClient_createSurfaceChecked_v2_handle_hint = nullptr;
   PFN_SurfaceControl_getSurface SurfaceControl_getSurface = nullptr;
   PFN_SurfaceControl_setLayer SurfaceControl_setLayer = nullptr;
   PFN_SurfaceControl_setPosition SurfaceControl_setPosition = nullptr;
@@ -261,6 +335,239 @@ static void* load_symbol_list_filtered(void* handle,
     }
   }
   return nullptr;
+}
+
+static bool read_section(FILE* file, long offset, void* out, size_t size) {
+  if (!file) {
+    return false;
+  }
+  if (fseek(file, offset, SEEK_SET) != 0) {
+    return false;
+  }
+  return fread(out, 1, size, file) == size;
+}
+
+static bool find_lib_path(const char* soname, char* out, size_t out_len) {
+  if (!soname || !out || out_len == 0) {
+    return false;
+  }
+  FILE* maps = fopen("/proc/self/maps", "r");
+  if (!maps) {
+    return false;
+  }
+  char line[512];
+  while (fgets(line, sizeof(line), maps)) {
+    if (!strstr(line, soname)) {
+      continue;
+    }
+    const char* path = strchr(line, '/');
+    if (!path) {
+      continue;
+    }
+    size_t len = strlen(path);
+    while (len > 0 && (path[len - 1] == '\n' || path[len - 1] == '\r')) {
+      --len;
+    }
+    if (len + 1 > out_len) {
+      continue;
+    }
+    memcpy(out, path, len);
+    out[len] = '\0';
+    fclose(maps);
+    return true;
+  }
+  fclose(maps);
+  return false;
+}
+
+static bool collect_dynsym_names(const char* path,
+                                 const char* needle,
+                                 std::vector<std::string>& out) {
+  if (!path || !needle) {
+    return false;
+  }
+  FILE* file = fopen(path, "rb");
+  if (!file) {
+    return false;
+  }
+  Elf64_Ehdr ehdr{};
+  if (!read_section(file, 0, &ehdr, sizeof(ehdr))) {
+    fclose(file);
+    return false;
+  }
+  if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 || ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+    fclose(file);
+    return false;
+  }
+  if (ehdr.e_shoff == 0 || ehdr.e_shentsize == 0 || ehdr.e_shnum == 0) {
+    fclose(file);
+    return false;
+  }
+  std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+  if (!read_section(file, static_cast<long>(ehdr.e_shoff), shdrs.data(),
+                    shdrs.size() * sizeof(Elf64_Shdr))) {
+    fclose(file);
+    return false;
+  }
+  if (ehdr.e_shstrndx >= shdrs.size()) {
+    fclose(file);
+    return false;
+  }
+  const Elf64_Shdr& shstr = shdrs[ehdr.e_shstrndx];
+  std::vector<char> shstrtab(shstr.sh_size);
+  if (!read_section(file, static_cast<long>(shstr.sh_offset), shstrtab.data(),
+                    shstrtab.size())) {
+    fclose(file);
+    return false;
+  }
+  const Elf64_Shdr* dynsym = nullptr;
+  const Elf64_Shdr* dynstr = nullptr;
+  for (const auto& sh : shdrs) {
+    if (sh.sh_name >= shstrtab.size()) {
+      continue;
+    }
+    const char* name = shstrtab.data() + sh.sh_name;
+    if (strcmp(name, ".dynsym") == 0) {
+      dynsym = &sh;
+    } else if (strcmp(name, ".dynstr") == 0) {
+      dynstr = &sh;
+    }
+  }
+  if (!dynsym || !dynstr || dynsym->sh_entsize == 0) {
+    fclose(file);
+    return false;
+  }
+  std::vector<char> dynstrtab(dynstr->sh_size);
+  if (!read_section(file, static_cast<long>(dynstr->sh_offset), dynstrtab.data(),
+                    dynstrtab.size())) {
+    fclose(file);
+    return false;
+  }
+  const size_t sym_count = dynsym->sh_size / dynsym->sh_entsize;
+  std::vector<Elf64_Sym> syms(sym_count);
+  if (!read_section(file, static_cast<long>(dynsym->sh_offset), syms.data(),
+                    syms.size() * sizeof(Elf64_Sym))) {
+    fclose(file);
+    return false;
+  }
+  for (const auto& sym : syms) {
+    if (sym.st_name >= dynstrtab.size()) {
+      continue;
+    }
+    const char* sym_name = dynstrtab.data() + sym.st_name;
+    if (!sym_name || !sym_name[0]) {
+      continue;
+    }
+    if (strstr(sym_name, needle)) {
+      out.emplace_back(sym_name);
+    }
+  }
+  fclose(file);
+  return !out.empty();
+}
+
+enum CreateSurfaceCheckedKind {
+  kCSC_None = 0,
+  kCSC_V1,
+  kCSC_V2_PARENT,
+  kCSC_V2_PARENT_HINT,
+  kCSC_V2_HANDLE,
+  kCSC_V2_HANDLE_HINT,
+};
+
+static CreateSurfaceCheckedKind classify_create_surface_checked(const char* demangled) {
+  if (!demangled) {
+    return kCSC_None;
+  }
+  if (!strstr(demangled, "SurfaceComposerClient::createSurfaceChecked")) {
+    return kCSC_None;
+  }
+  const bool has_layer_metadata = strstr(demangled, "LayerMetadata") != nullptr;
+  const bool has_ibinder = strstr(demangled, "IBinder") != nullptr;
+  const bool has_surface_control = strstr(demangled, "SurfaceControl*") != nullptr;
+  const bool has_out_hint = strstr(demangled, "uint32_t*") != nullptr ||
+                            strstr(demangled, "uint32_t *") != nullptr ||
+                            strstr(demangled, "unsigned int*") != nullptr ||
+                            strstr(demangled, "unsigned int *") != nullptr;
+
+  if (!has_layer_metadata && has_surface_control) {
+    return kCSC_V1;
+  }
+  if (has_layer_metadata) {
+    if (has_ibinder) {
+      return has_out_hint ? kCSC_V2_HANDLE_HINT : kCSC_V2_HANDLE;
+    }
+    if (has_surface_control) {
+      return has_out_hint ? kCSC_V2_PARENT_HINT : kCSC_V2_PARENT;
+    }
+  }
+  return kCSC_None;
+}
+
+static void resolve_create_surface_checked_dynamic(EngineSymbols& s) {
+  if (!s.libgui) {
+    return;
+  }
+  if (s.SurfaceComposerClient_createSurfaceChecked_v1 ||
+      s.SurfaceComposerClient_createSurfaceChecked_v2_parent ||
+      s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint ||
+      s.SurfaceComposerClient_createSurfaceChecked_v2_handle ||
+      s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
+    return;
+  }
+  char lib_path[256] = {};
+  if (!find_lib_path("libgui.so", lib_path, sizeof(lib_path))) {
+    return;
+  }
+  std::vector<std::string> symbols;
+  if (!collect_dynsym_names(lib_path, "createSurfaceChecked", symbols)) {
+    return;
+  }
+  for (const auto& name : symbols) {
+    void* sym = dlsym(s.libgui, name.c_str());
+    if (!sym) {
+      continue;
+    }
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
+    const char* demangled_view = (status == 0 && demangled) ? demangled : name.c_str();
+    CreateSurfaceCheckedKind kind = classify_create_surface_checked(demangled_view);
+    free(demangled);
+    switch (kind) {
+      case kCSC_V1:
+        if (!s.SurfaceComposerClient_createSurfaceChecked_v1) {
+          s.SurfaceComposerClient_createSurfaceChecked_v1 =
+              reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v1>(sym);
+        }
+        break;
+      case kCSC_V2_PARENT:
+        if (!s.SurfaceComposerClient_createSurfaceChecked_v2_parent) {
+          s.SurfaceComposerClient_createSurfaceChecked_v2_parent =
+              reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent>(sym);
+        }
+        break;
+      case kCSC_V2_PARENT_HINT:
+        if (!s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint) {
+          s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
+              reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint>(sym);
+        }
+        break;
+      case kCSC_V2_HANDLE:
+        if (!s.SurfaceComposerClient_createSurfaceChecked_v2_handle) {
+          s.SurfaceComposerClient_createSurfaceChecked_v2_handle =
+              reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle>(sym);
+        }
+        break;
+      case kCSC_V2_HANDLE_HINT:
+        if (!s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
+          s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
+              reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint>(sym);
+        }
+        break;
+      default:
+        break;
+    }
+  }
 }
 
 static bool load_symbols(EngineSymbols& s) {
@@ -429,12 +736,13 @@ static bool load_symbols(EngineSymbols& s) {
                            version ? version->SurfaceComposerClient_closeGlobalTransaction
                                    : empty_list,
                            "_ZN7android21SurfaceComposerClient22closeGlobalTransactionEv"));
-  s.SurfaceComposerClient_createSurfaceChecked =
+  s.SurfaceComposerClient_createSurfaceChecked_v1 =
       reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v1>(
           load_symbol_list_filtered(s.libgui,
                                     version ? version->SurfaceComposerClient_createSurfaceChecked
                                             : empty_list,
                                     legacy_name_is_v1));
+  resolve_create_surface_checked_dynamic(s);
 
   s.SurfaceControl_getSurface = reinterpret_cast<PFN_SurfaceControl_getSurface>(
       load_symbol_list(s.libgui,
@@ -567,7 +875,12 @@ static bool create_surface_asurface(EngineState& state,
 
 static bool create_surface_legacy(EngineState& state, int width, int height) {
   EngineSymbols& s = state.symbols;
-  if (!s.SurfaceComposerClient_getDefault || !s.SurfaceComposerClient_createSurfaceChecked ||
+  if (!s.SurfaceComposerClient_getDefault ||
+      (!s.SurfaceComposerClient_createSurfaceChecked_v1 &&
+       !s.SurfaceComposerClient_createSurfaceChecked_v2_parent &&
+       !s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint &&
+       !s.SurfaceComposerClient_createSurfaceChecked_v2_handle &&
+       !s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) ||
       !s.SurfaceControl_getSurface || !s.String8_ctor || !s.String8_dtor) {
     return false;
   }
@@ -581,17 +894,71 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   s.String8_ctor(name_storage.data, "SystemProfiler");
 
   SpObject control_sp{};
-  int32_t status = s.SurfaceComposerClient_createSurfaceChecked(
-      client_sp.ptr,
-      name_storage.data,
-      static_cast<uint32_t>(width),
-      static_cast<uint32_t>(height),
-      WINDOW_FORMAT_RGBA_8888,
-      &control_sp,
-      0,
-      nullptr,
-      -1,
-      -1);
+  int32_t status = -1;
+  if (s.SurfaceComposerClient_createSurfaceChecked_v1) {
+    status = s.SurfaceComposerClient_createSurfaceChecked_v1(
+        client_sp.ptr,
+        name_storage.data,
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(height),
+        WINDOW_FORMAT_RGBA_8888,
+        &control_sp,
+        0,
+        nullptr,
+        -1,
+        -1);
+  } else {
+    android::LayerMetadata metadata;
+    if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
+      SpObject parent_handle{};
+      status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint(
+          client_sp.ptr,
+          name_storage.data,
+          static_cast<uint32_t>(width),
+          static_cast<uint32_t>(height),
+          WINDOW_FORMAT_RGBA_8888,
+          &control_sp,
+          0,
+          &parent_handle,
+          &metadata,
+          nullptr);
+    } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle) {
+      SpObject parent_handle{};
+      status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle(
+          client_sp.ptr,
+          name_storage.data,
+          static_cast<uint32_t>(width),
+          static_cast<uint32_t>(height),
+          WINDOW_FORMAT_RGBA_8888,
+          &control_sp,
+          0,
+          &parent_handle,
+          &metadata);
+    } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint) {
+      status = s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint(
+          client_sp.ptr,
+          name_storage.data,
+          static_cast<uint32_t>(width),
+          static_cast<uint32_t>(height),
+          WINDOW_FORMAT_RGBA_8888,
+          &control_sp,
+          0,
+          nullptr,
+          &metadata,
+          nullptr);
+    } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_parent) {
+      status = s.SurfaceComposerClient_createSurfaceChecked_v2_parent(
+          client_sp.ptr,
+          name_storage.data,
+          static_cast<uint32_t>(width),
+          static_cast<uint32_t>(height),
+          WINDOW_FORMAT_RGBA_8888,
+          &control_sp,
+          0,
+          nullptr,
+          &metadata);
+    }
+  }
   s.String8_dtor(name_storage.data);
 
   if (status != 0 || !control_sp.ptr) {
