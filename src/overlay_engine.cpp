@@ -27,6 +27,7 @@ namespace android {
 using status_t = int32_t;
 
 class Parcel;
+class IBinder;
 
 class Parcelable {
  public:
@@ -36,6 +37,12 @@ class Parcelable {
 };
 
 class Parcel {};
+
+template <typename T>
+struct sp {
+  T* ptr;
+  sp() : ptr(nullptr) {}
+};
 
 struct LayerMetadata : public Parcelable {
   std::unordered_map<uint32_t, std::vector<uint8_t>> mMap;
@@ -134,7 +141,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent =
                 SpObject* out_surface,
                 int32_t flags,
                 void* parent,
-                const void* metadata);
+                android::LayerMetadata metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -144,7 +151,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
                 SpObject* out_surface,
                 int32_t flags,
                 void* parent,
-                const void* metadata,
+                android::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
     int32_t (*)(void* client,
@@ -154,8 +161,8 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
                 int32_t format,
                 SpObject* out_surface,
                 int32_t flags,
-                const SpObject* parent_handle,
-                const void* metadata);
+                const android::sp<android::IBinder>& parent_handle,
+                android::LayerMetadata metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -164,8 +171,8 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 int32_t format,
                 SpObject* out_surface,
                 int32_t flags,
-                const SpObject* parent_handle,
-                const void* metadata,
+                const android::sp<android::IBinder>& parent_handle,
+                android::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_setLayer = int32_t (*)(void* control, int32_t layer);
@@ -1042,7 +1049,6 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   } else {
     android::LayerMetadata metadata;
     if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
-      SpObject parent_handle{};
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint(
           client_sp.ptr,
           name_storage.data,
@@ -1051,11 +1057,10 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           WINDOW_FORMAT_RGBA_8888,
           &control_sp,
           0,
-          &parent_handle,
-          &metadata,
+          android::sp<android::IBinder>(),
+          metadata,
           nullptr);
     } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle) {
-      SpObject parent_handle{};
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle(
           client_sp.ptr,
           name_storage.data,
@@ -1064,8 +1069,8 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           WINDOW_FORMAT_RGBA_8888,
           &control_sp,
           0,
-          &parent_handle,
-          &metadata);
+          android::sp<android::IBinder>(),
+          metadata);
     } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint) {
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint(
           client_sp.ptr,
@@ -1076,7 +1081,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           &control_sp,
           0,
           nullptr,
-          &metadata,
+          metadata,
           nullptr);
     } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_parent) {
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_parent(
@@ -1088,7 +1093,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           &control_sp,
           0,
           nullptr,
-          &metadata);
+          metadata);
     }
   }
   s.String8_dtor(name_storage.data);
