@@ -581,6 +581,113 @@ static void resolve_create_surface_checked_dynamic(EngineSymbols& s) {
   }
 }
 
+enum SurfaceControlSymbolKind {
+  kSC_None = 0,
+  kSC_GetSurface,
+  kSC_SetLayer,
+  kSC_SetPosition,
+  kSC_SetSize,
+  kSC_SetAlpha,
+  kSC_SetFlags,
+};
+
+static SurfaceControlSymbolKind classify_surfacecontrol_symbol(const char* demangled) {
+  if (!demangled) {
+    return kSC_None;
+  }
+  if (!strstr(demangled, "SurfaceControl::")) {
+    return kSC_None;
+  }
+  if (strstr(demangled, "SurfaceControl::getSurface")) {
+    return kSC_GetSurface;
+  }
+  if (strstr(demangled, "SurfaceControl::setLayer")) {
+    return kSC_SetLayer;
+  }
+  if (strstr(demangled, "SurfaceControl::setPosition")) {
+    return kSC_SetPosition;
+  }
+  if (strstr(demangled, "SurfaceControl::setSize")) {
+    return kSC_SetSize;
+  }
+  if (strstr(demangled, "SurfaceControl::setAlpha")) {
+    return kSC_SetAlpha;
+  }
+  if (strstr(demangled, "SurfaceControl::setFlags")) {
+    return kSC_SetFlags;
+  }
+  return kSC_None;
+}
+
+static void resolve_surfacecontrol_symbols_dynamic(EngineSymbols& s) {
+  if (!s.libgui) {
+    return;
+  }
+  if (s.SurfaceControl_getSurface && s.SurfaceControl_setLayer && s.SurfaceControl_setPosition &&
+      s.SurfaceControl_setSize && s.SurfaceControl_setAlpha && s.SurfaceControl_setFlags) {
+    return;
+  }
+  char lib_path[256] = {};
+  if (!find_lib_path("libgui.so", lib_path, sizeof(lib_path))) {
+    return;
+  }
+  std::vector<std::string> symbols;
+  if (!collect_dynsym_names(lib_path, "SurfaceControl", symbols)) {
+    return;
+  }
+  for (const auto& name : symbols) {
+    void* sym = dlsym(s.libgui, name.c_str());
+    if (!sym) {
+      continue;
+    }
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
+    const char* demangled_view = (status == 0 && demangled) ? demangled : name.c_str();
+    SurfaceControlSymbolKind kind = classify_surfacecontrol_symbol(demangled_view);
+    free(demangled);
+    switch (kind) {
+      case kSC_GetSurface:
+        if (!s.SurfaceControl_getSurface) {
+          s.SurfaceControl_getSurface =
+              reinterpret_cast<PFN_SurfaceControl_getSurface>(sym);
+        }
+        break;
+      case kSC_SetLayer:
+        if (!s.SurfaceControl_setLayer) {
+          s.SurfaceControl_setLayer =
+              reinterpret_cast<PFN_SurfaceControl_setLayer>(sym);
+        }
+        break;
+      case kSC_SetPosition:
+        if (!s.SurfaceControl_setPosition) {
+          s.SurfaceControl_setPosition =
+              reinterpret_cast<PFN_SurfaceControl_setPosition>(sym);
+        }
+        break;
+      case kSC_SetSize:
+        if (!s.SurfaceControl_setSize) {
+          s.SurfaceControl_setSize =
+              reinterpret_cast<PFN_SurfaceControl_setSize>(sym);
+        }
+        break;
+      case kSC_SetAlpha:
+        if (!s.SurfaceControl_setAlpha) {
+          s.SurfaceControl_setAlpha =
+              reinterpret_cast<PFN_SurfaceControl_setAlpha>(sym);
+        }
+        break;
+      case kSC_SetFlags:
+        if (!s.SurfaceControl_setFlags) {
+          s.SurfaceControl_setFlags =
+              reinterpret_cast<PFN_SurfaceControl_setFlags>(sym);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 static bool load_symbols(EngineSymbols& s) {
   s.libgui = dlopen("libgui.so", RTLD_NOW);
   if (!s.libgui) {
@@ -780,6 +887,7 @@ static bool load_symbols(EngineSymbols& s) {
                        version ? version->SurfaceControl_setFlags : empty_list,
                        nullptr));
 
+  resolve_surfacecontrol_symbols_dynamic(s);
   return true;
 }
 
