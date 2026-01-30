@@ -76,9 +76,18 @@ jobs:
           echo "Collected files:"
           ls -la "${GITHUB_WORKSPACE}/dist"
 
+      - name: Verify artifacts
+        run: |
+          for f in libmidraw.so libmidraw.a overlay_engine benchmark; do
+            if [[ ! -f "${GITHUB_WORKSPACE}/dist/${f}" ]]; then
+              echo "Missing artifact: ${f}" >&2
+              exit 1
+            fi
+          done
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android-build
           path: |
-            dist/*
+            dist/**
