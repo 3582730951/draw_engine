@@ -1,0 +1,97 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(midraw C CXX)
+
+option(MIDRAW_BUILD_SHARED "Build shared library" ON)
+option(MIDRAW_BUILD_STATIC "Build static library" ON)
+option(MIDRAW_BUILD_BENCHMARK "Build benchmark executable" ON)
+option(MIDRAW_BUILD_OVERLAY "Build overlay engine executable" ON)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(MIDRAW_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/midraw.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/midraw_window.cpp
+)
+
+set(MIDRAW_PUBLIC_HEADERS
+    ${CMAKE_CURRENT_LIST_DIR}/include/midraw.h
+)
+
+set(FONT8X8_ROOT "" CACHE PATH "Path to font8x8 install prefix")
+set(STB_TRUETYPE_ROOT "" CACHE PATH "Path to stb_truetype install prefix")
+
+find_path(FONT8X8_INCLUDE_DIR font8x8_basic.h
+          HINTS ${FONT8X8_ROOT} ${CMAKE_PREFIX_PATH}
+          PATH_SUFFIXES include)
+find_library(FONT8X8_LIBRARY font8x8
+             HINTS ${FONT8X8_ROOT} ${CMAKE_PREFIX_PATH}
+             PATH_SUFFIXES lib)
+
+find_path(STB_TRUETYPE_INCLUDE_DIR stb_truetype.h
+          HINTS ${STB_TRUETYPE_ROOT} ${CMAKE_PREFIX_PATH}
+          PATH_SUFFIXES include)
+find_library(STB_TRUETYPE_LIBRARY stb_truetype
+             HINTS ${STB_TRUETYPE_ROOT} ${CMAKE_PREFIX_PATH}
+             PATH_SUFFIXES lib)
+
+if(MIDRAW_BUILD_SHARED)
+  add_library(midraw_shared SHARED ${MIDRAW_SOURCES})
+  set_target_properties(midraw_shared PROPERTIES OUTPUT_NAME midraw)
+  target_include_directories(midraw_shared PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_link_libraries(midraw_shared PUBLIC dl)
+  if(FONT8X8_INCLUDE_DIR AND FONT8X8_LIBRARY)
+    target_include_directories(midraw_shared PRIVATE ${FONT8X8_INCLUDE_DIR})
+    target_link_libraries(midraw_shared PUBLIC ${FONT8X8_LIBRARY})
+    target_compile_definitions(midraw_shared PRIVATE MIDRAW_USE_FONT8X8=1)
+  endif()
+  if(STB_TRUETYPE_INCLUDE_DIR AND STB_TRUETYPE_LIBRARY)
+    target_include_directories(midraw_shared PRIVATE ${STB_TRUETYPE_INCLUDE_DIR})
+    target_link_libraries(midraw_shared PUBLIC ${STB_TRUETYPE_LIBRARY})
+    target_compile_definitions(midraw_shared PRIVATE MIDRAW_USE_STB_TRUETYPE=1)
+  endif()
+endif()
+
+if(MIDRAW_BUILD_STATIC)
+  add_library(midraw_static STATIC ${MIDRAW_SOURCES})
+  set_target_properties(midraw_static PROPERTIES OUTPUT_NAME midraw)
+  target_include_directories(midraw_static PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_link_libraries(midraw_static PUBLIC dl)
+  if(FONT8X8_INCLUDE_DIR AND FONT8X8_LIBRARY)
+    target_include_directories(midraw_static PRIVATE ${FONT8X8_INCLUDE_DIR})
+    target_link_libraries(midraw_static PUBLIC ${FONT8X8_LIBRARY})
+    target_compile_definitions(midraw_static PRIVATE MIDRAW_USE_FONT8X8=1)
+  endif()
+  if(STB_TRUETYPE_INCLUDE_DIR AND STB_TRUETYPE_LIBRARY)
+    target_include_directories(midraw_static PRIVATE ${STB_TRUETYPE_INCLUDE_DIR})
+    target_link_libraries(midraw_static PUBLIC ${STB_TRUETYPE_LIBRARY})
+    target_compile_definitions(midraw_static PRIVATE MIDRAW_USE_STB_TRUETYPE=1)
+  endif()
+endif()
+
+if(MIDRAW_BUILD_BENCHMARK)
+  add_executable(benchmark ${CMAKE_CURRENT_LIST_DIR}/main.cpp)
+  target_include_directories(benchmark PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+  if(TARGET midraw_static)
+    target_link_libraries(benchmark PRIVATE midraw_static dl)
+  elseif(TARGET midraw_shared)
+    target_link_libraries(benchmark PRIVATE midraw_shared dl)
+  endif()
+endif()
+
+if(MIDRAW_BUILD_OVERLAY)
+  add_executable(overlay_engine ${CMAKE_CURRENT_LIST_DIR}/src/overlay_engine.cpp)
+  target_include_directories(overlay_engine PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_link_libraries(overlay_engine PRIVATE dl)
+endif()
+
+install(FILES ${MIDRAW_PUBLIC_HEADERS} DESTINATION include)
+if(TARGET midraw_shared)
+  install(TARGETS midraw_shared DESTINATION lib)
+endif()
+if(TARGET midraw_static)
+  install(TARGETS midraw_static DESTINATION lib)
+endif()

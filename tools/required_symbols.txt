@@ -1,0 +1,14 @@
+libgui ASurfaceControl_create
+libgui ASurfaceControl_release
+libgui ASurfaceTransaction_create
+libgui ASurfaceTransaction_release
+libgui ASurfaceTransaction_setBufferSize
+libgui ASurfaceTransaction_setVisibility
+libgui ASurfaceTransaction_setLayer
+libgui ASurfaceTransaction_apply
+libgui ANativeWindow_fromSurfaceControl
+libandroid ANativeWindow_lock
+libandroid ANativeWindow_unlockAndPost
+libandroid ANativeWindow_release
+libandroid ANativeWindow_getWidth
+libandroid ANativeWindow_getHeight
