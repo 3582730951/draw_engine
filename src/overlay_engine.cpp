@@ -18,6 +18,8 @@ struct ASurfaceTransaction;
 
 using PFN_ASurfaceControl_create = ASurfaceControl* (*)(ASurfaceControl* parent,
                                                         const char* debug_name);
+using PFN_ASurfaceControl_createFromWindow = ASurfaceControl* (*)(ANativeWindow* parent,
+                                                                  const char* debug_name);
 using PFN_ASurfaceControl_release = void (*)(ASurfaceControl* control);
 using PFN_ASurfaceTransaction_create = ASurfaceTransaction* (*)();
 using PFN_ASurfaceTransaction_release = void (*)(ASurfaceTransaction* transaction);
@@ -102,6 +104,7 @@ struct EngineSymbols {
   void* libnativewindow = nullptr;
 
   PFN_ASurfaceControl_create ASurfaceControl_create = nullptr;
+  PFN_ASurfaceControl_createFromWindow ASurfaceControl_createFromWindow = nullptr;
   PFN_ASurfaceControl_release ASurfaceControl_release = nullptr;
   PFN_ASurfaceTransaction_create ASurfaceTransaction_create = nullptr;
   PFN_ASurfaceTransaction_release ASurfaceTransaction_release = nullptr;
@@ -283,6 +286,12 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceControl_create : empty_list,
                         "ASurfaceControl_create"));
+  s.ASurfaceControl_createFromWindow = reinterpret_cast<PFN_ASurfaceControl_createFromWindow>(
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ASurfaceControl_createFromWindow"));
   s.ASurfaceControl_release = reinterpret_cast<PFN_ASurfaceControl_release>(
       load_symbol_multi(s.libgui,
                         s.libandroid,
@@ -455,14 +464,18 @@ static bool load_symbols(EngineSymbols& s) {
   return true;
 }
 
-static bool create_surface_asurface(EngineState& state, int width, int height) {
+static bool create_surface_asurface(EngineState& state,
+                                    int width,
+                                    int height,
+                                    ANativeWindow* parent_window) {
   EngineSymbols& s = state.symbols;
   const bool can_window =
       s.ANativeWindow_fromSurfaceControl && s.ANativeWindow_lock && s.ANativeWindow_unlockAndPost;
   const bool can_ahb = s.ASurfaceTransaction_setBuffer && s.AHardwareBuffer_allocate &&
                        s.AHardwareBuffer_lock && s.AHardwareBuffer_unlock &&
                        s.AHardwareBuffer_release && s.AHardwareBuffer_describe;
-  if (!s.ASurfaceControl_create || !s.ASurfaceTransaction_create ||
+  if ((!s.ASurfaceControl_createFromWindow && !s.ASurfaceControl_create) ||
+      !s.ASurfaceTransaction_create ||
       (!can_window && !can_ahb)) {
     fprintf(stderr,
             "ASurfaceControl symbols missing: create=%p tx=%p window=%p ahb=%p\n",
@@ -473,7 +486,14 @@ static bool create_surface_asurface(EngineState& state, int width, int height) {
     return false;
   }
 
-  state.surface = s.ASurfaceControl_create(nullptr, "SystemProfiler");
+  if (parent_window && s.ASurfaceControl_createFromWindow) {
+    state.surface = s.ASurfaceControl_createFromWindow(parent_window, "SystemProfiler");
+  } else {
+    fprintf(stderr,
+            "ASurfaceControl_create requires non-null parent on this platform; "
+            "skipping ASurfaceControl path.\n");
+    return false;
+  }
   if (!state.surface) {
     fprintf(stderr, "ASurfaceControl_create returned null\n");
     return false;
@@ -741,8 +761,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!create_surface_asurface(state, width, height)) {
-    if (!create_surface_legacy(state, width, height)) {
+  if (!create_surface_legacy(state, width, height)) {
+    if (!create_surface_asurface(state, width, height, nullptr)) {
       fprintf(stderr, "create_surface failed\n");
       return 1;
     }
