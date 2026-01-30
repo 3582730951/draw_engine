@@ -82,6 +82,7 @@ struct EngineSymbols {
   void* libgui = nullptr;
   void* libandroid = nullptr;
   void* libutils = nullptr;
+  void* libnativewindow = nullptr;
 
   PFN_ASurfaceControl_create ASurfaceControl_create = nullptr;
   PFN_ASurfaceControl_release ASurfaceControl_release = nullptr;
@@ -182,6 +183,21 @@ static void* load_symbol_list(void* handle, const SymbolNameList& list, const ch
   return nullptr;
 }
 
+static void* load_symbol_multi(void* h1,
+                               void* h2,
+                               void* h3,
+                               const SymbolNameList& list,
+                               const char* fallback) {
+  void* sym = load_symbol_list(h1, list, fallback);
+  if (!sym && h2) {
+    sym = load_symbol_list(h2, list, fallback);
+  }
+  if (!sym && h3) {
+    sym = load_symbol_list(h3, list, fallback);
+  }
+  return sym;
+}
+
 static bool legacy_name_is_v1(const char* name) {
   if (!name) {
     return false;
@@ -230,53 +246,78 @@ static bool load_symbols(EngineSymbols& s) {
     return false;
   }
   s.libutils = dlopen("libutils.so", RTLD_NOW);
+  s.libnativewindow = dlopen("libnativewindow.so", RTLD_NOW);
 
   const SymbolVersion* version = pick_symbol_version(read_sdk_version());
   const SymbolNameList empty_list{nullptr, 0};
 
   s.ASurfaceControl_create = reinterpret_cast<PFN_ASurfaceControl_create>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceControl_create : empty_list,
-                       "ASurfaceControl_create"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceControl_create : empty_list,
+                        "ASurfaceControl_create"));
   s.ASurfaceControl_release = reinterpret_cast<PFN_ASurfaceControl_release>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceControl_release : empty_list,
-                       "ASurfaceControl_release"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceControl_release : empty_list,
+                        "ASurfaceControl_release"));
   s.ASurfaceTransaction_create = reinterpret_cast<PFN_ASurfaceTransaction_create>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_create : empty_list,
-                       "ASurfaceTransaction_create"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_create : empty_list,
+                        "ASurfaceTransaction_create"));
   s.ASurfaceTransaction_release = reinterpret_cast<PFN_ASurfaceTransaction_release>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_release : empty_list,
-                       "ASurfaceTransaction_release"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_release : empty_list,
+                        "ASurfaceTransaction_release"));
   s.ASurfaceTransaction_setBufferSize = reinterpret_cast<PFN_ASurfaceTransaction_setBufferSize>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_setBufferSize : empty_list,
-                       "ASurfaceTransaction_setBufferSize"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_setBufferSize : empty_list,
+                        "ASurfaceTransaction_setBufferSize"));
   s.ASurfaceTransaction_setVisibility =
       reinterpret_cast<PFN_ASurfaceTransaction_setVisibility>(
-          load_symbol_list(s.libgui,
-                           version ? version->ASurfaceTransaction_setVisibility : empty_list,
-                           "ASurfaceTransaction_setVisibility"));
+          load_symbol_multi(s.libgui,
+                            s.libandroid,
+                            s.libnativewindow,
+                            version ? version->ASurfaceTransaction_setVisibility : empty_list,
+                            "ASurfaceTransaction_setVisibility"));
   s.ASurfaceTransaction_setLayer = reinterpret_cast<PFN_ASurfaceTransaction_setLayer>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_setLayer : empty_list,
-                       "ASurfaceTransaction_setLayer"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_setLayer : empty_list,
+                        "ASurfaceTransaction_setLayer"));
   s.ASurfaceTransaction_apply = reinterpret_cast<PFN_ASurfaceTransaction_apply>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_apply : empty_list,
-                       "ASurfaceTransaction_apply"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_apply : empty_list,
+                        "ASurfaceTransaction_apply"));
   s.ASurfaceTransaction_setAlpha = reinterpret_cast<PFN_ASurfaceTransaction_setAlpha>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_setAlpha : empty_list,
-                       "ASurfaceTransaction_setAlpha"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_setAlpha : empty_list,
+                        "ASurfaceTransaction_setAlpha"));
   s.ASurfaceTransaction_setOpaque = reinterpret_cast<PFN_ASurfaceTransaction_setOpaque>(
-      load_symbol_list(s.libgui,
-                       version ? version->ASurfaceTransaction_setOpaque : empty_list,
-                       "ASurfaceTransaction_setOpaque"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        version ? version->ASurfaceTransaction_setOpaque : empty_list,
+                        "ASurfaceTransaction_setOpaque"));
   s.ANativeWindow_fromSurfaceControl = reinterpret_cast<PFN_ANativeWindow_fromSurfaceControl>(
-      load_symbol_list(s.libgui, empty_list, "ANativeWindow_fromSurfaceControl"));
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ANativeWindow_fromSurfaceControl"));
 
   s.ANativeWindow_lock = reinterpret_cast<PFN_ANativeWindow_lock>(
       load_symbol_list(s.libandroid, empty_list, "ANativeWindow_lock"));
@@ -285,9 +326,11 @@ static bool load_symbols(EngineSymbols& s) {
   s.ANativeWindow_release = reinterpret_cast<PFN_ANativeWindow_release>(
       load_symbol_list(s.libandroid, empty_list, "ANativeWindow_release"));
   s.ANativeWindow_setBuffersGeometry = reinterpret_cast<PFN_ANativeWindow_setBuffersGeometry>(
-      load_symbol_list(s.libandroid,
-                       version ? version->ANativeWindow_setBuffersGeometry : empty_list,
-                       "ANativeWindow_setBuffersGeometry"));
+      load_symbol_multi(s.libandroid,
+                        s.libgui,
+                        s.libnativewindow,
+                        version ? version->ANativeWindow_setBuffersGeometry : empty_list,
+                        "ANativeWindow_setBuffersGeometry"));
 
   if (s.libutils) {
     s.String8_ctor = reinterpret_cast<PFN_String8_ctor>(
@@ -366,22 +409,37 @@ static bool load_symbols(EngineSymbols& s) {
 
 static bool create_surface_asurface(EngineState& state, int width, int height) {
   EngineSymbols& s = state.symbols;
-  if (!s.ASurfaceControl_create || !s.ASurfaceTransaction_create || !s.ANativeWindow_fromSurfaceControl) {
+  if (!s.ASurfaceControl_create || !s.ASurfaceTransaction_create ||
+      !s.ANativeWindow_fromSurfaceControl) {
+    fprintf(stderr, "ASurfaceControl symbols missing: create=%p tx=%p window=%p\n",
+            reinterpret_cast<void*>(s.ASurfaceControl_create),
+            reinterpret_cast<void*>(s.ASurfaceTransaction_create),
+            reinterpret_cast<void*>(s.ANativeWindow_fromSurfaceControl));
     return false;
   }
 
   state.surface = s.ASurfaceControl_create("SystemProfiler", nullptr);
   if (!state.surface) {
+    fprintf(stderr, "ASurfaceControl_create returned null\n");
     return false;
   }
 
   ASurfaceTransaction* tx = s.ASurfaceTransaction_create();
   if (!tx) {
+    fprintf(stderr, "ASurfaceTransaction_create returned null\n");
+    if (s.ASurfaceControl_release) {
+      s.ASurfaceControl_release(state.surface);
+    }
+    state.surface = nullptr;
     return false;
   }
 
-  s.ASurfaceTransaction_setVisibility(tx, state.surface, 1);
-  s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
+  if (s.ASurfaceTransaction_setVisibility) {
+    s.ASurfaceTransaction_setVisibility(tx, state.surface, 1);
+  }
+  if (s.ASurfaceTransaction_setLayer) {
+    s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
+  }
   if (s.ASurfaceTransaction_setAlpha) {
     s.ASurfaceTransaction_setAlpha(tx, state.surface, 1.0f);
   }
@@ -391,11 +449,16 @@ static bool create_surface_asurface(EngineState& state, int width, int height) {
   if (s.ASurfaceTransaction_setBufferSize && width > 0 && height > 0) {
     s.ASurfaceTransaction_setBufferSize(tx, state.surface, width, height);
   }
-  s.ASurfaceTransaction_apply(tx);
-  s.ASurfaceTransaction_release(tx);
+  if (s.ASurfaceTransaction_apply) {
+    s.ASurfaceTransaction_apply(tx);
+  }
+  if (s.ASurfaceTransaction_release) {
+    s.ASurfaceTransaction_release(tx);
+  }
 
   state.window = s.ANativeWindow_fromSurfaceControl(state.surface);
   if (!state.window) {
+    fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
     return false;
   }
 
