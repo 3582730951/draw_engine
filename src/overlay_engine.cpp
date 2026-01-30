@@ -151,7 +151,7 @@ struct EngineState {
   int height = 0;
   int stride = 0;
   uint32_t* pixels = nullptr;
-  ANativeWindow_Buffer buffer{};
+  ANativeWindow_Buffer window_buffer{};
 };
 
 static int read_sdk_version() {
@@ -642,13 +642,13 @@ static bool lock_buffer(EngineState& state) {
   if (!state.window || !state.symbols.ANativeWindow_lock) {
     return false;
   }
-  if (state.symbols.ANativeWindow_lock(state.window, &state.buffer, nullptr) != 0) {
+  if (state.symbols.ANativeWindow_lock(state.window, &state.window_buffer, nullptr) != 0) {
     return false;
   }
-  state.width = state.buffer.width;
-  state.height = state.buffer.height;
-  state.stride = state.buffer.stride;
-  state.pixels = reinterpret_cast<uint32_t*>(state.buffer.bits);
+  state.width = state.window_buffer.width;
+  state.height = state.window_buffer.height;
+  state.stride = state.window_buffer.stride;
+  state.pixels = reinterpret_cast<uint32_t*>(state.window_buffer.bits);
   return state.pixels != nullptr;
 }
 
