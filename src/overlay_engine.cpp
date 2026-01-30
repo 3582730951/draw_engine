@@ -24,10 +24,18 @@ struct ASurfaceControl;
 struct ASurfaceTransaction;
 
 namespace android {
+using status_t = int32_t;
+
+class Parcel;
+
 class Parcelable {
  public:
   virtual ~Parcelable() = default;
+  virtual status_t writeToParcel(Parcel* parcel) const = 0;
+  virtual status_t readFromParcel(const Parcel* parcel) = 0;
 };
+
+class Parcel {};
 
 struct LayerMetadata : public Parcelable {
   std::unordered_map<uint32_t, std::vector<uint8_t>> mMap;
@@ -37,6 +45,9 @@ struct LayerMetadata : public Parcelable {
   LayerMetadata& operator=(const LayerMetadata&) = default;
   LayerMetadata& operator=(LayerMetadata&&) = default;
   ~LayerMetadata() override = default;
+
+  status_t writeToParcel(Parcel*) const override { return 0; }
+  status_t readFromParcel(const Parcel*) override { return 0; }
 };
 }  // namespace android
 
@@ -880,13 +891,26 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
        !s.SurfaceComposerClient_createSurfaceChecked_v2_parent &&
        !s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint &&
        !s.SurfaceComposerClient_createSurfaceChecked_v2_handle &&
-       !s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) ||
+      !s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) ||
       !s.SurfaceControl_getSurface || !s.String8_ctor || !s.String8_dtor) {
+    fprintf(stderr,
+            "legacy symbols missing: getDefault=%p v1=%p v2_parent=%p v2_parent_hint=%p "
+            "v2_handle=%p v2_handle_hint=%p getSurface=%p String8_ctor=%p String8_dtor=%p\n",
+            reinterpret_cast<void*>(s.SurfaceComposerClient_getDefault),
+            reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v1),
+            reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_parent),
+            reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint),
+            reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_handle),
+            reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint),
+            reinterpret_cast<void*>(s.SurfaceControl_getSurface),
+            reinterpret_cast<void*>(s.String8_ctor),
+            reinterpret_cast<void*>(s.String8_dtor));
     return false;
   }
 
   SpObject client_sp = s.SurfaceComposerClient_getDefault();
   if (!client_sp.ptr) {
+    fprintf(stderr, "SurfaceComposerClient_getDefault returned null\n");
     return false;
   }
 
@@ -962,6 +986,8 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   s.String8_dtor(name_storage.data);
 
   if (status != 0 || !control_sp.ptr) {
+    fprintf(stderr, "createSurfaceChecked failed: status=%d control=%p\n", status,
+            control_sp.ptr);
     return false;
   }
 
