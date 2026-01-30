@@ -127,7 +127,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
                 uint32_t width,
                 uint32_t height,
                 int32_t format,
-                SpObject* out_surface,
+                void* out_surface,
                 uint32_t flags,
                 void* parent,
                 int32_t window_type,
@@ -138,7 +138,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent =
                 uint32_t width,
                 uint32_t height,
                 int32_t format,
-                SpObject* out_surface,
+                void* out_surface,
                 int32_t flags,
                 void* parent,
                 android::LayerMetadata metadata);
@@ -148,7 +148,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
                 uint32_t width,
                 uint32_t height,
                 int32_t format,
-                SpObject* out_surface,
+                void* out_surface,
                 int32_t flags,
                 void* parent,
                 android::LayerMetadata metadata,
@@ -159,7 +159,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
                 uint32_t width,
                 uint32_t height,
                 int32_t format,
-                SpObject* out_surface,
+                void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
                 android::LayerMetadata metadata);
@@ -169,7 +169,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 uint32_t width,
                 uint32_t height,
                 int32_t format,
-                SpObject* out_surface,
+                void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
                 android::LayerMetadata metadata,
@@ -1034,6 +1034,8 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   s.String8_ctor(name_storage.data, "SystemProfiler");
 
   SpObject control_sp{};
+  alignas(void*) unsigned char control_sp_storage[32] = {};
+  void* control_sp_ptr = control_sp_storage;
   int32_t status = -1;
   if (s.SurfaceComposerClient_createSurfaceChecked_v1) {
     status = s.SurfaceComposerClient_createSurfaceChecked_v1(
@@ -1042,7 +1044,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
         static_cast<uint32_t>(width),
         static_cast<uint32_t>(height),
         WINDOW_FORMAT_RGBA_8888,
-        &control_sp,
+        control_sp_ptr,
         0,
         nullptr,
         -1,
@@ -1056,7 +1058,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           static_cast<uint32_t>(width),
           static_cast<uint32_t>(height),
           WINDOW_FORMAT_RGBA_8888,
-          &control_sp,
+          control_sp_ptr,
           0,
           android::sp<android::IBinder>(),
           metadata,
@@ -1068,7 +1070,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           static_cast<uint32_t>(width),
           static_cast<uint32_t>(height),
           WINDOW_FORMAT_RGBA_8888,
-          &control_sp,
+          control_sp_ptr,
           0,
           android::sp<android::IBinder>(),
           metadata);
@@ -1079,7 +1081,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           static_cast<uint32_t>(width),
           static_cast<uint32_t>(height),
           WINDOW_FORMAT_RGBA_8888,
-          &control_sp,
+          control_sp_ptr,
           0,
           nullptr,
           metadata,
@@ -1091,7 +1093,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           static_cast<uint32_t>(width),
           static_cast<uint32_t>(height),
           WINDOW_FORMAT_RGBA_8888,
-          &control_sp,
+          control_sp_ptr,
           0,
           nullptr,
           metadata);
@@ -1099,6 +1101,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   }
   s.String8_dtor(name_storage.data);
 
+  memcpy(&control_sp, control_sp_ptr, sizeof(control_sp));
   if (status != 0 || !control_sp.ptr) {
     fprintf(stderr, "createSurfaceChecked failed: status=%d control=%p\n", status,
             control_sp.ptr);
