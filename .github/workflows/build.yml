@@ -75,12 +75,20 @@ jobs:
           cp "${GITHUB_WORKSPACE}/include/generated_symbols.h" "${GITHUB_WORKSPACE}/dist" || true
           echo "Collected files:"
           ls -la "${GITHUB_WORKSPACE}/dist"
+          {
+            echo "dist listing:";
+            ls -la "${GITHUB_WORKSPACE}/dist";
+            echo;
+            echo "file info:";
+            file "${GITHUB_WORKSPACE}/dist"/* || true;
+          } | tee "${GITHUB_WORKSPACE}/dist/manifest.txt"
+          cat "${GITHUB_WORKSPACE}/dist/manifest.txt" >> "${GITHUB_STEP_SUMMARY}" || true
 
       - name: Verify artifacts
         run: |
           for f in libmidraw.so libmidraw.a overlay_engine benchmark; do
-            if [[ ! -f "${GITHUB_WORKSPACE}/dist/${f}" ]]; then
-              echo "Missing artifact: ${f}" >&2
+            if [[ ! -s "${GITHUB_WORKSPACE}/dist/${f}" ]]; then
+              echo "Missing or empty artifact: ${f}" >&2
               exit 1
             fi
           done
