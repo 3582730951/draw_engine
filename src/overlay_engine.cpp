@@ -147,6 +147,8 @@ using PFN_String8_dtor = void (*)(void* self);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
 using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
     SpObject (*)(android::PhysicalDisplayId display_id);
+using PFN_SurfaceComposerClient_getPhysicalDisplayIds =
+    std::vector<android::PhysicalDisplayId> (*)();
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
@@ -253,6 +255,8 @@ struct EngineSymbols {
   PFN_String8_dtor String8_dtor = nullptr;
   PFN_SurfaceComposerClient_getDefault SurfaceComposerClient_getDefault = nullptr;
   PFN_SurfaceComposerClient_getPhysicalDisplayToken SurfaceComposerClient_getPhysicalDisplayToken =
+      nullptr;
+  PFN_SurfaceComposerClient_getPhysicalDisplayIds SurfaceComposerClient_getPhysicalDisplayIds =
       nullptr;
   PFN_SurfaceComposerClient_openGlobalTransaction SurfaceComposerClient_openGlobalTransaction =
       nullptr;
@@ -943,6 +947,11 @@ static bool load_symbols(EngineSymbols& s) {
               s.libgui,
               empty_list,
               "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE"));
+  s.SurfaceComposerClient_getPhysicalDisplayIds =
+      reinterpret_cast<PFN_SurfaceComposerClient_getPhysicalDisplayIds>(
+          load_symbol_list(s.libgui,
+                           empty_list,
+                           "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv"));
   s.SurfaceComposerClient_openGlobalTransaction =
       reinterpret_cast<PFN_SurfaceComposerClient_openGlobalTransaction>(
           load_symbol_list(s.libgui,
@@ -1193,6 +1202,16 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
     parent_handle.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
     fprintf(stderr, "Display token=%p\n", token_sp.ptr);
+    if (!parent_handle.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
+      std::vector<android::PhysicalDisplayId> ids =
+          s.SurfaceComposerClient_getPhysicalDisplayIds();
+      if (!ids.empty()) {
+        SpObject token2 = s.SurfaceComposerClient_getPhysicalDisplayToken(ids.front());
+        parent_handle.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
+        fprintf(stderr, "Display token(id=%llu)=%p\n",
+                static_cast<unsigned long long>(ids.front().value), token2.ptr);
+      }
+    }
   }
 
   SpObject control_sp{};
