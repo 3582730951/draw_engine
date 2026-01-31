@@ -1818,6 +1818,11 @@ static bool lock_buffer(EngineState& state) {
     state.direct_graphic = nullptr;
     ANativeWindowBuffer* buffer = nullptr;
     int fence_fd = -1;
+    static int log_count_dequeue = 0;
+    if (log_count_dequeue < 1) {
+      fprintf(stderr, "Surface_dequeueBuffer start\n");
+      ++log_count_dequeue;
+    }
     int res = s.Surface_dequeueBuffer(state.surface_native, &buffer, &fence_fd);
     if (res != 0 || !buffer) {
       static int log_count = 0;
@@ -2033,6 +2038,11 @@ int main(int argc, char** argv) {
   uint64_t frame = 0;
 
   while (true) {
+    static int loop_log = 0;
+    if (loop_log < 1) {
+      fprintf(stderr, "main loop start\n");
+      ++loop_log;
+    }
     if (!lock_buffer(state)) {
       usleep(1000);
       continue;
