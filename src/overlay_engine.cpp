@@ -51,6 +51,30 @@ struct sp {
 struct PhysicalDisplayId {
   uint64_t value;
 };
+
+namespace ui {
+struct LayerStack {
+  uint32_t id;
+};
+
+struct Size {
+  int32_t width;
+  int32_t height;
+};
+
+enum class Rotation : uint32_t {
+  Rotation0 = 0,
+  Rotation90 = 1,
+  Rotation180 = 2,
+  Rotation270 = 3,
+};
+
+struct DisplayState {
+  LayerStack layerStack;
+  Rotation orientation;
+  Size layerStackSpaceRect;
+};
+}  // namespace ui
 }  // namespace android
 
 struct LayerMetadataStorage {
@@ -180,11 +204,20 @@ using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
     SpObject (*)(android::PhysicalDisplayId display_id);
 using PFN_SurfaceComposerClient_getPhysicalDisplayIds =
     std::vector<android::PhysicalDisplayId> (*)();
+using PFN_SurfaceComposerClient_getDisplayState =
+    int32_t (*)(const android::sp<android::IBinder>& display,
+                android::ui::DisplayState* out_state);
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_Transaction_ctor = void (*)(void* tx);
 using PFN_SurfaceComposerClient_Transaction_setLayer =
     void* (*)(void* tx, void* surface_control, int32_t z);
+using PFN_SurfaceComposerClient_Transaction_setPosition =
+    void* (*)(void* tx, void* surface_control, float x, float y);
+using PFN_SurfaceComposerClient_Transaction_setLayerStack =
+    void* (*)(void* tx, void* surface_control, android::ui::LayerStack layer_stack);
+using PFN_SurfaceComposerClient_Transaction_show =
+    void* (*)(void* tx, void* surface_control);
 using PFN_SurfaceComposerClient_Transaction_setTrustedOverlay =
     void* (*)(void* tx, void* surface_control, bool is_trusted);
 using PFN_SurfaceComposerClient_Transaction_apply2 =
@@ -313,6 +346,7 @@ struct EngineSymbols {
       nullptr;
   PFN_SurfaceComposerClient_getPhysicalDisplayIds SurfaceComposerClient_getPhysicalDisplayIds =
       nullptr;
+  PFN_SurfaceComposerClient_getDisplayState SurfaceComposerClient_getDisplayState = nullptr;
   PFN_SurfaceComposerClient_openGlobalTransaction SurfaceComposerClient_openGlobalTransaction =
       nullptr;
   PFN_SurfaceComposerClient_closeGlobalTransaction SurfaceComposerClient_closeGlobalTransaction =
@@ -320,6 +354,11 @@ struct EngineSymbols {
   PFN_SurfaceComposerClient_Transaction_ctor SurfaceComposerClient_Transaction_ctor = nullptr;
   PFN_SurfaceComposerClient_Transaction_setLayer SurfaceComposerClient_Transaction_setLayer =
       nullptr;
+  PFN_SurfaceComposerClient_Transaction_setPosition
+      SurfaceComposerClient_Transaction_setPosition = nullptr;
+  PFN_SurfaceComposerClient_Transaction_setLayerStack
+      SurfaceComposerClient_Transaction_setLayerStack = nullptr;
+  PFN_SurfaceComposerClient_Transaction_show SurfaceComposerClient_Transaction_show = nullptr;
   PFN_SurfaceComposerClient_Transaction_setTrustedOverlay
       SurfaceComposerClient_Transaction_setTrustedOverlay = nullptr;
   PFN_SurfaceComposerClient_Transaction_apply2 SurfaceComposerClient_Transaction_apply2 = nullptr;
@@ -1127,6 +1166,11 @@ static bool load_symbols(EngineSymbols& s) {
           load_symbol_list(s.libgui,
                            empty_list,
                            "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv"));
+  s.SurfaceComposerClient_getDisplayState =
+      reinterpret_cast<PFN_SurfaceComposerClient_getDisplayState>(
+          load_symbol_list(s.libgui,
+                           empty_list,
+                           "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE"));
   s.SurfaceComposerClient_openGlobalTransaction =
       reinterpret_cast<PFN_SurfaceComposerClient_openGlobalTransaction>(
           load_symbol_list(s.libgui,
@@ -1146,6 +1190,15 @@ static bool load_symbols(EngineSymbols& s) {
   static const char* kTransactionSetLayerNames[] = {
       "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi",
   };
+  static const char* kTransactionSetPositionNames[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff",
+  };
+  static const char* kTransactionSetLayerStackNames[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE",
+  };
+  static const char* kTransactionShowNames[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE",
+  };
   static const char* kTransactionSetTrustedNames[] = {
       "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb",
   };
@@ -1160,6 +1213,15 @@ static bool load_symbols(EngineSymbols& s) {
   const SymbolNameList tx_setlayer_list{
       kTransactionSetLayerNames,
       sizeof(kTransactionSetLayerNames) / sizeof(kTransactionSetLayerNames[0])};
+  const SymbolNameList tx_setpos_list{
+      kTransactionSetPositionNames,
+      sizeof(kTransactionSetPositionNames) / sizeof(kTransactionSetPositionNames[0])};
+  const SymbolNameList tx_setlayerstack_list{
+      kTransactionSetLayerStackNames,
+      sizeof(kTransactionSetLayerStackNames) / sizeof(kTransactionSetLayerStackNames[0])};
+  const SymbolNameList tx_show_list{
+      kTransactionShowNames,
+      sizeof(kTransactionShowNames) / sizeof(kTransactionShowNames[0])};
   const SymbolNameList tx_settrusted_list{
       kTransactionSetTrustedNames,
       sizeof(kTransactionSetTrustedNames) / sizeof(kTransactionSetTrustedNames[0])};
@@ -1175,6 +1237,15 @@ static bool load_symbols(EngineSymbols& s) {
   s.SurfaceComposerClient_Transaction_setLayer =
       reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setLayer>(
           load_symbol_list(s.libgui, tx_setlayer_list, nullptr));
+  s.SurfaceComposerClient_Transaction_setPosition =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setPosition>(
+          load_symbol_list(s.libgui, tx_setpos_list, nullptr));
+  s.SurfaceComposerClient_Transaction_setLayerStack =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setLayerStack>(
+          load_symbol_list(s.libgui, tx_setlayerstack_list, nullptr));
+  s.SurfaceComposerClient_Transaction_show =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_show>(
+          load_symbol_list(s.libgui, tx_show_list, nullptr));
   s.SurfaceComposerClient_Transaction_setTrustedOverlay =
       reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setTrustedOverlay>(
           load_symbol_list(s.libgui, tx_settrusted_list, nullptr));
@@ -1330,26 +1401,71 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
   LayerMetadataStorage metadata_storage{};
   init_layer_metadata(s, metadata_storage);
 
-  android::sp<android::IBinder> parent_handle{};
+  android::sp<android::IBinder> display_token{};
+  android::ui::LayerStack display_layer_stack{0xFFFFFFFFu};
+  int display_width = 0;
+  int display_height = 0;
   if (s.SurfaceComposerClient_getPhysicalDisplayToken) {
     android::PhysicalDisplayId display_id{0};
     SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
-    parent_handle.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
-    if (!parent_handle.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
+    display_token.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
+    if (!display_token.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
       std::vector<android::PhysicalDisplayId> ids =
           s.SurfaceComposerClient_getPhysicalDisplayIds();
       if (!ids.empty()) {
         SpObject token2 = s.SurfaceComposerClient_getPhysicalDisplayToken(ids.front());
-        parent_handle.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
+        display_token.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
       }
     }
+  }
+  if (display_token.ptr && s.SurfaceComposerClient_getDisplayState) {
+    android::ui::DisplayState display_state{};
+    int32_t res = s.SurfaceComposerClient_getDisplayState(display_token, &display_state);
+    if (res == 0) {
+      display_layer_stack = display_state.layerStack;
+      display_width = display_state.layerStackSpaceRect.width;
+      display_height = display_state.layerStackSpaceRect.height;
+    } else {
+      fprintf(stderr, "getDisplayState failed: %d\n", res);
+    }
+  }
+  const char* layer_env = getenv("MIDRAW_LAYERSTACK");
+  if (layer_env && layer_env[0]) {
+    char* endptr = nullptr;
+    unsigned long val = strtoul(layer_env, &endptr, 0);
+    if (endptr != layer_env) {
+      display_layer_stack.id = static_cast<uint32_t>(val);
+    }
+  }
+  fprintf(stderr, "Display layerStack=%u\n", display_layer_stack.id);
+
+  bool use_display_size = sdk >= 34;
+  const char* size_env = getenv("MIDRAW_USE_DISPLAY_SIZE");
+  if (size_env) {
+    use_display_size = size_env[0] != '0';
+  }
+  int request_width = width;
+  int request_height = height;
+  if (use_display_size && display_width > 0 && display_height > 0) {
+    request_width = display_width;
+    request_height = display_height;
+  }
+
+  bool use_display_parent = sdk < 34;
+  const char* parent_env = getenv("MIDRAW_PARENT_DISPLAY");
+  if (parent_env) {
+    use_display_parent = parent_env[0] != '0';
+  }
+  android::sp<android::IBinder> parent_handle{};
+  if (use_display_parent) {
+    parent_handle = display_token;
   }
 
   SpObject control_sp = s.SurfaceComposerClient_createSurface(
       client_ptr,
       name_storage.data,
-      static_cast<uint32_t>(width),
-      static_cast<uint32_t>(height),
+      static_cast<uint32_t>(request_width),
+      static_cast<uint32_t>(request_height),
       WINDOW_FORMAT_RGBA_8888,
       0,
       parent_handle,
@@ -1372,6 +1488,16 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
     if (s.SurfaceComposerClient_Transaction_setLayer) {
       s.SurfaceComposerClient_Transaction_setLayer(tx_storage.data, &control_sp, INT_MAX);
     }
+    if (s.SurfaceComposerClient_Transaction_setPosition) {
+      s.SurfaceComposerClient_Transaction_setPosition(tx_storage.data, &control_sp, 0.0f, 0.0f);
+    }
+    if (s.SurfaceComposerClient_Transaction_setLayerStack) {
+      s.SurfaceComposerClient_Transaction_setLayerStack(tx_storage.data, &control_sp,
+                                                       display_layer_stack);
+    }
+    if (s.SurfaceComposerClient_Transaction_show) {
+      s.SurfaceComposerClient_Transaction_show(tx_storage.data, &control_sp);
+    }
     if (sdk >= 31 && s.SurfaceComposerClient_Transaction_setTrustedOverlay) {
       s.SurfaceComposerClient_Transaction_setTrustedOverlay(tx_storage.data, &control_sp, true);
     }
@@ -1387,8 +1513,8 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
     s.SurfaceControl_setPosition(control_sp.ptr, 0.0f, 0.0f);
   }
   if (s.SurfaceControl_setSize) {
-    s.SurfaceControl_setSize(control_sp.ptr, static_cast<uint32_t>(width),
-                             static_cast<uint32_t>(height));
+    s.SurfaceControl_setSize(control_sp.ptr, static_cast<uint32_t>(request_width),
+                             static_cast<uint32_t>(request_height));
   }
   if (s.SurfaceControl_setAlpha) {
     s.SurfaceControl_setAlpha(control_sp.ptr, 1.0f);
@@ -1441,11 +1567,14 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
   }
 
   if (s.ANativeWindow_setBuffersGeometry) {
-    int res = s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+    int res = s.ANativeWindow_setBuffersGeometry(state.window,
+                                                 request_width,
+                                                 request_height,
+                                                 WINDOW_FORMAT_RGBA_8888);
     if (res != 0 && state.window_raw && state.window_raw != state.window) {
       int res2 = s.ANativeWindow_setBuffersGeometry(state.window_raw,
-                                                    width,
-                                                    height,
+                                                    request_width,
+                                                    request_height,
                                                     WINDOW_FORMAT_RGBA_8888);
       if (res2 == 0) {
         state.window = state.window_raw;
@@ -1564,6 +1693,7 @@ static bool create_surface_asurface(EngineState& state,
 
 static bool create_surface_legacy(EngineState& state, int width, int height) {
   EngineSymbols& s = state.symbols;
+  int sdk = read_sdk_version();
   if (create_surface_osimgui(state, width, height)) {
     return true;
   }
@@ -1602,22 +1732,51 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   String8Storage name_storage{};
   s.String8_ctor(name_storage.data, "SystemProfiler");
 
-  android::sp<android::IBinder> parent_handle{};
+  android::sp<android::IBinder> display_token{};
+  android::ui::LayerStack display_layer_stack{0xFFFFFFFFu};
   if (s.SurfaceComposerClient_getPhysicalDisplayToken) {
     android::PhysicalDisplayId display_id{0};
     SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
-    parent_handle.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
+    display_token.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
     fprintf(stderr, "Display token=%p\n", token_sp.ptr);
-    if (!parent_handle.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
+    if (!display_token.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
       std::vector<android::PhysicalDisplayId> ids =
           s.SurfaceComposerClient_getPhysicalDisplayIds();
       if (!ids.empty()) {
         SpObject token2 = s.SurfaceComposerClient_getPhysicalDisplayToken(ids.front());
-        parent_handle.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
+        display_token.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
         fprintf(stderr, "Display token(id=%llu)=%p\n",
                 static_cast<unsigned long long>(ids.front().value), token2.ptr);
       }
     }
+  }
+  if (display_token.ptr && s.SurfaceComposerClient_getDisplayState) {
+    android::ui::DisplayState display_state{};
+    int32_t res = s.SurfaceComposerClient_getDisplayState(display_token, &display_state);
+    if (res == 0) {
+      display_layer_stack = display_state.layerStack;
+    } else {
+      fprintf(stderr, "getDisplayState failed: %d\n", res);
+    }
+  }
+  const char* layer_env = getenv("MIDRAW_LAYERSTACK");
+  if (layer_env && layer_env[0]) {
+    char* endptr = nullptr;
+    unsigned long val = strtoul(layer_env, &endptr, 0);
+    if (endptr != layer_env) {
+      display_layer_stack.id = static_cast<uint32_t>(val);
+    }
+  }
+  fprintf(stderr, "Display layerStack=%u\n", display_layer_stack.id);
+
+  bool use_display_parent = sdk < 34;
+  const char* parent_env = getenv("MIDRAW_PARENT_DISPLAY");
+  if (parent_env) {
+    use_display_parent = parent_env[0] != '0';
+  }
+  android::sp<android::IBinder> parent_handle{};
+  if (use_display_parent) {
+    parent_handle = display_token;
   }
 
   SpObject control_sp{};
@@ -1699,22 +1858,48 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
       s.SurfaceComposerClient_closeGlobalTransaction) {
     s.SurfaceComposerClient_openGlobalTransaction();
   }
-  if (s.SurfaceControl_setLayer) {
-    s.SurfaceControl_setLayer(control_sp.ptr, INT_MAX);
-  }
-  if (s.SurfaceControl_setPosition) {
-    s.SurfaceControl_setPosition(control_sp.ptr, 0.0f, 0.0f);
-  }
-  if (s.SurfaceControl_setSize) {
-    s.SurfaceControl_setSize(control_sp.ptr, static_cast<uint32_t>(width),
-                             static_cast<uint32_t>(height));
-  }
-  if (s.SurfaceControl_setAlpha) {
-    s.SurfaceControl_setAlpha(control_sp.ptr, 1.0f);
-  }
-  if (s.SurfaceControl_setFlags) {
-    const uint32_t kOpaqueMask = 0x00000400u;
-    s.SurfaceControl_setFlags(control_sp.ptr, 0, kOpaqueMask);
+  if (s.SurfaceComposerClient_Transaction_ctor) {
+    TransactionStorage tx_storage{};
+    s.SurfaceComposerClient_Transaction_ctor(tx_storage.data);
+    if (s.SurfaceComposerClient_Transaction_setLayer) {
+      s.SurfaceComposerClient_Transaction_setLayer(tx_storage.data, &control_sp, INT_MAX);
+    }
+    if (s.SurfaceComposerClient_Transaction_setPosition) {
+      s.SurfaceComposerClient_Transaction_setPosition(tx_storage.data, &control_sp, 0.0f, 0.0f);
+    }
+    if (s.SurfaceComposerClient_Transaction_setLayerStack) {
+      s.SurfaceComposerClient_Transaction_setLayerStack(tx_storage.data, &control_sp,
+                                                       display_layer_stack);
+    }
+    if (s.SurfaceComposerClient_Transaction_show) {
+      s.SurfaceComposerClient_Transaction_show(tx_storage.data, &control_sp);
+    }
+    if (sdk >= 31 && s.SurfaceComposerClient_Transaction_setTrustedOverlay) {
+      s.SurfaceComposerClient_Transaction_setTrustedOverlay(tx_storage.data, &control_sp, true);
+    }
+    if (s.SurfaceComposerClient_Transaction_apply2) {
+      s.SurfaceComposerClient_Transaction_apply2(tx_storage.data, false, true);
+    } else if (s.SurfaceComposerClient_Transaction_apply1) {
+      s.SurfaceComposerClient_Transaction_apply1(tx_storage.data, false);
+    }
+  } else {
+    if (s.SurfaceControl_setLayer) {
+      s.SurfaceControl_setLayer(control_sp.ptr, INT_MAX);
+    }
+    if (s.SurfaceControl_setPosition) {
+      s.SurfaceControl_setPosition(control_sp.ptr, 0.0f, 0.0f);
+    }
+    if (s.SurfaceControl_setSize) {
+      s.SurfaceControl_setSize(control_sp.ptr, static_cast<uint32_t>(width),
+                               static_cast<uint32_t>(height));
+    }
+    if (s.SurfaceControl_setAlpha) {
+      s.SurfaceControl_setAlpha(control_sp.ptr, 1.0f);
+    }
+    if (s.SurfaceControl_setFlags) {
+      const uint32_t kOpaqueMask = 0x00000400u;
+      s.SurfaceControl_setFlags(control_sp.ptr, 0, kOpaqueMask);
+    }
   }
   if (s.SurfaceComposerClient_openGlobalTransaction &&
       s.SurfaceComposerClient_closeGlobalTransaction) {
@@ -1732,7 +1917,6 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   state.surface_native = surface_sp.ptr;
   state.window_raw = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
   state.window = surface_to_window(surface_sp.ptr);
-  int sdk = read_sdk_version();
   state.use_surface_direct = false;
   const char* force_direct_env = getenv("MIDRAW_FORCE_DIRECT");
   const bool allow_direct = force_direct_env && force_direct_env[0] != '0';
@@ -2021,7 +2205,14 @@ static void unlock_post(EngineState& state) {
 
   if ((state.window || state.window_raw) && state.symbols.ANativeWindow_unlockAndPost) {
     ANativeWindow* window = state.window ? state.window : state.window_raw;
-    state.symbols.ANativeWindow_unlockAndPost(window);
+    int res = state.symbols.ANativeWindow_unlockAndPost(window);
+    if (res != 0) {
+      static int log_count = 0;
+      if (log_count < 5) {
+        fprintf(stderr, "ANativeWindow_unlockAndPost failed: %d\n", res);
+        ++log_count;
+      }
+    }
   }
   state.pixels = nullptr;
 }
@@ -2096,6 +2287,7 @@ int main(int argc, char** argv) {
   uint16_t samples[256] = {};
   int sample_index = 0;
   uint64_t frame = 0;
+  const bool solid_fill = getenv("MIDRAW_SOLID") != nullptr;
 
   while (true) {
     static int loop_log = 0;
@@ -2105,6 +2297,14 @@ int main(int argc, char** argv) {
     }
     if (!lock_buffer(state)) {
       usleep(1000);
+      continue;
+    }
+
+    if (solid_fill) {
+      clear_rect(state.pixels, state.stride, 0, 0, state.width, state.height, 0xFF00FF00);
+      unlock_post(state);
+      ++frame;
+      usleep(8333);
       continue;
     }
 
