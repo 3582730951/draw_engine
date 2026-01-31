@@ -107,3 +107,30 @@ jobs:
           name: android-build
           path: |
             dist/**
+
+  android16-root-test:
+    needs: android-build
+    runs-on: [self-hosted, android16, root]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-build
+          path: dist
+
+      - name: Run Android 16 root demo
+        env:
+          REQUIRED_SDK: "36"
+        run: |
+          chmod +x "${GITHUB_WORKSPACE}/scripts/android16_root_demo.sh"
+          "${GITHUB_WORKSPACE}/scripts/android16_root_demo.sh"
+
+      - name: Upload demo logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android16-root-logs
+          path: |
+            android16_root_artifacts/**
