@@ -126,7 +126,12 @@ using PFN_AHardwareBuffer_lock = int (*)(AHardwareBuffer* buffer,
 using PFN_AHardwareBuffer_unlock = int (*)(AHardwareBuffer* buffer, int32_t* fence);
 using PFN_Surface_dequeueBuffer =
     int32_t (*)(void* surface, ANativeWindowBuffer** outBuffer, int* fenceFd);
-using PFN_Surface_queueBuffer =
+using PFN_Surface_queueBuffer4 =
+    int32_t (*)(void* surface,
+                ANativeWindowBuffer* buffer,
+                int fenceFd,
+                void* queueOutput);
+using PFN_Surface_queueBuffer3 =
     int32_t (*)(void* surface, ANativeWindowBuffer* buffer, int fenceFd);
 using PFN_Surface_cancelBuffer =
     int32_t (*)(void* surface, ANativeWindowBuffer* buffer, int fenceFd);
@@ -287,7 +292,8 @@ struct EngineSymbols {
   PFN_AHardwareBuffer_lock AHardwareBuffer_lock = nullptr;
   PFN_AHardwareBuffer_unlock AHardwareBuffer_unlock = nullptr;
   PFN_Surface_dequeueBuffer Surface_dequeueBuffer = nullptr;
-  PFN_Surface_queueBuffer Surface_queueBuffer = nullptr;
+  PFN_Surface_queueBuffer4 Surface_queueBuffer4 = nullptr;
+  PFN_Surface_queueBuffer3 Surface_queueBuffer3 = nullptr;
   PFN_Surface_cancelBuffer Surface_cancelBuffer = nullptr;
   PFN_GraphicBuffer_lock GraphicBuffer_lock = nullptr;
   PFN_GraphicBuffer_unlock GraphicBuffer_unlock = nullptr;
@@ -974,7 +980,10 @@ static bool load_symbols(EngineSymbols& s) {
   static const char* kSurfaceDequeueNames[] = {
       "_ZN7android7Surface13dequeueBufferEPP19ANativeWindowBufferPi",
   };
-  static const char* kSurfaceQueueNames[] = {
+  static const char* kSurfaceQueue4Names[] = {
+      "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE",
+  };
+  static const char* kSurfaceQueue3Names[] = {
       "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi",
   };
   static const char* kSurfaceCancelNames[] = {
@@ -988,8 +997,10 @@ static bool load_symbols(EngineSymbols& s) {
   };
   const SymbolNameList surface_dequeue_list{
       kSurfaceDequeueNames, sizeof(kSurfaceDequeueNames) / sizeof(kSurfaceDequeueNames[0])};
-  const SymbolNameList surface_queue_list{
-      kSurfaceQueueNames, sizeof(kSurfaceQueueNames) / sizeof(kSurfaceQueueNames[0])};
+  const SymbolNameList surface_queue4_list{
+      kSurfaceQueue4Names, sizeof(kSurfaceQueue4Names) / sizeof(kSurfaceQueue4Names[0])};
+  const SymbolNameList surface_queue3_list{
+      kSurfaceQueue3Names, sizeof(kSurfaceQueue3Names) / sizeof(kSurfaceQueue3Names[0])};
   const SymbolNameList surface_cancel_list{
       kSurfaceCancelNames, sizeof(kSurfaceCancelNames) / sizeof(kSurfaceCancelNames[0])};
   const SymbolNameList graphic_lock_list{
@@ -998,8 +1009,10 @@ static bool load_symbols(EngineSymbols& s) {
       kGraphicBufferUnlockNames, sizeof(kGraphicBufferUnlockNames) / sizeof(kGraphicBufferUnlockNames[0])};
   s.Surface_dequeueBuffer = reinterpret_cast<PFN_Surface_dequeueBuffer>(
       load_symbol_list(s.libgui, surface_dequeue_list, nullptr));
-  s.Surface_queueBuffer = reinterpret_cast<PFN_Surface_queueBuffer>(
-      load_symbol_list(s.libgui, surface_queue_list, nullptr));
+  s.Surface_queueBuffer4 = reinterpret_cast<PFN_Surface_queueBuffer4>(
+      load_symbol_list(s.libgui, surface_queue4_list, nullptr));
+  s.Surface_queueBuffer3 = reinterpret_cast<PFN_Surface_queueBuffer3>(
+      load_symbol_list(s.libgui, surface_queue3_list, nullptr));
   s.Surface_cancelBuffer = reinterpret_cast<PFN_Surface_cancelBuffer>(
       load_symbol_list(s.libgui, surface_cancel_list, nullptr));
   s.GraphicBuffer_lock = reinterpret_cast<PFN_GraphicBuffer_lock>(
@@ -1365,8 +1378,9 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
   state.surface = nullptr;
 
   state.use_surface_direct = false;
-  if (state.surface_native && s.Surface_dequeueBuffer && s.Surface_queueBuffer &&
-      s.GraphicBuffer_lock && s.GraphicBuffer_unlock) {
+  if (state.surface_native && s.Surface_dequeueBuffer &&
+      (s.Surface_queueBuffer4 || s.Surface_queueBuffer3) && s.GraphicBuffer_lock &&
+      s.GraphicBuffer_unlock) {
     if (sdk >= 34) {
       state.use_surface_direct = true;
       fprintf(stderr, "Using Surface direct buffer path\n");
@@ -1375,7 +1389,9 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
     fprintf(stderr,
             "Surface direct path unavailable: dequeue=%p queue=%p lock=%p unlock=%p\n",
             reinterpret_cast<void*>(s.Surface_dequeueBuffer),
-            reinterpret_cast<void*>(s.Surface_queueBuffer),
+            reinterpret_cast<void*>(s.Surface_queueBuffer4
+                                        ? reinterpret_cast<void*>(s.Surface_queueBuffer4)
+                                        : reinterpret_cast<void*>(s.Surface_queueBuffer3)),
             reinterpret_cast<void*>(s.GraphicBuffer_lock),
             reinterpret_cast<void*>(s.GraphicBuffer_unlock));
   }
@@ -1663,8 +1679,9 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
   int sdk = read_sdk_version();
   state.use_surface_direct = false;
-  if (state.surface_native && s.Surface_dequeueBuffer && s.Surface_queueBuffer &&
-      s.GraphicBuffer_lock && s.GraphicBuffer_unlock) {
+  if (state.surface_native && s.Surface_dequeueBuffer &&
+      (s.Surface_queueBuffer4 || s.Surface_queueBuffer3) && s.GraphicBuffer_lock &&
+      s.GraphicBuffer_unlock) {
     if (sdk >= 34) {
       state.use_surface_direct = true;
       fprintf(stderr, "Using Surface direct buffer path\n");
@@ -1673,7 +1690,9 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     fprintf(stderr,
             "Surface direct path unavailable: dequeue=%p queue=%p lock=%p unlock=%p\n",
             reinterpret_cast<void*>(s.Surface_dequeueBuffer),
-            reinterpret_cast<void*>(s.Surface_queueBuffer),
+            reinterpret_cast<void*>(s.Surface_queueBuffer4
+                                        ? reinterpret_cast<void*>(s.Surface_queueBuffer4)
+                                        : reinterpret_cast<void*>(s.Surface_queueBuffer3)),
             reinterpret_cast<void*>(s.GraphicBuffer_lock),
             reinterpret_cast<void*>(s.GraphicBuffer_unlock));
   }
@@ -1758,8 +1777,9 @@ static bool lock_buffer(EngineState& state) {
 
   if (state.use_surface_direct) {
     EngineSymbols& s = state.symbols;
-    if (!state.surface_native || !s.Surface_dequeueBuffer || !s.Surface_queueBuffer ||
-        !s.GraphicBuffer_lock || !s.GraphicBuffer_unlock) {
+    if (!state.surface_native || !s.Surface_dequeueBuffer ||
+        (!s.Surface_queueBuffer4 && !s.Surface_queueBuffer3) || !s.GraphicBuffer_lock ||
+        !s.GraphicBuffer_unlock) {
       return false;
     }
     state.direct_buffer = nullptr;
@@ -1838,8 +1858,14 @@ static void unlock_post(EngineState& state) {
     if (state.direct_buffer && s.GraphicBuffer_unlock) {
       s.GraphicBuffer_unlock(reinterpret_cast<void*>(state.direct_buffer));
     }
-    if (state.surface_native && state.direct_buffer && s.Surface_queueBuffer) {
-      int res = s.Surface_queueBuffer(state.surface_native, state.direct_buffer, -1);
+    if (state.surface_native && state.direct_buffer &&
+        (s.Surface_queueBuffer4 || s.Surface_queueBuffer3)) {
+      int res = -1;
+      if (s.Surface_queueBuffer4) {
+        res = s.Surface_queueBuffer4(state.surface_native, state.direct_buffer, -1, nullptr);
+      } else if (s.Surface_queueBuffer3) {
+        res = s.Surface_queueBuffer3(state.surface_native, state.direct_buffer, -1);
+      }
       if (res != 0 && s.Surface_cancelBuffer) {
         s.Surface_cancelBuffer(state.surface_native, state.direct_buffer, -1);
       }
