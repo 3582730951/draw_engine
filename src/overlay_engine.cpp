@@ -134,6 +134,10 @@ struct String8Storage {
 
 constexpr int8_t kBufferTransparencyTranslucent = 1;
 
+using PFN_ProcessState_self = SpObject (*)();
+using PFN_ProcessState_setThreadPoolMaxThreadCount = void (*)(void* proc, size_t count);
+using PFN_ProcessState_startThreadPool = void (*)(void* proc);
+
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
@@ -204,6 +208,7 @@ struct EngineSymbols {
   void* libandroid = nullptr;
   void* libutils = nullptr;
   void* libnativewindow = nullptr;
+  void* libbinder = nullptr;
 
   PFN_ASurfaceControl_create ASurfaceControl_create = nullptr;
   PFN_ASurfaceControl_createFromWindow ASurfaceControl_createFromWindow = nullptr;
@@ -232,6 +237,10 @@ struct EngineSymbols {
   PFN_AHardwareBuffer_release AHardwareBuffer_release = nullptr;
   PFN_AHardwareBuffer_lock AHardwareBuffer_lock = nullptr;
   PFN_AHardwareBuffer_unlock AHardwareBuffer_unlock = nullptr;
+
+  PFN_ProcessState_self ProcessState_self = nullptr;
+  PFN_ProcessState_setThreadPoolMaxThreadCount ProcessState_setThreadPoolMaxThreadCount = nullptr;
+  PFN_ProcessState_startThreadPool ProcessState_startThreadPool = nullptr;
 
   PFN_String8_ctor String8_ctor = nullptr;
   PFN_String8_dtor String8_dtor = nullptr;
@@ -731,6 +740,7 @@ static bool load_symbols(EngineSymbols& s) {
   }
   s.libutils = dlopen("libutils.so", RTLD_NOW);
   s.libnativewindow = dlopen("libnativewindow.so", RTLD_NOW);
+  s.libbinder = dlopen("libbinder.so", RTLD_NOW);
 
   const SymbolVersion* version = pick_symbol_version(read_sdk_version());
   const SymbolNameList empty_list{nullptr, 0};
@@ -839,6 +849,16 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         empty_list,
                         "ANativeWindow_fromSurfaceControl"));
+
+  s.ProcessState_self = reinterpret_cast<PFN_ProcessState_self>(
+      load_symbol_list(s.libbinder, empty_list, "_ZN7android12ProcessState4selfEv"));
+  s.ProcessState_setThreadPoolMaxThreadCount =
+      reinterpret_cast<PFN_ProcessState_setThreadPoolMaxThreadCount>(
+          load_symbol_list(s.libbinder,
+                           empty_list,
+                           "_ZN7android12ProcessState27setThreadPoolMaxThreadCountEm"));
+  s.ProcessState_startThreadPool = reinterpret_cast<PFN_ProcessState_startThreadPool>(
+      load_symbol_list(s.libbinder, empty_list, "_ZN7android12ProcessState15startThreadPoolEv"));
 
   s.ANativeWindow_lock = reinterpret_cast<PFN_ANativeWindow_lock>(
       load_symbol_list(s.libandroid, empty_list, "ANativeWindow_lock"));
@@ -982,6 +1002,19 @@ static void release_transaction(EngineSymbols& s, ASurfaceTransaction* tx) {
   if (s.ASurfaceTransaction_release) {
     s.ASurfaceTransaction_release(tx);
   }
+}
+
+static void init_binder_threadpool(EngineSymbols& s) {
+  if (!s.ProcessState_self || !s.ProcessState_setThreadPoolMaxThreadCount ||
+      !s.ProcessState_startThreadPool) {
+    return;
+  }
+  SpObject proc = s.ProcessState_self();
+  if (!proc.ptr) {
+    return;
+  }
+  s.ProcessState_setThreadPoolMaxThreadCount(proc.ptr, 1);
+  s.ProcessState_startThreadPool(proc.ptr);
 }
 
 static bool create_surface_asurface(EngineState& state,
@@ -1408,6 +1441,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "load_symbols failed\n");
     return 1;
   }
+  init_binder_threadpool(state.symbols);
 
   if (!create_surface_legacy(state, width, height)) {
     if (!create_surface_asurface(state, width, height, nullptr)) {
