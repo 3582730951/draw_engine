@@ -1278,8 +1278,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     }
   }
   if (sdk >= 34) {
-    fprintf(stderr, "API %d requires AHB path; aborting legacy ANativeWindow usage\n", sdk);
-    return false;
+    fprintf(stderr, "API %d using legacy ANativeWindow path (AHB unavailable)\n", sdk);
   }
   if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
