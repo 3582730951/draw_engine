@@ -7,7 +7,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <hardware/gralloc.h>
 #include <limits.h>
 #include <poll.h>
 #include <stdint.h>
@@ -22,9 +21,21 @@
 #include <vector>
 #include <time.h>
 
+#ifndef GRALLOC_USAGE_SW_WRITE_OFTEN
+#define GRALLOC_USAGE_SW_WRITE_OFTEN 0x00000030u
+#endif
+
 // Forward declarations to avoid compile-time linkage to SurfaceControl headers.
 struct ASurfaceControl;
 struct ASurfaceTransaction;
+struct ANativeWindowBuffer {
+  int32_t width;
+  int32_t height;
+  int32_t stride;
+  int32_t format;
+  int32_t usage;
+  void* reserved[2];
+};
 
 namespace android {
 class IBinder;
