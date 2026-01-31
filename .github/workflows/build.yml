@@ -89,7 +89,8 @@ jobs:
           python3 "${GITHUB_WORKSPACE}/scripts/ci_test.py" \
             --dist "${GITHUB_WORKSPACE}/dist" \
             --ndk "${ANDROID_NDK_HOME}" \
-            --repo "${GITHUB_WORKSPACE}"
+            --repo "${GITHUB_WORKSPACE}" \
+            --lib-root "${GITHUB_WORKSPACE}/android-lib-dump"
 
       - name: Verify artifacts
         run: |
