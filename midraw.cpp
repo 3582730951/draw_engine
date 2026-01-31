@@ -423,13 +423,8 @@ static bool init_symbols(AndroidSymbols* symbols) {
                              sizeof(kCandidates_ANativeWindow_getHeight) /
                                  sizeof(kCandidates_ANativeWindow_getHeight[0])));
 
-  const bool ok = symbols->ASurfaceControl_create && symbols->ASurfaceControl_release &&
-                  symbols->ASurfaceTransaction_create && symbols->ASurfaceTransaction_release &&
-                  symbols->ASurfaceTransaction_setBufferSize &&
-                  symbols->ASurfaceTransaction_setVisibility &&
-                  symbols->ASurfaceTransaction_setLayer && symbols->ASurfaceTransaction_apply &&
-                  symbols->ANativeWindow_fromSurfaceControl && symbols->ANativeWindow_lock &&
-                  symbols->ANativeWindow_unlockAndPost && symbols->ANativeWindow_release;
+  const bool ok = symbols->ANativeWindow_lock && symbols->ANativeWindow_unlockAndPost &&
+                  symbols->ANativeWindow_release;
 
   if (!ok) {
     fprintf(stderr, "dlsym failed: missing required symbols\n");

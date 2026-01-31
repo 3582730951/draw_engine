@@ -4,11 +4,14 @@
 #include "include/midraw.h"
 
 #include <android/native_window.h>
+#include <cstddef>
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/system_properties.h>
+#include <vector>
 
 using PFN_ASurfaceTransaction_setAlpha = void (*)(ASurfaceTransaction* transaction,
                                                   ASurfaceControl* control,
@@ -27,15 +30,79 @@ struct SpObject {
   ~SpObject() {}
 };
 
+namespace android {
+class IBinder;
+
+template <typename T>
+struct sp {
+  T* ptr;
+  sp() : ptr(nullptr) {}
+};
+
+struct PhysicalDisplayId {
+  uint64_t value;
+};
+
+namespace ui {
+struct LayerStack {
+  uint32_t id;
+};
+
+struct Size {
+  int32_t width;
+  int32_t height;
+};
+
+enum class Rotation : uint32_t {
+  Rotation0 = 0,
+  Rotation90 = 1,
+  Rotation180 = 2,
+  Rotation270 = 3,
+};
+
+struct DisplayState {
+  LayerStack layerStack;
+  Rotation orientation;
+  Size layerStackSpaceRect;
+};
+}  // namespace ui
+}  // namespace android
+
+static ANativeWindow* surface_to_window(void* surface_ptr) {
+  if (!surface_ptr) {
+    return nullptr;
+  }
+  const size_t offset = sizeof(std::max_align_t) / 2;
+  return reinterpret_cast<ANativeWindow*>(reinterpret_cast<uintptr_t>(surface_ptr) + offset);
+}
+
 struct String8Storage {
   alignas(void*) unsigned char data[64];
 };
 
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
+using PFN_LayerMetadata_ctor = void (*)(void* self);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
+using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
+    SpObject (*)(android::PhysicalDisplayId display_id);
+using PFN_SurfaceComposerClient_getPhysicalDisplayIds =
+    std::vector<android::PhysicalDisplayId> (*)();
+using PFN_SurfaceComposerClient_getDisplayState =
+    int32_t (*)(const android::sp<android::IBinder>& display,
+                android::ui::DisplayState* out_state);
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
+using PFN_SurfaceComposerClient_createSurface =
+    SpObject (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                uint32_t flags,
+                const android::sp<android::IBinder>& parent,
+                const void* layer_metadata,
+                uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
     int32_t (*)(void* client,
                 const void* name,
@@ -53,6 +120,21 @@ using PFN_SurfaceControl_setPosition = int32_t (*)(void* control, float x, float
 using PFN_SurfaceControl_setSize = int32_t (*)(void* control, uint32_t w, uint32_t h);
 using PFN_SurfaceControl_setAlpha = int32_t (*)(void* control, float alpha);
 using PFN_SurfaceControl_setFlags = int32_t (*)(void* control, uint32_t flags, uint32_t mask);
+using PFN_SurfaceComposerClient_Transaction_ctor = void (*)(void* tx);
+using PFN_SurfaceComposerClient_Transaction_setLayer =
+    void* (*)(void* tx, void* surface_control, int32_t z);
+using PFN_SurfaceComposerClient_Transaction_setPosition =
+    void* (*)(void* tx, void* surface_control, float x, float y);
+using PFN_SurfaceComposerClient_Transaction_setLayerStack =
+    void* (*)(void* tx, void* surface_control, android::ui::LayerStack layer_stack);
+using PFN_SurfaceComposerClient_Transaction_show =
+    void* (*)(void* tx, void* surface_control);
+using PFN_SurfaceComposerClient_Transaction_setTrustedOverlay =
+    void* (*)(void* tx, void* surface_control, bool is_trusted);
+using PFN_SurfaceComposerClient_Transaction_apply2 =
+    int32_t (*)(void* tx, bool synchronous, bool one_way);
+using PFN_SurfaceComposerClient_Transaction_apply1 =
+    int32_t (*)(void* tx, bool synchronous);
 
 static int read_sdk_version() {
   const char* override = getenv("MIDRAW_SDK");
@@ -228,6 +310,307 @@ static bool create_window_asurface(AndroidSymbols& symbols,
           symbols.libandroid, geometry_list, "ANativeWindow_setBuffersGeometry"));
   if (set_geometry) {
     set_geometry(render.window, target_width, target_height, WINDOW_FORMAT_RGBA_8888);
+  }
+
+  return true;
+}
+
+struct LayerMetadataStorage {
+  alignas(void*) unsigned char data[1024];
+};
+
+struct TransactionStorage {
+  alignas(void*) unsigned char data[1024];
+};
+
+static void init_layer_metadata(PFN_LayerMetadata_ctor ctor, LayerMetadataStorage& storage) {
+  memset(storage.data, 0, sizeof(storage.data));
+  if (ctor) {
+    ctor(storage.data);
+  }
+}
+
+static bool create_window_osimgui(AndroidSymbols& symbols,
+                                  RenderContext& render,
+                                  int32_t requested_width,
+                                  int32_t requested_height,
+                                  const MidrawConfig* config) {
+  if (!symbols.libgui) {
+    return false;
+  }
+  void* libutils = dlopen("libutils.so", RTLD_NOW);
+  if (!libutils) {
+    fprintf(stderr, "dlopen libutils.so failed\n");
+    return false;
+  }
+
+  const char* name = (config && config->surface_name) ? config->surface_name : "Benchmark_Layer";
+
+  PFN_String8_ctor string8_ctor = reinterpret_cast<PFN_String8_ctor>(
+      load_symbol_list(libutils, SymbolNameList{nullptr, 0}, "_ZN7android7String8C1EPKc"));
+  if (!string8_ctor) {
+    string8_ctor = reinterpret_cast<PFN_String8_ctor>(
+        load_symbol_list(libutils, SymbolNameList{nullptr, 0}, "_ZN7android7String8C2EPKc"));
+  }
+  PFN_String8_dtor string8_dtor = reinterpret_cast<PFN_String8_dtor>(
+      load_symbol_list(libutils, SymbolNameList{nullptr, 0}, "_ZN7android7String8D1Ev"));
+  if (!string8_dtor) {
+    string8_dtor = reinterpret_cast<PFN_String8_dtor>(
+        load_symbol_list(libutils, SymbolNameList{nullptr, 0}, "_ZN7android7String8D2Ev"));
+  }
+
+  static const char* kLayerMetadataCtorNames[] = {
+      "_ZN7android3gui13LayerMetadataC2Ev",
+      "_ZN7android13LayerMetadataC2Ev",
+  };
+  const SymbolNameList layer_ctor_list{
+      kLayerMetadataCtorNames,
+      sizeof(kLayerMetadataCtorNames) / sizeof(kLayerMetadataCtorNames[0])};
+  PFN_LayerMetadata_ctor layer_ctor = reinterpret_cast<PFN_LayerMetadata_ctor>(
+      load_symbol_list(symbols.libgui, layer_ctor_list, nullptr));
+
+  static const char* kSurfaceComposerCreateSurfaceNames[] = {
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataE",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEii",
+  };
+  const SymbolNameList create_surface_list{
+      kSurfaceComposerCreateSurfaceNames,
+      sizeof(kSurfaceComposerCreateSurfaceNames) /
+          sizeof(kSurfaceComposerCreateSurfaceNames[0])};
+  PFN_SurfaceComposerClient_createSurface create_surface =
+      reinterpret_cast<PFN_SurfaceComposerClient_createSurface>(
+          load_symbol_list(symbols.libgui, create_surface_list, nullptr));
+
+  PFN_SurfaceComposerClient_getDefault get_default =
+      reinterpret_cast<PFN_SurfaceComposerClient_getDefault>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient10getDefaultEv"));
+
+  static const char* kSurfaceControlGetSurfaceNames[] = {
+      "_ZN7android14SurfaceControl10getSurfaceEv",
+      "_ZNK7android14SurfaceControl10getSurfaceEv",
+  };
+  const SymbolNameList get_surface_list{
+      kSurfaceControlGetSurfaceNames,
+      sizeof(kSurfaceControlGetSurfaceNames) / sizeof(kSurfaceControlGetSurfaceNames[0])};
+  PFN_SurfaceControl_getSurface get_surface =
+      reinterpret_cast<PFN_SurfaceControl_getSurface>(
+          load_symbol_list(symbols.libgui, get_surface_list, nullptr));
+
+  PFN_SurfaceComposerClient_getPhysicalDisplayToken get_display_token =
+      reinterpret_cast<PFN_SurfaceComposerClient_getPhysicalDisplayToken>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE"));
+  PFN_SurfaceComposerClient_getPhysicalDisplayIds get_display_ids =
+      reinterpret_cast<PFN_SurfaceComposerClient_getPhysicalDisplayIds>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv"));
+  PFN_SurfaceComposerClient_getDisplayState get_display_state =
+      reinterpret_cast<PFN_SurfaceComposerClient_getDisplayState>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE"));
+
+  PFN_SurfaceComposerClient_openGlobalTransaction open_tx =
+      reinterpret_cast<PFN_SurfaceComposerClient_openGlobalTransaction>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient21openGlobalTransactionEv"));
+  PFN_SurfaceComposerClient_closeGlobalTransaction close_tx =
+      reinterpret_cast<PFN_SurfaceComposerClient_closeGlobalTransaction>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient22closeGlobalTransactionEv"));
+  PFN_SurfaceComposerClient_Transaction_ctor tx_ctor =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_ctor>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11TransactionC2Ev"));
+  PFN_SurfaceComposerClient_Transaction_setLayer tx_set_layer =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setLayer>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi"));
+  PFN_SurfaceComposerClient_Transaction_setPosition tx_set_pos =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setPosition>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction11setPositionERKNS_2spINS_14SurfaceControlEEEff"));
+  PFN_SurfaceComposerClient_Transaction_setLayerStack tx_set_layer_stack =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setLayerStack>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction13setLayerStackERKNS_2spINS_14SurfaceControlEEENS_2ui10LayerStackE"));
+  PFN_SurfaceComposerClient_Transaction_show tx_show =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_show>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction4showERKNS_2spINS_14SurfaceControlEEE"));
+  PFN_SurfaceComposerClient_Transaction_setTrustedOverlay tx_set_trusted =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setTrustedOverlay>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb"));
+  PFN_SurfaceComposerClient_Transaction_apply2 tx_apply2 =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_apply2>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction5applyEbb"));
+  PFN_SurfaceComposerClient_Transaction_apply1 tx_apply1 =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_apply1>(
+          load_symbol_list(symbols.libgui,
+                           SymbolNameList{nullptr, 0},
+                           "_ZN7android21SurfaceComposerClient11Transaction5applyEb"));
+
+  if (!string8_ctor || !string8_dtor || !get_default || !create_surface || !get_surface) {
+    dlclose(libutils);
+    return false;
+  }
+
+  const int sdk = read_sdk_version();
+  SpObject client_sp = get_default();
+  if (!client_sp.ptr) {
+    dlclose(libutils);
+    return false;
+  }
+
+  String8Storage name_storage{};
+  string8_ctor(name_storage.data, name);
+
+  LayerMetadataStorage metadata_storage{};
+  init_layer_metadata(layer_ctor, metadata_storage);
+
+  android::sp<android::IBinder> display_token{};
+  android::ui::LayerStack display_layer_stack{0xFFFFFFFFu};
+  int display_width = 0;
+  int display_height = 0;
+  if (get_display_token) {
+    android::PhysicalDisplayId display_id{0};
+    SpObject token_sp = get_display_token(display_id);
+    display_token.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
+    if (!display_token.ptr && get_display_ids) {
+      std::vector<android::PhysicalDisplayId> ids = get_display_ids();
+      if (!ids.empty()) {
+        SpObject token2 = get_display_token(ids.front());
+        display_token.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
+      }
+    }
+  }
+  if (display_token.ptr && get_display_state) {
+    android::ui::DisplayState display_state{};
+    if (get_display_state(display_token, &display_state) == 0) {
+      display_layer_stack = display_state.layerStack;
+      display_width = display_state.layerStackSpaceRect.width;
+      display_height = display_state.layerStackSpaceRect.height;
+    }
+  }
+  const char* layer_env = getenv("MIDRAW_LAYERSTACK");
+  if (layer_env && layer_env[0]) {
+    char* endptr = nullptr;
+    unsigned long val = strtoul(layer_env, &endptr, 0);
+    if (endptr != layer_env) {
+      display_layer_stack.id = static_cast<uint32_t>(val);
+    }
+  }
+
+  bool use_display_parent = sdk < 34;
+  const char* parent_env = getenv("MIDRAW_PARENT_DISPLAY");
+  if (parent_env) {
+    use_display_parent = parent_env[0] != '0';
+  }
+  android::sp<android::IBinder> parent_handle{};
+  if (use_display_parent) {
+    parent_handle = display_token;
+  }
+
+  bool use_display_size = sdk >= 34;
+  const char* size_env = getenv("MIDRAW_USE_DISPLAY_SIZE");
+  if (size_env) {
+    use_display_size = size_env[0] != '0';
+  }
+  int request_width = requested_width;
+  int request_height = requested_height;
+  if ((request_width <= 0 || request_height <= 0) && use_display_size &&
+      display_width > 0 && display_height > 0) {
+    request_width = display_width;
+    request_height = display_height;
+  }
+  if (request_width <= 0 || request_height <= 0) {
+    request_width = 1080;
+    request_height = 1920;
+  }
+
+  SpObject control_sp = create_surface(client_sp.ptr,
+                                       name_storage.data,
+                                       static_cast<uint32_t>(request_width),
+                                       static_cast<uint32_t>(request_height),
+                                       WINDOW_FORMAT_RGBA_8888,
+                                       0,
+                                       parent_handle,
+                                       metadata_storage.data,
+                                       nullptr);
+  string8_dtor(name_storage.data);
+  dlclose(libutils);
+
+  if (!control_sp.ptr) {
+    return false;
+  }
+
+  if (open_tx && close_tx) {
+    open_tx();
+  }
+  if (tx_ctor) {
+    TransactionStorage tx_storage{};
+    tx_ctor(tx_storage.data);
+    if (tx_set_layer) {
+      tx_set_layer(tx_storage.data, &control_sp, INT_MAX);
+    }
+    if (tx_set_pos) {
+      tx_set_pos(tx_storage.data, &control_sp, 0.0f, 0.0f);
+    }
+    if (tx_set_layer_stack) {
+      tx_set_layer_stack(tx_storage.data, &control_sp, display_layer_stack);
+    }
+    if (tx_show) {
+      tx_show(tx_storage.data, &control_sp);
+    }
+    if (sdk >= 31 && tx_set_trusted) {
+      tx_set_trusted(tx_storage.data, &control_sp, true);
+    }
+    if (tx_apply2) {
+      tx_apply2(tx_storage.data, false, true);
+    } else if (tx_apply1) {
+      tx_apply1(tx_storage.data, false);
+    }
+  }
+  if (open_tx && close_tx) {
+    close_tx();
+  }
+
+  SpObject surface_sp = get_surface(control_sp.ptr);
+  if (!surface_sp.ptr) {
+    return false;
+  }
+
+  render.window = surface_to_window(surface_sp.ptr);
+  if (!render.window) {
+    render.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  }
+  render.surface = nullptr;
+
+  PFN_ANativeWindow_setBuffersGeometry set_geometry =
+      reinterpret_cast<PFN_ANativeWindow_setBuffersGeometry>(
+          load_symbol_list(symbols.libandroid,
+                           SymbolNameList{nullptr, 0},
+                           "ANativeWindow_setBuffersGeometry"));
+  if (set_geometry) {
+    set_geometry(render.window, request_width, request_height, WINDOW_FORMAT_RGBA_8888);
   }
 
   return true;
@@ -433,17 +816,44 @@ bool midraw_create_window(AndroidSymbols& symbols,
                           int32_t requested_width,
                           int32_t requested_height,
                           const MidrawConfig* config) {
+  const bool force_osimgui = env_truthy("MIDRAW_USE_OSIMGUI");
   const bool force_legacy = env_truthy("MIDRAW_USE_LEGACY_SCC");
-  if (!force_legacy && symbols.ASurfaceControl_create) {
-    return create_window_asurface(symbols, render, requested_width, requested_height, config);
+  const int sdk = read_sdk_version();
+  const bool prefer_osimgui = sdk >= 34;
+
+  if (force_osimgui) {
+    if (create_window_osimgui(symbols, render, requested_width, requested_height, config)) {
+      return true;
+    }
   }
+
+  if (!force_legacy && !prefer_osimgui && symbols.ASurfaceControl_create) {
+    if (create_window_asurface(symbols, render, requested_width, requested_height, config)) {
+      return true;
+    }
+  }
+
+  if (!force_legacy && prefer_osimgui) {
+    if (create_window_osimgui(symbols, render, requested_width, requested_height, config)) {
+      return true;
+    }
+  }
+
   if (force_legacy) {
     if (create_window_legacy(symbols, render, requested_width, requested_height, config)) {
       return true;
     }
   }
+
   if (symbols.ASurfaceControl_create) {
-    return create_window_asurface(symbols, render, requested_width, requested_height, config);
+    if (create_window_asurface(symbols, render, requested_width, requested_height, config)) {
+      return true;
+    }
   }
+
+  if (create_window_osimgui(symbols, render, requested_width, requested_height, config)) {
+    return true;
+  }
+
   return create_window_legacy(symbols, render, requested_width, requested_height, config);
 }
