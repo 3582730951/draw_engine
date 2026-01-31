@@ -949,12 +949,16 @@ static bool create_surface_asurface(EngineState& state,
     return false;
   }
 
-  if (parent_window && s.ASurfaceControl_createFromWindow) {
+  if (s.ASurfaceControl_create) {
+    state.surface = s.ASurfaceControl_create(nullptr, "SystemProfiler");
+  }
+  if (!state.surface && parent_window && s.ASurfaceControl_createFromWindow) {
     state.surface = s.ASurfaceControl_createFromWindow(parent_window, "SystemProfiler");
-  } else {
+  }
+  if (!state.surface) {
     fprintf(stderr,
-            "ASurfaceControl_create requires non-null parent on this platform; "
-            "skipping ASurfaceControl path.\n");
+            "ASurfaceControl_create failed (parent=%p); skipping ASurfaceControl path.\n",
+            reinterpret_cast<void*>(parent_window));
     return false;
   }
   if (!state.surface) {
@@ -1163,12 +1167,14 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   fprintf(stderr, "Surface surface=%p\n", surface_sp.ptr);
 
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  int sdk = read_sdk_version();
   const bool can_ahb = s.ASurfaceControl_createFromWindow && s.ASurfaceTransaction_create &&
                        s.ASurfaceTransaction_setBuffer && s.ASurfaceTransaction_setBufferSize &&
                        s.ASurfaceTransaction_setVisibility && s.ASurfaceTransaction_setLayer &&
                        s.ASurfaceTransaction_setAlpha && s.ASurfaceTransaction_setOpaque &&
                        s.ASurfaceTransaction_apply;
   if (can_ahb) {
+    fprintf(stderr, "Attempting AHB path via ASurfaceControl_createFromWindow\n");
     state.surface = s.ASurfaceControl_createFromWindow(state.window, "SystemProfiler");
     if (state.surface) {
       ASurfaceTransaction* tx = s.ASurfaceTransaction_create();
@@ -1184,15 +1190,22 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
         }
       }
       if (setup_ahb_buffer(state, width, height)) {
+        fprintf(stderr, "AHB path enabled\n");
         return true;
       }
+      fprintf(stderr, "AHB setup failed\n");
       if (s.ASurfaceControl_release) {
         s.ASurfaceControl_release(state.surface);
       }
       state.surface = nullptr;
+    } else {
+      fprintf(stderr, "ASurfaceControl_createFromWindow returned null\n");
     }
   }
-  int sdk = read_sdk_version();
+  if (sdk >= 34) {
+    fprintf(stderr, "API %d requires AHB path; aborting legacy ANativeWindow usage\n", sdk);
+    return false;
+  }
   if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
   }
