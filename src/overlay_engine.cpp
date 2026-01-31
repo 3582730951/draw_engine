@@ -1872,6 +1872,18 @@ static bool lock_buffer(EngineState& state) {
       stride_pixels = out_stride / 4;
     }
     state.stride = stride_pixels > 0 ? stride_pixels : buffer->stride;
+    static int log_count = 0;
+    if (log_count < 3) {
+      fprintf(stderr,
+              "Direct buffer: %dx%d stride=%d fmt=%d out_stride=%d out_bpp=%d\n",
+              state.width,
+              state.height,
+              state.stride,
+              buffer->format,
+              out_stride,
+              out_bpp);
+      ++log_count;
+    }
     state.pixels = reinterpret_cast<uint32_t*>(out);
     return state.pixels != nullptr;
   }
@@ -1923,6 +1935,13 @@ static void unlock_post(EngineState& state) {
         res = s.Surface_queueBuffer4(state.surface_native, state.direct_buffer, -1, nullptr);
       } else if (s.Surface_queueBuffer3) {
         res = s.Surface_queueBuffer3(state.surface_native, state.direct_buffer, -1);
+      }
+      if (res != 0) {
+        static int log_count = 0;
+        if (log_count < 5) {
+          fprintf(stderr, "Surface_queueBuffer failed: %d\n", res);
+          ++log_count;
+        }
       }
       if (res != 0 && s.Surface_cancelBuffer) {
         s.Surface_cancelBuffer(state.surface_native, state.direct_buffer, -1);
