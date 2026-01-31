@@ -27,19 +27,7 @@ struct ASurfaceControl;
 struct ASurfaceTransaction;
 
 namespace android {
-using status_t = int32_t;
-
-class Parcel;
 class IBinder;
-
-class Parcelable {
- public:
-  virtual ~Parcelable() = default;
-  virtual status_t writeToParcel(Parcel* parcel) const = 0;
-  virtual status_t readFromParcel(const Parcel* parcel) = 0;
-};
-
-class Parcel {};
 
 template <typename T>
 struct sp {
@@ -52,20 +40,17 @@ struct PhysicalDisplayId {
 };
 }  // namespace android
 
-namespace android::gui {
-struct LayerMetadata : public android::Parcelable {
-  std::unordered_map<uint32_t, std::vector<uint8_t>> mMap;
-  LayerMetadata() = default;
-  LayerMetadata(const LayerMetadata&) = default;
-  LayerMetadata(LayerMetadata&&) = default;
-  LayerMetadata& operator=(const LayerMetadata&) = default;
-  LayerMetadata& operator=(LayerMetadata&&) = default;
-  ~LayerMetadata() override = default;
-
-  android::status_t writeToParcel(android::Parcel*) const override { return 0; }
-  android::status_t readFromParcel(const android::Parcel*) override { return 0; }
+struct LayerMetadataStorage {
+  alignas(void*) unsigned char data[1024];
 };
-}  // namespace android::gui
+
+struct SurfaceComposerClientStorage {
+  alignas(void*) unsigned char data[1024];
+};
+
+struct TransactionStorage {
+  alignas(void*) unsigned char data[1024];
+};
 
 using PFN_ASurfaceControl_create = ASurfaceControl* (*)(ASurfaceControl* parent,
                                                         const char* debug_name);
@@ -156,6 +141,21 @@ using PFN_ProcessState_startThreadPool = void (*)(void* proc);
 
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
+using PFN_LayerMetadata_ctor = void (*)(void* self);
+using PFN_RefBase_incStrong = void (*)(void* self, void* id);
+using PFN_RefBase_decStrong = void (*)(void* self, void* id);
+using PFN_SurfaceComposerClient_ctor = void (*)(void* self);
+using PFN_SurfaceComposerClient_dtor = void (*)(void* self);
+using PFN_SurfaceComposerClient_createSurface =
+    SpObject (*)(void* client,
+                const void* name,
+                uint32_t width,
+                uint32_t height,
+                int32_t format,
+                uint32_t flags,
+                void* parent,
+                void* layer_metadata,
+                uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
 using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
     SpObject (*)(android::PhysicalDisplayId display_id);
@@ -163,6 +163,15 @@ using PFN_SurfaceComposerClient_getPhysicalDisplayIds =
     std::vector<android::PhysicalDisplayId> (*)();
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
+using PFN_SurfaceComposerClient_Transaction_ctor = void (*)(void* tx);
+using PFN_SurfaceComposerClient_Transaction_setLayer =
+    void* (*)(void* tx, void* surface_control, int32_t z);
+using PFN_SurfaceComposerClient_Transaction_setTrustedOverlay =
+    void* (*)(void* tx, void* surface_control, bool is_trusted);
+using PFN_SurfaceComposerClient_Transaction_apply2 =
+    int32_t (*)(void* tx, bool synchronous, bool one_way);
+using PFN_SurfaceComposerClient_Transaction_apply1 =
+    int32_t (*)(void* tx, bool synchronous);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
     int32_t (*)(void* client,
                 const void* name,
@@ -183,7 +192,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent =
                 void* out_surface,
                 int32_t flags,
                 void* parent,
-                android::gui::LayerMetadata metadata);
+                void* metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -193,7 +202,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
                 void* out_surface,
                 int32_t flags,
                 void* parent,
-                android::gui::LayerMetadata metadata,
+                void* metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
     int32_t (*)(void* client,
@@ -204,7 +213,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
                 void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
-                android::gui::LayerMetadata metadata);
+                void* metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -214,7 +223,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
-                android::gui::LayerMetadata metadata,
+                void* metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_createSurface = SpObject (*)(void* control);
@@ -231,6 +240,13 @@ struct EngineSymbols {
   void* libutils = nullptr;
   void* libnativewindow = nullptr;
   void* libbinder = nullptr;
+
+  PFN_LayerMetadata_ctor LayerMetadata_ctor = nullptr;
+  PFN_RefBase_incStrong RefBase_incStrong = nullptr;
+  PFN_RefBase_decStrong RefBase_decStrong = nullptr;
+  PFN_SurfaceComposerClient_ctor SurfaceComposerClient_ctor = nullptr;
+  PFN_SurfaceComposerClient_dtor SurfaceComposerClient_dtor = nullptr;
+  PFN_SurfaceComposerClient_createSurface SurfaceComposerClient_createSurface = nullptr;
 
   PFN_ASurfaceControl_create ASurfaceControl_create = nullptr;
   PFN_ASurfaceControl_createFromWindow ASurfaceControl_createFromWindow = nullptr;
@@ -280,6 +296,13 @@ struct EngineSymbols {
       nullptr;
   PFN_SurfaceComposerClient_closeGlobalTransaction SurfaceComposerClient_closeGlobalTransaction =
       nullptr;
+  PFN_SurfaceComposerClient_Transaction_ctor SurfaceComposerClient_Transaction_ctor = nullptr;
+  PFN_SurfaceComposerClient_Transaction_setLayer SurfaceComposerClient_Transaction_setLayer =
+      nullptr;
+  PFN_SurfaceComposerClient_Transaction_setTrustedOverlay
+      SurfaceComposerClient_Transaction_setTrustedOverlay = nullptr;
+  PFN_SurfaceComposerClient_Transaction_apply2 SurfaceComposerClient_Transaction_apply2 = nullptr;
+  PFN_SurfaceComposerClient_Transaction_apply1 SurfaceComposerClient_Transaction_apply1 = nullptr;
   PFN_SurfaceComposerClient_createSurfaceChecked_v1 SurfaceComposerClient_createSurfaceChecked_v1 =
       nullptr;
   PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent
@@ -301,6 +324,8 @@ struct EngineSymbols {
 
 struct EngineState {
   EngineSymbols symbols;
+  SurfaceComposerClientStorage client_storage{};
+  void* client_ptr = nullptr;
   ANativeWindow* window = nullptr;
   ASurfaceControl* surface = nullptr;
   void* surface_native = nullptr;
@@ -992,7 +1017,53 @@ static bool load_symbols(EngineSymbols& s) {
                            version ? version->String8_dtor : empty_list,
                            "_ZN7android7String8D2Ev"));
     }
+    s.RefBase_incStrong = reinterpret_cast<PFN_RefBase_incStrong>(
+        load_symbol_list(s.libutils, empty_list, "_ZNK7android7RefBase9incStrongEPKv"));
+    s.RefBase_decStrong = reinterpret_cast<PFN_RefBase_decStrong>(
+        load_symbol_list(s.libutils, empty_list, "_ZNK7android7RefBase9decStrongEPKv"));
   }
+
+  static const char* kLayerMetadataCtorNames[] = {
+      "_ZN7android3gui13LayerMetadataC2Ev",
+      "_ZN7android13LayerMetadataC2Ev",
+  };
+  const SymbolNameList layer_metadata_ctor_list{
+      kLayerMetadataCtorNames,
+      sizeof(kLayerMetadataCtorNames) / sizeof(kLayerMetadataCtorNames[0])};
+  s.LayerMetadata_ctor = reinterpret_cast<PFN_LayerMetadata_ctor>(
+      load_symbol_list(s.libgui, layer_metadata_ctor_list, nullptr));
+
+  static const char* kSurfaceComposerCtorNames[] = {
+      "_ZN7android21SurfaceComposerClientC2Ev",
+  };
+  static const char* kSurfaceComposerDtorNames[] = {
+      "_ZN7android21SurfaceComposerClientD2Ev",
+  };
+  const SymbolNameList scc_ctor_list{kSurfaceComposerCtorNames,
+                                    sizeof(kSurfaceComposerCtorNames) /
+                                        sizeof(kSurfaceComposerCtorNames[0])};
+  const SymbolNameList scc_dtor_list{kSurfaceComposerDtorNames,
+                                    sizeof(kSurfaceComposerDtorNames) /
+                                        sizeof(kSurfaceComposerDtorNames[0])};
+  s.SurfaceComposerClient_ctor = reinterpret_cast<PFN_SurfaceComposerClient_ctor>(
+      load_symbol_list(s.libgui, scc_ctor_list, nullptr));
+  s.SurfaceComposerClient_dtor = reinterpret_cast<PFN_SurfaceComposerClient_dtor>(
+      load_symbol_list(s.libgui, scc_dtor_list, nullptr));
+
+  static const char* kSurfaceComposerCreateSurfaceNames[] = {
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataEPj",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataE",
+      "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEii",
+  };
+  const SymbolNameList create_surface_list{
+      kSurfaceComposerCreateSurfaceNames,
+      sizeof(kSurfaceComposerCreateSurfaceNames) /
+          sizeof(kSurfaceComposerCreateSurfaceNames[0])};
+  s.SurfaceComposerClient_createSurface =
+      reinterpret_cast<PFN_SurfaceComposerClient_createSurface>(
+          load_symbol_list(s.libgui, create_surface_list, nullptr));
 
   s.SurfaceComposerClient_getDefault =
       reinterpret_cast<PFN_SurfaceComposerClient_getDefault>(
@@ -1022,6 +1093,51 @@ static bool load_symbols(EngineSymbols& s) {
                            version ? version->SurfaceComposerClient_closeGlobalTransaction
                                    : empty_list,
                            "_ZN7android21SurfaceComposerClient22closeGlobalTransactionEv"));
+
+  static const char* kTransactionCtorNames[] = {
+      "_ZN7android21SurfaceComposerClient11TransactionC2Ev",
+  };
+  static const char* kTransactionSetLayerNames[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi",
+  };
+  static const char* kTransactionSetTrustedNames[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb",
+  };
+  static const char* kTransactionApply2Names[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction5applyEbb",
+  };
+  static const char* kTransactionApply1Names[] = {
+      "_ZN7android21SurfaceComposerClient11Transaction5applyEb",
+  };
+  const SymbolNameList tx_ctor_list{
+      kTransactionCtorNames, sizeof(kTransactionCtorNames) / sizeof(kTransactionCtorNames[0])};
+  const SymbolNameList tx_setlayer_list{
+      kTransactionSetLayerNames,
+      sizeof(kTransactionSetLayerNames) / sizeof(kTransactionSetLayerNames[0])};
+  const SymbolNameList tx_settrusted_list{
+      kTransactionSetTrustedNames,
+      sizeof(kTransactionSetTrustedNames) / sizeof(kTransactionSetTrustedNames[0])};
+  const SymbolNameList tx_apply2_list{
+      kTransactionApply2Names,
+      sizeof(kTransactionApply2Names) / sizeof(kTransactionApply2Names[0])};
+  const SymbolNameList tx_apply1_list{
+      kTransactionApply1Names,
+      sizeof(kTransactionApply1Names) / sizeof(kTransactionApply1Names[0])};
+  s.SurfaceComposerClient_Transaction_ctor =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_ctor>(
+          load_symbol_list(s.libgui, tx_ctor_list, nullptr));
+  s.SurfaceComposerClient_Transaction_setLayer =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setLayer>(
+          load_symbol_list(s.libgui, tx_setlayer_list, nullptr));
+  s.SurfaceComposerClient_Transaction_setTrustedOverlay =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_setTrustedOverlay>(
+          load_symbol_list(s.libgui, tx_settrusted_list, nullptr));
+  s.SurfaceComposerClient_Transaction_apply2 =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_apply2>(
+          load_symbol_list(s.libgui, tx_apply2_list, nullptr));
+  s.SurfaceComposerClient_Transaction_apply1 =
+      reinterpret_cast<PFN_SurfaceComposerClient_Transaction_apply1>(
+          load_symbol_list(s.libgui, tx_apply1_list, nullptr));
   s.SurfaceComposerClient_createSurfaceChecked_v1 =
       reinterpret_cast<PFN_SurfaceComposerClient_createSurfaceChecked_v1>(
           load_symbol_list_filtered(s.libgui,
@@ -1115,6 +1231,13 @@ static void wait_for_fence(int fence_fd) {
   close(fence_fd);
 }
 
+static void init_layer_metadata(EngineSymbols& s, LayerMetadataStorage& storage) {
+  memset(storage.data, 0, sizeof(storage.data));
+  if (s.LayerMetadata_ctor) {
+    s.LayerMetadata_ctor(storage.data);
+  }
+}
+
 static void init_binder_threadpool(EngineSymbols& s) {
   if (!s.ProcessState_self || !s.ProcessState_setThreadPoolMaxThreadCount ||
       !s.ProcessState_startThreadPool) {
@@ -1126,6 +1249,131 @@ static void init_binder_threadpool(EngineSymbols& s) {
   }
   s.ProcessState_setThreadPoolMaxThreadCount(proc.ptr, 1);
   s.ProcessState_startThreadPool(proc.ptr);
+}
+
+static bool create_surface_osimgui(EngineState& state, int width, int height) {
+  EngineSymbols& s = state.symbols;
+  if (!s.String8_ctor || !s.String8_dtor || !s.SurfaceComposerClient_createSurface ||
+      (!s.SurfaceControl_getSurface && !s.SurfaceControl_createSurface)) {
+    return false;
+  }
+
+  int sdk = read_sdk_version();
+  void* client_ptr = nullptr;
+  if (s.SurfaceComposerClient_getDefault) {
+    SpObject client_sp = s.SurfaceComposerClient_getDefault();
+    client_ptr = client_sp.ptr;
+  }
+  if (!client_ptr && s.SurfaceComposerClient_ctor) {
+    memset(state.client_storage.data, 0, sizeof(state.client_storage.data));
+    s.SurfaceComposerClient_ctor(state.client_storage.data);
+    client_ptr = state.client_storage.data;
+    if (s.RefBase_incStrong) {
+      s.RefBase_incStrong(client_ptr, state.client_storage.data);
+    }
+  }
+  if (!client_ptr) {
+    fprintf(stderr, "SurfaceComposerClient instance unavailable\n");
+    return false;
+  }
+  state.client_ptr = client_ptr;
+
+  String8Storage name_storage{};
+  s.String8_ctor(name_storage.data, "SystemProfiler");
+
+  LayerMetadataStorage metadata_storage{};
+  init_layer_metadata(s, metadata_storage);
+
+  void* parent_handle = nullptr;
+  static void* fake_parent_handle = nullptr;
+  if (sdk >= 31) {
+    parent_handle = &fake_parent_handle;
+  }
+
+  SpObject control_sp = s.SurfaceComposerClient_createSurface(
+      client_ptr,
+      name_storage.data,
+      static_cast<uint32_t>(width),
+      static_cast<uint32_t>(height),
+      WINDOW_FORMAT_RGBA_8888,
+      0,
+      parent_handle,
+      metadata_storage.data,
+      nullptr);
+  s.String8_dtor(name_storage.data);
+
+  if (!control_sp.ptr) {
+    fprintf(stderr, "createSurface (OS-ImGui path) returned null\n");
+    return false;
+  }
+
+  if (s.SurfaceComposerClient_Transaction_ctor) {
+    TransactionStorage tx_storage{};
+    s.SurfaceComposerClient_Transaction_ctor(tx_storage.data);
+    if (s.SurfaceComposerClient_Transaction_setLayer) {
+      s.SurfaceComposerClient_Transaction_setLayer(tx_storage.data, &control_sp, INT_MAX);
+    }
+    if (sdk >= 31 && s.SurfaceComposerClient_Transaction_setTrustedOverlay) {
+      s.SurfaceComposerClient_Transaction_setTrustedOverlay(tx_storage.data, &control_sp, true);
+    }
+    if (s.SurfaceComposerClient_Transaction_apply2) {
+      s.SurfaceComposerClient_Transaction_apply2(tx_storage.data, false, true);
+    } else if (s.SurfaceComposerClient_Transaction_apply1) {
+      s.SurfaceComposerClient_Transaction_apply1(tx_storage.data, false);
+    }
+  } else if (s.SurfaceControl_setLayer) {
+    s.SurfaceControl_setLayer(control_sp.ptr, INT_MAX);
+  }
+  if (s.SurfaceControl_setPosition) {
+    s.SurfaceControl_setPosition(control_sp.ptr, 0.0f, 0.0f);
+  }
+  if (s.SurfaceControl_setSize) {
+    s.SurfaceControl_setSize(control_sp.ptr, static_cast<uint32_t>(width),
+                             static_cast<uint32_t>(height));
+  }
+  if (s.SurfaceControl_setAlpha) {
+    s.SurfaceControl_setAlpha(control_sp.ptr, 1.0f);
+  }
+  if (s.SurfaceControl_setFlags) {
+    const uint32_t kOpaqueMask = 0x00000400u;
+    s.SurfaceControl_setFlags(control_sp.ptr, 0, kOpaqueMask);
+  }
+
+  SpObject surface_sp = s.SurfaceControl_createSurface
+                            ? s.SurfaceControl_createSurface(control_sp.ptr)
+                            : s.SurfaceControl_getSurface(control_sp.ptr);
+  if (!surface_sp.ptr) {
+    fprintf(stderr, "SurfaceControl getSurface returned null\n");
+    return false;
+  }
+
+  fprintf(stderr, "OS-ImGui surface=%p\n", surface_sp.ptr);
+  state.surface_native = surface_sp.ptr;
+  state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  state.use_ahb = false;
+  state.surface = nullptr;
+
+  state.use_surface_direct = false;
+  if (state.surface_native && s.Surface_dequeueBuffer && s.Surface_queueBuffer &&
+      s.GraphicBuffer_lock && s.GraphicBuffer_unlock) {
+    if (sdk >= 34) {
+      state.use_surface_direct = true;
+      fprintf(stderr, "Using Surface direct buffer path\n");
+    }
+  } else if (sdk >= 34) {
+    fprintf(stderr,
+            "Surface direct path unavailable: dequeue=%p queue=%p lock=%p unlock=%p\n",
+            reinterpret_cast<void*>(s.Surface_dequeueBuffer),
+            reinterpret_cast<void*>(s.Surface_queueBuffer),
+            reinterpret_cast<void*>(s.GraphicBuffer_lock),
+            reinterpret_cast<void*>(s.GraphicBuffer_unlock));
+  }
+
+  if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
+    s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+  }
+
+  return true;
 }
 
 static bool create_surface_asurface(EngineState& state,
@@ -1235,6 +1483,9 @@ static bool create_surface_asurface(EngineState& state,
 
 static bool create_surface_legacy(EngineState& state, int width, int height) {
   EngineSymbols& s = state.symbols;
+  if (create_surface_osimgui(state, width, height)) {
+    return true;
+  }
   if (!s.SurfaceComposerClient_getDefault ||
       (!s.SurfaceComposerClient_createSurfaceChecked_v1 &&
        !s.SurfaceComposerClient_createSurfaceChecked_v2_parent &&
@@ -1303,7 +1554,9 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
         -1,
         -1);
   } else {
-    android::gui::LayerMetadata metadata;
+    LayerMetadataStorage metadata_storage{};
+    init_layer_metadata(s, metadata_storage);
+    void* metadata = metadata_storage.data;
     if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint(
           client_sp.ptr,
