@@ -1191,7 +1191,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   if (s.SurfaceComposerClient_getPhysicalDisplayToken) {
     android::PhysicalDisplayId display_id{0};
     SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
-    parent_handle.ptr = token_sp.ptr;
+    parent_handle.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
     fprintf(stderr, "Display token=%p\n", token_sp.ptr);
   }
 
