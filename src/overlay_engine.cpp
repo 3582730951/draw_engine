@@ -902,6 +902,31 @@ static bool load_symbols(EngineSymbols& s) {
   return true;
 }
 
+static bool setup_ahb_buffer(EngineState& state, int width, int height) {
+  EngineSymbols& s = state.symbols;
+  if (!s.AHardwareBuffer_allocate || !s.AHardwareBuffer_describe || !s.AHardwareBuffer_lock ||
+      !s.AHardwareBuffer_unlock || !s.AHardwareBuffer_release) {
+    return false;
+  }
+
+  memset(&state.buffer_desc, 0, sizeof(state.buffer_desc));
+  state.buffer_desc.width = static_cast<uint32_t>(width);
+  state.buffer_desc.height = static_cast<uint32_t>(height);
+  state.buffer_desc.layers = 1;
+  state.buffer_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+  state.buffer_desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                            AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+
+  if (s.AHardwareBuffer_allocate(&state.buffer_desc, &state.buffer) != 0 || !state.buffer) {
+    fprintf(stderr, "AHardwareBuffer_allocate failed\n");
+    return false;
+  }
+  s.AHardwareBuffer_describe(state.buffer, &state.buffer_desc);
+  state.use_ahb = true;
+  return true;
+}
+
 static bool create_surface_asurface(EngineState& state,
                                     int width,
                                     int height,
@@ -969,13 +994,22 @@ static bool create_surface_asurface(EngineState& state,
     s.ASurfaceTransaction_release(tx);
   }
 
+  const int sdk = read_sdk_version();
+  const bool prefer_ahb = (sdk >= 34);
+  if (prefer_ahb && can_ahb) {
+    if (setup_ahb_buffer(state, width, height)) {
+      return true;
+    }
+    fprintf(stderr, "AHB setup failed on API %d\n", sdk);
+    return false;
+  }
+
   if (can_window && s.ANativeWindow_fromSurfaceControl) {
     state.window = s.ANativeWindow_fromSurfaceControl(state.surface);
     if (!state.window) {
       fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
       return false;
     }
-    int sdk = read_sdk_version();
     if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
       s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
     }
@@ -986,22 +1020,7 @@ static bool create_surface_asurface(EngineState& state,
     return false;
   }
 
-  memset(&state.buffer_desc, 0, sizeof(state.buffer_desc));
-  state.buffer_desc.width = static_cast<uint32_t>(width);
-  state.buffer_desc.height = static_cast<uint32_t>(height);
-  state.buffer_desc.layers = 1;
-  state.buffer_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
-  state.buffer_desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                            AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
-                            AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
-
-  if (s.AHardwareBuffer_allocate(&state.buffer_desc, &state.buffer) != 0 || !state.buffer) {
-    fprintf(stderr, "AHardwareBuffer_allocate failed\n");
-    return false;
-  }
-  s.AHardwareBuffer_describe(state.buffer, &state.buffer_desc);
-  state.use_ahb = true;
-  return true;
+  return setup_ahb_buffer(state, width, height);
 }
 
 static bool create_surface_legacy(EngineState& state, int width, int height) {
@@ -1144,6 +1163,35 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   fprintf(stderr, "Surface surface=%p\n", surface_sp.ptr);
 
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  const bool can_ahb = s.ASurfaceControl_createFromWindow && s.ASurfaceTransaction_create &&
+                       s.ASurfaceTransaction_setBuffer && s.ASurfaceTransaction_setBufferSize &&
+                       s.ASurfaceTransaction_setVisibility && s.ASurfaceTransaction_setLayer &&
+                       s.ASurfaceTransaction_setAlpha && s.ASurfaceTransaction_setOpaque &&
+                       s.ASurfaceTransaction_apply;
+  if (can_ahb) {
+    state.surface = s.ASurfaceControl_createFromWindow(state.window, "SystemProfiler");
+    if (state.surface) {
+      ASurfaceTransaction* tx = s.ASurfaceTransaction_create();
+      if (tx) {
+        s.ASurfaceTransaction_setVisibility(tx, state.surface, 1);
+        s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
+        s.ASurfaceTransaction_setAlpha(tx, state.surface, 1.0f);
+        s.ASurfaceTransaction_setOpaque(tx, state.surface, 0);
+        s.ASurfaceTransaction_setBufferSize(tx, state.surface, width, height);
+        s.ASurfaceTransaction_apply(tx);
+        if (s.ASurfaceTransaction_release) {
+          s.ASurfaceTransaction_release(tx);
+        }
+      }
+      if (setup_ahb_buffer(state, width, height)) {
+        return true;
+      }
+      if (s.ASurfaceControl_release) {
+        s.ASurfaceControl_release(state.surface);
+      }
+      state.surface = nullptr;
+    }
+  }
   int sdk = read_sdk_version();
   if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
