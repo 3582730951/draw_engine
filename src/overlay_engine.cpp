@@ -973,7 +973,8 @@ static bool create_surface_asurface(EngineState& state,
       fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
       return false;
     }
-    if (s.ANativeWindow_setBuffersGeometry) {
+    int sdk = read_sdk_version();
+    if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
       s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
     }
     return true;
@@ -1141,7 +1142,8 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   fprintf(stderr, "Surface surface=%p\n", surface_sp.ptr);
 
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
-  if (s.ANativeWindow_setBuffersGeometry) {
+  int sdk = read_sdk_version();
+  if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
   }
   return true;
