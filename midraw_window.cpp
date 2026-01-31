@@ -23,6 +23,8 @@ using PFN_ANativeWindow_setBuffersGeometry = int32_t (*)(ANativeWindow* window,
 
 struct SpObject {
   void* ptr;
+  SpObject() : ptr(nullptr) {}
+  ~SpObject() {}
 };
 
 struct String8Storage {

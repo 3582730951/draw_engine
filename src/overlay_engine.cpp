@@ -110,6 +110,8 @@ using PFN_AHardwareBuffer_unlock = int (*)(AHardwareBuffer* buffer, int32_t* fen
 
 struct SpObject {
   void* ptr;
+  SpObject() : ptr(nullptr) {}
+  ~SpObject() {}
 };
 
 struct String8Storage {
@@ -118,7 +120,7 @@ struct String8Storage {
 
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
-using PFN_SurfaceComposerClient_getDefault = void (*)(SpObject* out);
+using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
@@ -174,7 +176,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 const android::sp<android::IBinder>& parent_handle,
                 android::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
-using PFN_SurfaceControl_getSurface = void (*)(SpObject* out, void* control);
+using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_setLayer = int32_t (*)(void* control, int32_t layer);
 using PFN_SurfaceControl_setPosition = int32_t (*)(void* control, float x, float y);
 using PFN_SurfaceControl_setSize = int32_t (*)(void* control, uint32_t w, uint32_t h);
@@ -1023,8 +1025,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     return false;
   }
 
-  SpObject client_sp{};
-  s.SurfaceComposerClient_getDefault(&client_sp);
+  SpObject client_sp = s.SurfaceComposerClient_getDefault();
   if (!client_sp.ptr) {
     fprintf(stderr, "SurfaceComposerClient_getDefault returned null\n");
     return false;
@@ -1101,7 +1102,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   }
   s.String8_dtor(name_storage.data);
 
-  memcpy(&control_sp, control_sp_ptr, sizeof(control_sp));
+  control_sp.ptr = *reinterpret_cast<void**>(control_sp_ptr);
   if (status != 0 || !control_sp.ptr) {
     fprintf(stderr, "createSurfaceChecked failed: status=%d control=%p\n", status,
             control_sp.ptr);
@@ -1134,8 +1135,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     s.SurfaceComposerClient_closeGlobalTransaction();
   }
 
-  SpObject surface_sp{};
-  s.SurfaceControl_getSurface(&surface_sp, control_sp.ptr);
+  SpObject surface_sp = s.SurfaceControl_getSurface(control_sp.ptr);
   if (!surface_sp.ptr) {
     return false;
   }
