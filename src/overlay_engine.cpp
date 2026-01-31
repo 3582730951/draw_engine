@@ -43,8 +43,10 @@ struct sp {
   T* ptr;
   sp() : ptr(nullptr) {}
 };
+}  // namespace android
 
-struct LayerMetadata : public Parcelable {
+namespace android::gui {
+struct LayerMetadata : public android::Parcelable {
   std::unordered_map<uint32_t, std::vector<uint8_t>> mMap;
   LayerMetadata() = default;
   LayerMetadata(const LayerMetadata&) = default;
@@ -53,10 +55,10 @@ struct LayerMetadata : public Parcelable {
   LayerMetadata& operator=(LayerMetadata&&) = default;
   ~LayerMetadata() override = default;
 
-  status_t writeToParcel(Parcel*) const override { return 0; }
-  status_t readFromParcel(const Parcel*) override { return 0; }
+  android::status_t writeToParcel(android::Parcel*) const override { return 0; }
+  android::status_t readFromParcel(const android::Parcel*) override { return 0; }
 };
-}  // namespace android
+}  // namespace android::gui
 
 using PFN_ASurfaceControl_create = ASurfaceControl* (*)(ASurfaceControl* parent,
                                                         const char* debug_name);
@@ -143,7 +145,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent =
                 void* out_surface,
                 int32_t flags,
                 void* parent,
-                android::LayerMetadata metadata);
+                android::gui::LayerMetadata metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -153,7 +155,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_parent_hint =
                 void* out_surface,
                 int32_t flags,
                 void* parent,
-                android::LayerMetadata metadata,
+                android::gui::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
     int32_t (*)(void* client,
@@ -164,7 +166,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle =
                 void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
-                android::LayerMetadata metadata);
+                android::gui::LayerMetadata metadata);
 using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
     int32_t (*)(void* client,
                 const void* name,
@@ -174,7 +176,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 void* out_surface,
                 int32_t flags,
                 const android::sp<android::IBinder>& parent_handle,
-                android::LayerMetadata metadata,
+                android::gui::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_setLayer = int32_t (*)(void* control, int32_t layer);
@@ -1051,7 +1053,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
         -1,
         -1);
   } else {
-    android::LayerMetadata metadata;
+    android::gui::LayerMetadata metadata;
     if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) {
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint(
           client_sp.ptr,
