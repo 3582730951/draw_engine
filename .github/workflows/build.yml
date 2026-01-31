@@ -84,6 +84,13 @@ jobs:
           } | tee "${GITHUB_WORKSPACE}/dist/manifest.txt"
           cat "${GITHUB_WORKSPACE}/dist/manifest.txt" >> "${GITHUB_STEP_SUMMARY}" || true
 
+      - name: Run CI tests
+        run: |
+          python3 "${GITHUB_WORKSPACE}/scripts/ci_test.py" \
+            --dist "${GITHUB_WORKSPACE}/dist" \
+            --ndk "${ANDROID_NDK_HOME}" \
+            --repo "${GITHUB_WORKSPACE}"
+
       - name: Verify artifacts
         run: |
           for f in libmidraw.so libmidraw.a overlay_engine benchmark; do
