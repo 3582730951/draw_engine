@@ -171,8 +171,8 @@ using PFN_SurfaceComposerClient_createSurface =
                 uint32_t height,
                 int32_t format,
                 uint32_t flags,
-                void* parent,
-                void* layer_metadata,
+                const android::sp<android::IBinder>& parent,
+                const void* layer_metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
 using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
@@ -1320,10 +1320,19 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
   LayerMetadataStorage metadata_storage{};
   init_layer_metadata(s, metadata_storage);
 
-  void* parent_handle = nullptr;
-  static void* fake_parent_handle = nullptr;
-  if (sdk >= 31) {
-    parent_handle = &fake_parent_handle;
+  android::sp<android::IBinder> parent_handle{};
+  if (s.SurfaceComposerClient_getPhysicalDisplayToken) {
+    android::PhysicalDisplayId display_id{0};
+    SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
+    parent_handle.ptr = reinterpret_cast<android::IBinder*>(token_sp.ptr);
+    if (!parent_handle.ptr && s.SurfaceComposerClient_getPhysicalDisplayIds) {
+      std::vector<android::PhysicalDisplayId> ids =
+          s.SurfaceComposerClient_getPhysicalDisplayIds();
+      if (!ids.empty()) {
+        SpObject token2 = s.SurfaceComposerClient_getPhysicalDisplayToken(ids.front());
+        parent_handle.ptr = reinterpret_cast<android::IBinder*>(token2.ptr);
+      }
+    }
   }
 
   SpObject control_sp = s.SurfaceComposerClient_createSurface(
