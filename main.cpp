@@ -89,45 +89,98 @@ static inline uint32_t lcg(uint32_t& state) {
 static void draw_stress_shapes(MidrawContext* ctx,
                                int w,
                                int h,
+                               int region_x,
+                               int region_y,
+                               int region_w,
+                               int region_h,
                                uint64_t frame,
                                int shape_count) {
   if (!ctx || w <= 0 || h <= 0 || shape_count <= 0) {
     return;
   }
-  const int max_w = w;
-  const int max_h = h;
+  int rx = region_x;
+  int ry = region_y;
+  int rw = (region_w > 0) ? region_w : w;
+  int rh = (region_h > 0) ? region_h : h;
+  if (rx < 0) {
+    rx = 0;
+  }
+  if (ry < 0) {
+    ry = 0;
+  }
+  if (rx >= w) {
+    rx = 0;
+  }
+  if (ry >= h) {
+    ry = 0;
+  }
+  if (rw > w - rx) {
+    rw = w - rx;
+  }
+  if (rh > h - ry) {
+    rh = h - ry;
+  }
+  if (rw <= 0 || rh <= 0) {
+    return;
+  }
+  const int max_w = rw;
+  const int max_h = rh;
+  static int shape_min = -1;
+  static int shape_max = -1;
+  if (shape_min < 0 || shape_max < 0) {
+    shape_min = env_int("MIDRAW_SHAPE_MIN", 6);
+    shape_max = env_int("MIDRAW_SHAPE_MAX", 96);
+    if (shape_min < 1) {
+      shape_min = 1;
+    }
+    if (shape_max < shape_min) {
+      shape_max = shape_min;
+    }
+  }
+  const int max_dim = (max_w < max_h) ? max_w : max_h;
+  int max_size = shape_max;
+  if (max_size > max_dim) {
+    max_size = max_dim;
+  }
+  if (max_size < shape_min) {
+    max_size = shape_min;
+  }
+
   uint32_t seed = 0x5a5a5a5au ^ static_cast<uint32_t>(frame);
   for (int i = 0; i < shape_count; ++i) {
     uint32_t r = lcg(seed);
     const int type = static_cast<int>(r % 3u);
     if (type == 0) {
-      int rw = 6 + static_cast<int>(lcg(seed) % 96u);
-      int rh = 6 + static_cast<int>(lcg(seed) % 96u);
+      int rw = shape_min + static_cast<int>(lcg(seed) % (static_cast<uint32_t>(max_size - shape_min + 1)));
+      int rh = shape_min + static_cast<int>(lcg(seed) % (static_cast<uint32_t>(max_size - shape_min + 1)));
       if (rw > max_w) {
         rw = max_w;
       }
       if (rh > max_h) {
         rh = max_h;
       }
-      const int x = (max_w > rw) ? static_cast<int>(lcg(seed) % (max_w - rw)) : 0;
-      const int y = (max_h > rh) ? static_cast<int>(lcg(seed) % (max_h - rh)) : 0;
+      const int x = rx + ((max_w > rw) ? static_cast<int>(lcg(seed) % (max_w - rw)) : 0);
+      const int y = ry + ((max_h > rh) ? static_cast<int>(lcg(seed) % (max_h - rh)) : 0);
       const uint32_t color = 0xFF000000u | (lcg(seed) & 0x00FFFFFFu);
       midraw_draw_rect(ctx, x, y, rw, rh, (i & 1), color);
     } else if (type == 1) {
-      const int x1 = static_cast<int>(lcg(seed) % max_w);
-      const int y1 = static_cast<int>(lcg(seed) % max_h);
-      const int x2 = static_cast<int>(lcg(seed) % max_w);
-      const int y2 = static_cast<int>(lcg(seed) % max_h);
+      const int x1 = rx + static_cast<int>(lcg(seed) % max_w);
+      const int y1 = ry + static_cast<int>(lcg(seed) % max_h);
+      const int x2 = rx + static_cast<int>(lcg(seed) % max_w);
+      const int y2 = ry + static_cast<int>(lcg(seed) % max_h);
       const uint32_t color = 0xFF000000u | (lcg(seed) & 0x00FFFFFFu);
       midraw_draw_line(ctx, x1, y1, x2, y2, color);
     } else {
-      int max_r = (max_w < max_h ? max_w : max_h) / 6;
-      if (max_r < 4) {
-        max_r = 4;
+      int max_r = max_size / 2;
+      if (max_r < 2) {
+        max_r = 2;
       }
-      int radius = 4 + static_cast<int>(lcg(seed) % static_cast<uint32_t>(max_r));
-      const int cx = static_cast<int>(lcg(seed) % max_w);
-      const int cy = static_cast<int>(lcg(seed) % max_h);
+      int radius = (shape_min / 2) + static_cast<int>(lcg(seed) % static_cast<uint32_t>(max_r));
+      if (radius < 2) {
+        radius = 2;
+      }
+      const int cx = rx + static_cast<int>(lcg(seed) % max_w);
+      const int cy = ry + static_cast<int>(lcg(seed) % max_h);
       const uint32_t color = 0xFF000000u | (lcg(seed) & 0x00FFFFFFu);
       midraw_draw_circle(ctx, cx, cy, radius, color);
     }
@@ -191,6 +244,10 @@ int main(int argc, char** argv) {
   if (stress_mode && shape_count <= 0) {
     shape_count = 300;
   }
+  const int region_x = env_int("MIDRAW_REGION_X", 0);
+  const int region_y = env_int("MIDRAW_REGION_Y", 0);
+  const int region_w = env_int("MIDRAW_REGION_W", 0);
+  const int region_h = env_int("MIDRAW_REGION_H", 0);
 
   uint64_t frame = 0;
   uint64_t last_log_time = now_ns();
@@ -211,7 +268,8 @@ int main(int argc, char** argv) {
     const int h = midraw_logical_height(ctx);
 
     if (shape_count > 0) {
-      draw_stress_shapes(ctx, w, h, frame, shape_count);
+      draw_stress_shapes(ctx, w, h, region_x, region_y, region_w, region_h, frame,
+                         shape_count);
     } else {
       const int rect_w = w / 4;
       const int rect_h = h / 8;
@@ -222,11 +280,26 @@ int main(int argc, char** argv) {
 
       const int radius = (h < w ? h : w) / 6;
       midraw_draw_circle(ctx, w / 2, h / 2, radius, 0xFFFF0000);
-
-      char text[64];
-      snprintf(text, sizeof(text), "FRAME:%" PRIu64, frame);
-      midraw_draw_text(ctx, text, 16, 16, 0xFFFFFFFF);
     }
+
+    int text_x = 16;
+    int text_y = 16;
+    if (region_w > 0 || region_h > 0) {
+      int rx = region_x;
+      int ry = region_y;
+      if (rx < 0) {
+        rx = 0;
+      }
+      if (ry < 0) {
+        ry = 0;
+      }
+      text_x = rx + 16;
+      text_y = ry + 16;
+    }
+
+    char text[96];
+    snprintf(text, sizeof(text), "FRAME:%" PRIu64 " SHAPES:%d", frame, shape_count);
+    midraw_draw_text(ctx, text, text_x, text_y, 0xFFFFFFFF);
 
     midraw_unlock_post(ctx);
 

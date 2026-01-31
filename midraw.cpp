@@ -700,6 +700,21 @@ static inline void blend_pixel_mapped(RenderContext& ctx,
   *dst = blend_pixel(*dst, src, coverage);
 }
 
+static inline void plot_pixel_physical(RenderContext& ctx, int px, int py, uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  if (px < 0 || py < 0 || px >= ctx.width || py >= ctx.height) {
+    return;
+  }
+  ctx.pixels[py * ctx.stride + px] = color;
+}
+
+static inline void plot_pixel_physical_unchecked(RenderContext& ctx, int px, int py,
+                                                 uint32_t color) {
+  ctx.pixels[py * ctx.stride + px] = color;
+}
+
 static inline void plot_pixel(RenderContext& ctx, int x, int y, uint32_t color) {
   if (!ctx.pixels) {
     return;
@@ -709,13 +724,14 @@ static inline void plot_pixel(RenderContext& ctx, int x, int y, uint32_t color) 
   if (x < 0 || y < 0 || x >= w || y >= h) {
     return;
   }
+  if (ctx.rotation == 0) {
+    plot_pixel_physical(ctx, x, y, color);
+    return;
+  }
   int px = 0;
   int py = 0;
   map_coords(ctx, x, y, &px, &py);
-  if (px < 0 || py < 0 || px >= ctx.width || py >= ctx.height) {
-    return;
-  }
-  ctx.pixels[py * ctx.stride + px] = color;
+  plot_pixel_physical(ctx, px, py, color);
 }
 
 static void draw_pixel(RenderContext& ctx, int x, int y, uint32_t color) {
@@ -755,37 +771,106 @@ static void plot_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
   }
 }
 
-static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32_t color) {
+static void fill_rect_physical(RenderContext& ctx, int x, int y, int w, int h, uint32_t color);
+
+static void plot_line_physical(RenderContext& ctx,
+                               int x1,
+                               int y1,
+                               int x2,
+                               int y2,
+                               uint32_t color) {
   if (!ctx.pixels) {
+    return;
+  }
+  if (y1 == y2) {
+    const int start = x1 < x2 ? x1 : x2;
+    const int end = x1 < x2 ? x2 : x1;
+    fill_rect_physical(ctx, start, y1, end - start + 1, 1, color);
+    return;
+  }
+  if (x1 == x2) {
+    const int start = y1 < y2 ? y1 : y2;
+    const int end = y1 < y2 ? y2 : y1;
+    fill_rect_physical(ctx, x1, start, 1, end - start + 1, color);
     return;
   }
   const int min_x = x1 < x2 ? x1 : x2;
-  const int max_x = x1 > x2 ? x1 : x2;
+  const int max_x = x1 < x2 ? x2 : x1;
   const int min_y = y1 < y2 ? y1 : y2;
-  const int max_y = y1 > y2 ? y1 : y2;
-  expand_dirty_rect(ctx, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
-  plot_line(ctx, x1, y1, x2, y2, color);
+  const int max_y = y1 < y2 ? y2 : y1;
+  const bool in_bounds = (min_x >= 0 && min_y >= 0 && max_x < ctx.width &&
+                          max_y < ctx.height);
+  int dx = abs(x2 - x1);
+  int sx = x1 < x2 ? 1 : -1;
+  int dy = -abs(y2 - y1);
+  int sy = y1 < y2 ? 1 : -1;
+  int err = dx + dy;
+
+  if (in_bounds) {
+    while (true) {
+      plot_pixel_physical_unchecked(ctx, x1, y1, color);
+      if (x1 == x2 && y1 == y2) {
+        break;
+      }
+      int e2 = 2 * err;
+      if (e2 >= dy) {
+        err += dy;
+        x1 += sx;
+      }
+      if (e2 <= dx) {
+        err += dx;
+        y1 += sy;
+      }
+    }
+  } else {
+    while (true) {
+      plot_pixel_physical(ctx, x1, y1, color);
+      if (x1 == x2 && y1 == y2) {
+        break;
+      }
+      int e2 = 2 * err;
+      if (e2 >= dy) {
+        err += dy;
+        x1 += sx;
+      }
+      if (e2 <= dx) {
+        err += dx;
+        y1 += sy;
+      }
+    }
+  }
 }
 
-static void draw_circle(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
+static void plot_circle_physical(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
   if (!ctx.pixels) {
     return;
   }
-  expand_dirty_rect(ctx, cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1);
-
+  const bool in_bounds = (cx - radius >= 0 && cy - radius >= 0 &&
+                          cx + radius < ctx.width && cy + radius < ctx.height);
   int x = radius;
   int y = 0;
   int err = 1 - x;
 
   while (x >= y) {
-    plot_pixel(ctx, cx + x, cy + y, color);
-    plot_pixel(ctx, cx + y, cy + x, color);
-    plot_pixel(ctx, cx - y, cy + x, color);
-    plot_pixel(ctx, cx - x, cy + y, color);
-    plot_pixel(ctx, cx - x, cy - y, color);
-    plot_pixel(ctx, cx - y, cy - x, color);
-    plot_pixel(ctx, cx + y, cy - x, color);
-    plot_pixel(ctx, cx + x, cy - y, color);
+    if (in_bounds) {
+      plot_pixel_physical_unchecked(ctx, cx + x, cy + y, color);
+      plot_pixel_physical_unchecked(ctx, cx + y, cy + x, color);
+      plot_pixel_physical_unchecked(ctx, cx - y, cy + x, color);
+      plot_pixel_physical_unchecked(ctx, cx - x, cy + y, color);
+      plot_pixel_physical_unchecked(ctx, cx - x, cy - y, color);
+      plot_pixel_physical_unchecked(ctx, cx - y, cy - x, color);
+      plot_pixel_physical_unchecked(ctx, cx + y, cy - x, color);
+      plot_pixel_physical_unchecked(ctx, cx + x, cy - y, color);
+    } else {
+      plot_pixel_physical(ctx, cx + x, cy + y, color);
+      plot_pixel_physical(ctx, cx + y, cy + x, color);
+      plot_pixel_physical(ctx, cx - y, cy + x, color);
+      plot_pixel_physical(ctx, cx - x, cy + y, color);
+      plot_pixel_physical(ctx, cx - x, cy - y, color);
+      plot_pixel_physical(ctx, cx - y, cy - x, color);
+      plot_pixel_physical(ctx, cx + y, cy - x, color);
+      plot_pixel_physical(ctx, cx + x, cy - y, color);
+    }
 
     ++y;
     if (err < 0) {
@@ -795,6 +880,43 @@ static void draw_circle(RenderContext& ctx, int cx, int cy, int radius, uint32_t
       err += 2 * (y - x + 1);
     }
   }
+}
+
+static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  const int min_x = x1 < x2 ? x1 : x2;
+  const int max_x = x1 > x2 ? x1 : x2;
+  const int min_y = y1 < y2 ? y1 : y2;
+  const int max_y = y1 > y2 ? y1 : y2;
+  expand_dirty_rect(ctx, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
+  if (ctx.rotation == 0) {
+    plot_line_physical(ctx, x1, y1, x2, y2, color);
+    return;
+  }
+  int px1 = 0;
+  int py1 = 0;
+  int px2 = 0;
+  int py2 = 0;
+  map_coords(ctx, x1, y1, &px1, &py1);
+  map_coords(ctx, x2, y2, &px2, &py2);
+  plot_line_physical(ctx, px1, py1, px2, py2, color);
+}
+
+static void draw_circle(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  expand_dirty_rect(ctx, cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1);
+  if (ctx.rotation == 0) {
+    plot_circle_physical(ctx, cx, cy, radius, color);
+    return;
+  }
+  int pcx = 0;
+  int pcy = 0;
+  map_coords(ctx, cx, cy, &pcx, &pcy);
+  plot_circle_physical(ctx, pcx, pcy, radius, color);
 }
 
 static void fill_rect_physical(RenderContext& ctx, int x, int y, int w, int h, uint32_t color) {
@@ -853,10 +975,21 @@ static void draw_rect(RenderContext& ctx, int x, int y, int w, int h, bool fille
   }
   expand_dirty_rect(ctx, x, y, w, h);
   if (!filled) {
-    plot_line(ctx, x, y, x + w - 1, y, color);
-    plot_line(ctx, x, y + h - 1, x + w - 1, y + h - 1, color);
-    plot_line(ctx, x, y, x, y + h - 1, color);
-    plot_line(ctx, x + w - 1, y, x + w - 1, y + h - 1, color);
+    int px = 0;
+    int py = 0;
+    int pw = 0;
+    int ph = 0;
+    if (!logical_to_physical_rect(ctx, x, y, w, h, &px, &py, &pw, &ph)) {
+      return;
+    }
+    const int x1 = px;
+    const int y1 = py;
+    const int x2 = px + pw - 1;
+    const int y2 = py + ph - 1;
+    plot_line_physical(ctx, x1, y1, x2, y1, color);
+    plot_line_physical(ctx, x1, y2, x2, y2, color);
+    plot_line_physical(ctx, x1, y1, x1, y2, color);
+    plot_line_physical(ctx, x2, y1, x2, y2, color);
     return;
   }
 
