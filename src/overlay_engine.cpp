@@ -3,6 +3,7 @@
 #include <android/hardware_buffer.h>
 #include <android/native_window.h>
 #include <cxxabi.h>
+#include <cstddef>
 #include <dlfcn.h>
 #include <elf.h>
 #include <errno.h>
@@ -347,6 +348,7 @@ struct EngineState {
   SurfaceComposerClientStorage client_storage{};
   void* client_ptr = nullptr;
   ANativeWindow* window = nullptr;
+  ANativeWindow* window_raw = nullptr;
   ASurfaceControl* surface = nullptr;
   void* surface_native = nullptr;
   AHardwareBuffer* buffer = nullptr;
@@ -361,6 +363,14 @@ struct EngineState {
   uint32_t* pixels = nullptr;
   ANativeWindow_Buffer window_buffer{};
 };
+
+static ANativeWindow* surface_to_window(void* surface_ptr) {
+  if (!surface_ptr) {
+    return nullptr;
+  }
+  const size_t offset = sizeof(std::max_align_t) / 2;
+  return reinterpret_cast<ANativeWindow*>(reinterpret_cast<uintptr_t>(surface_ptr) + offset);
+}
 
 static int read_sdk_version() {
   char value[PROP_VALUE_MAX] = {};
@@ -1403,19 +1413,22 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
 
   fprintf(stderr, "OS-ImGui surface=%p\n", surface_sp.ptr);
   state.surface_native = surface_sp.ptr;
-  state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  state.window_raw = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  state.window = surface_to_window(surface_sp.ptr);
   state.use_ahb = false;
   state.surface = nullptr;
 
   state.use_surface_direct = false;
-  if (state.surface_native && s.Surface_dequeueBuffer &&
+  const char* force_direct_env = getenv("MIDRAW_FORCE_DIRECT");
+  const bool allow_direct = force_direct_env && force_direct_env[0] != '0';
+  if (allow_direct && state.surface_native && s.Surface_dequeueBuffer &&
       (s.Surface_queueBuffer4 || s.Surface_queueBuffer3) && s.GraphicBuffer_from &&
       s.GraphicBuffer_lock && s.GraphicBuffer_unlock) {
     if (sdk >= 34) {
       state.use_surface_direct = true;
-      fprintf(stderr, "Using Surface direct buffer path\n");
+      fprintf(stderr, "Using Surface direct buffer path (MIDRAW_FORCE_DIRECT=1)\n");
     }
-  } else if (sdk >= 34) {
+  } else if (sdk >= 34 && allow_direct) {
     fprintf(stderr,
             "Surface direct path unavailable: dequeue=%p queue=%p from=%p lock=%p unlock=%p\n",
             reinterpret_cast<void*>(s.Surface_dequeueBuffer),
@@ -1428,7 +1441,16 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
   }
 
   if (s.ANativeWindow_setBuffersGeometry) {
-    s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+    int res = s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+    if (res != 0 && state.window_raw && state.window_raw != state.window) {
+      int res2 = s.ANativeWindow_setBuffersGeometry(state.window_raw,
+                                                    width,
+                                                    height,
+                                                    WINDOW_FORMAT_RGBA_8888);
+      if (res2 == 0) {
+        state.window = state.window_raw;
+      }
+    }
   }
 
   return true;
@@ -1522,6 +1544,7 @@ static bool create_surface_asurface(EngineState& state,
 
   if (can_window && s.ANativeWindow_fromSurfaceControl) {
     state.window = s.ANativeWindow_fromSurfaceControl(state.surface);
+    state.window_raw = state.window;
     if (!state.window) {
       fprintf(stderr, "ANativeWindow_fromSurfaceControl returned null\n");
       return false;
@@ -1707,17 +1730,20 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   fprintf(stderr, "Surface surface=%p\n", surface_sp.ptr);
 
   state.surface_native = surface_sp.ptr;
-  state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  state.window_raw = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
+  state.window = surface_to_window(surface_sp.ptr);
   int sdk = read_sdk_version();
   state.use_surface_direct = false;
-  if (state.surface_native && s.Surface_dequeueBuffer &&
+  const char* force_direct_env = getenv("MIDRAW_FORCE_DIRECT");
+  const bool allow_direct = force_direct_env && force_direct_env[0] != '0';
+  if (allow_direct && state.surface_native && s.Surface_dequeueBuffer &&
       (s.Surface_queueBuffer4 || s.Surface_queueBuffer3) && s.GraphicBuffer_from &&
       s.GraphicBuffer_lock && s.GraphicBuffer_unlock) {
     if (sdk >= 34) {
       state.use_surface_direct = true;
-      fprintf(stderr, "Using Surface direct buffer path\n");
+      fprintf(stderr, "Using Surface direct buffer path (MIDRAW_FORCE_DIRECT=1)\n");
     }
-  } else if (sdk >= 34) {
+  } else if (sdk >= 34 && allow_direct) {
     fprintf(stderr,
             "Surface direct path unavailable: dequeue=%p queue=%p from=%p lock=%p unlock=%p\n",
             reinterpret_cast<void*>(s.Surface_dequeueBuffer),
@@ -1779,7 +1805,17 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     fprintf(stderr, "API %d using legacy ANativeWindow path (AHB unavailable)\n", sdk);
   }
   if (s.ANativeWindow_setBuffersGeometry) {
-    s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
+    int res = s.ANativeWindow_setBuffersGeometry(state.window, width, height,
+                                                 WINDOW_FORMAT_RGBA_8888);
+    if (res != 0 && state.window_raw && state.window_raw != state.window) {
+      int res2 = s.ANativeWindow_setBuffersGeometry(state.window_raw,
+                                                    width,
+                                                    height,
+                                                    WINDOW_FORMAT_RGBA_8888);
+      if (res2 == 0) {
+        state.window = state.window_raw;
+      }
+    }
   }
   return true;
 }
@@ -1893,16 +1929,39 @@ static bool lock_buffer(EngineState& state) {
     return state.pixels != nullptr;
   }
 
-  if (!state.window || !state.symbols.ANativeWindow_lock) {
+  if ((!state.window && !state.window_raw) || !state.symbols.ANativeWindow_lock) {
     return false;
   }
-  if (state.symbols.ANativeWindow_lock(state.window, &state.window_buffer, nullptr) != 0) {
+  ANativeWindow* window = state.window ? state.window : state.window_raw;
+  int lock_res = state.symbols.ANativeWindow_lock(window, &state.window_buffer, nullptr);
+  if (lock_res != 0 && state.window_raw && window != state.window_raw) {
+    lock_res = state.symbols.ANativeWindow_lock(state.window_raw, &state.window_buffer, nullptr);
+    if (lock_res == 0) {
+      state.window = state.window_raw;
+    }
+  }
+  if (lock_res != 0) {
+    static int log_count = 0;
+    if (log_count < 5) {
+      fprintf(stderr, "ANativeWindow_lock failed: %d (window=%p raw=%p)\n",
+              lock_res, reinterpret_cast<void*>(state.window),
+              reinterpret_cast<void*>(state.window_raw));
+      ++log_count;
+    }
     return false;
   }
   state.width = state.window_buffer.width;
   state.height = state.window_buffer.height;
   state.stride = state.window_buffer.stride;
   state.pixels = reinterpret_cast<uint32_t*>(state.window_buffer.bits);
+  if (state.pixels) {
+    static int log_count = 0;
+    if (log_count < 3) {
+      fprintf(stderr, "ANativeWindow buffer: %dx%d stride=%d bits=%p\n",
+              state.width, state.height, state.stride, state.pixels);
+      ++log_count;
+    }
+  }
   return state.pixels != nullptr;
 }
 
@@ -1960,8 +2019,9 @@ static void unlock_post(EngineState& state) {
     return;
   }
 
-  if (state.window && state.symbols.ANativeWindow_unlockAndPost) {
-    state.symbols.ANativeWindow_unlockAndPost(state.window);
+  if ((state.window || state.window_raw) && state.symbols.ANativeWindow_unlockAndPost) {
+    ANativeWindow* window = state.window ? state.window : state.window_raw;
+    state.symbols.ANativeWindow_unlockAndPost(window);
   }
   state.pixels = nullptr;
 }
