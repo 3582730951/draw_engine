@@ -2320,12 +2320,6 @@ int main(int argc, char** argv) {
     const int graph_width = max_w < 240 ? max_w : 240;
     const int graph_height = max_h / 6 > 0 ? max_h / 6 : 1;
 
-    const int debug_w = state.width > 80 ? 80 : state.width;
-    const int debug_h = state.height > 80 ? 80 : state.height;
-    if (debug_w > 0 && debug_h > 0) {
-      clear_rect(state.pixels, state.stride, 8, 8, debug_w, debug_h, 0xFFFF0000);
-    }
-
     clear_rect(state.pixels, state.stride, graph_x, graph_y, graph_width, graph_height,
                0x00000000);
 
@@ -2343,6 +2337,18 @@ int main(int argc, char** argv) {
 
     draw_line(state.pixels, state.stride, graph_x, graph_y + graph_height - 1,
               graph_x + graph_width - 1, graph_y + graph_height - 1, 0x80FFFFFF);
+
+    const int debug_w = state.width > 160 ? 160 : state.width;
+    const int debug_h = state.height > 160 ? 160 : state.height;
+    if (debug_w > 0 && debug_h > 0) {
+      int debug_x = state.width - debug_w - 16;
+      int debug_y = 16;
+      if (debug_x < 0) {
+        debug_x = 0;
+      }
+      clear_rect(state.pixels, state.stride, debug_x, debug_y, debug_w, debug_h,
+                 0xFFFF0000);
+    }
 
     unlock_post(state);
 
