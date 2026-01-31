@@ -1417,10 +1417,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  const int graph_height = height / 6;
-  const int graph_width = 240;
-  const int graph_x = 16;
-  const int graph_y = 16;
   uint16_t samples[256] = {};
   int sample_index = 0;
   uint64_t frame = 0;
@@ -1430,6 +1426,18 @@ int main(int argc, char** argv) {
       usleep(1000);
       continue;
     }
+
+    const int graph_x = 16;
+    const int graph_y = 16;
+    const int max_w = state.width - graph_x - 1;
+    const int max_h = state.height - graph_y - 1;
+    if (max_w <= 0 || max_h <= 0) {
+      unlock_post(state);
+      usleep(1000);
+      continue;
+    }
+    const int graph_width = max_w < 240 ? max_w : 240;
+    const int graph_height = max_h / 6 > 0 ? max_h / 6 : 1;
 
     clear_rect(state.pixels, state.stride, graph_x, graph_y, graph_width, graph_height,
                0x00000000);
