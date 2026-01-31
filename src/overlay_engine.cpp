@@ -43,6 +43,10 @@ struct sp {
   T* ptr;
   sp() : ptr(nullptr) {}
 };
+
+struct PhysicalDisplayId {
+  uint64_t value;
+};
 }  // namespace android
 
 namespace android::gui {
@@ -141,6 +145,8 @@ using PFN_ProcessState_startThreadPool = void (*)(void* proc);
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
 using PFN_SurfaceComposerClient_getDefault = SpObject (*)();
+using PFN_SurfaceComposerClient_getPhysicalDisplayToken =
+    SpObject (*)(android::PhysicalDisplayId display_id);
 using PFN_SurfaceComposerClient_openGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_closeGlobalTransaction = void (*)();
 using PFN_SurfaceComposerClient_createSurfaceChecked_v1 =
@@ -246,6 +252,8 @@ struct EngineSymbols {
   PFN_String8_ctor String8_ctor = nullptr;
   PFN_String8_dtor String8_dtor = nullptr;
   PFN_SurfaceComposerClient_getDefault SurfaceComposerClient_getDefault = nullptr;
+  PFN_SurfaceComposerClient_getPhysicalDisplayToken SurfaceComposerClient_getPhysicalDisplayToken =
+      nullptr;
   PFN_SurfaceComposerClient_openGlobalTransaction SurfaceComposerClient_openGlobalTransaction =
       nullptr;
   PFN_SurfaceComposerClient_closeGlobalTransaction SurfaceComposerClient_closeGlobalTransaction =
@@ -929,6 +937,12 @@ static bool load_symbols(EngineSymbols& s) {
           load_symbol_list(s.libgui,
                            version ? version->SurfaceComposerClient_getDefault : empty_list,
                            "_ZN7android21SurfaceComposerClient10getDefaultEv"));
+  s.SurfaceComposerClient_getPhysicalDisplayToken =
+      reinterpret_cast<PFN_SurfaceComposerClient_getPhysicalDisplayToken>(
+          load_symbol_list(
+              s.libgui,
+              empty_list,
+              "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE"));
   s.SurfaceComposerClient_openGlobalTransaction =
       reinterpret_cast<PFN_SurfaceComposerClient_openGlobalTransaction>(
           load_symbol_list(s.libgui,
@@ -1173,6 +1187,14 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   String8Storage name_storage{};
   s.String8_ctor(name_storage.data, "SystemProfiler");
 
+  android::sp<android::IBinder> parent_handle{};
+  if (s.SurfaceComposerClient_getPhysicalDisplayToken) {
+    android::PhysicalDisplayId display_id{0};
+    SpObject token_sp = s.SurfaceComposerClient_getPhysicalDisplayToken(display_id);
+    parent_handle.ptr = token_sp.ptr;
+    fprintf(stderr, "Display token=%p\n", token_sp.ptr);
+  }
+
   SpObject control_sp{};
   int32_t status = -1;
   if (s.SurfaceComposerClient_createSurfaceChecked_v1) {
@@ -1198,7 +1220,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           WINDOW_FORMAT_RGBA_8888,
           &control_sp,
           0,
-          android::sp<android::IBinder>(),
+          parent_handle,
           metadata,
           nullptr);
     } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_handle) {
@@ -1210,7 +1232,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
           WINDOW_FORMAT_RGBA_8888,
           &control_sp,
           0,
-          android::sp<android::IBinder>(),
+          parent_handle,
           metadata);
     } else if (s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint) {
       status = s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint(
