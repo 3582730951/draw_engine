@@ -66,17 +66,26 @@ using PFN_ASurfaceControl_createFromWindow = ASurfaceControl* (*)(ANativeWindow*
                                                                   const char* debug_name);
 using PFN_ASurfaceControl_release = void (*)(ASurfaceControl* control);
 using PFN_ASurfaceTransaction_create = ASurfaceTransaction* (*)();
+using PFN_ASurfaceTransaction_delete = void (*)(ASurfaceTransaction* transaction);
 using PFN_ASurfaceTransaction_release = void (*)(ASurfaceTransaction* transaction);
 using PFN_ASurfaceTransaction_setBufferSize = void (*)(ASurfaceTransaction* transaction,
                                                      ASurfaceControl* control,
                                                      int32_t width,
                                                      int32_t height);
+using PFN_ASurfaceTransaction_setGeometry = void (*)(ASurfaceTransaction* transaction,
+                                                    ASurfaceControl* control,
+                                                    const ARect& source,
+                                                    const ARect& destination,
+                                                    int32_t transform);
 using PFN_ASurfaceTransaction_setVisibility = void (*)(ASurfaceTransaction* transaction,
                                                       ASurfaceControl* control,
                                                       int32_t visibility);
 using PFN_ASurfaceTransaction_setLayer = void (*)(ASurfaceTransaction* transaction,
                                                  ASurfaceControl* control,
                                                  int32_t layer);
+using PFN_ASurfaceTransaction_setZOrder = void (*)(ASurfaceTransaction* transaction,
+                                                  ASurfaceControl* control,
+                                                  int32_t z_order);
 using PFN_ASurfaceTransaction_apply = void (*)(ASurfaceTransaction* transaction);
 using PFN_ASurfaceTransaction_setBuffer = void (*)(ASurfaceTransaction* transaction,
                                                    ASurfaceControl* control,
@@ -88,6 +97,9 @@ using PFN_ASurfaceTransaction_setAlpha = void (*)(ASurfaceTransaction* transacti
 using PFN_ASurfaceTransaction_setOpaque = void (*)(ASurfaceTransaction* transaction,
                                                    ASurfaceControl* control,
                                                    int32_t opaque);
+using PFN_ASurfaceTransaction_setBufferTransparency = void (*)(ASurfaceTransaction* transaction,
+                                                               ASurfaceControl* control,
+                                                               int8_t transparency);
 using PFN_ANativeWindow_fromSurfaceControl = ANativeWindow* (*)(ASurfaceControl* control);
 using PFN_ANativeWindow_lock = int32_t (*)(ANativeWindow* window,
                                           ANativeWindow_Buffer* outBuffer,
@@ -119,6 +131,8 @@ struct SpObject {
 struct String8Storage {
   alignas(void*) unsigned char data[64];
 };
+
+constexpr int8_t kBufferTransparencyTranslucent = 1;
 
 using PFN_String8_ctor = void (*)(void* self, const char* str);
 using PFN_String8_dtor = void (*)(void* self);
@@ -195,14 +209,19 @@ struct EngineSymbols {
   PFN_ASurfaceControl_createFromWindow ASurfaceControl_createFromWindow = nullptr;
   PFN_ASurfaceControl_release ASurfaceControl_release = nullptr;
   PFN_ASurfaceTransaction_create ASurfaceTransaction_create = nullptr;
+  PFN_ASurfaceTransaction_delete ASurfaceTransaction_delete = nullptr;
   PFN_ASurfaceTransaction_release ASurfaceTransaction_release = nullptr;
   PFN_ASurfaceTransaction_setBufferSize ASurfaceTransaction_setBufferSize = nullptr;
+  PFN_ASurfaceTransaction_setGeometry ASurfaceTransaction_setGeometry = nullptr;
   PFN_ASurfaceTransaction_setVisibility ASurfaceTransaction_setVisibility = nullptr;
   PFN_ASurfaceTransaction_setLayer ASurfaceTransaction_setLayer = nullptr;
+  PFN_ASurfaceTransaction_setZOrder ASurfaceTransaction_setZOrder = nullptr;
   PFN_ASurfaceTransaction_apply ASurfaceTransaction_apply = nullptr;
   PFN_ASurfaceTransaction_setBuffer ASurfaceTransaction_setBuffer = nullptr;
   PFN_ASurfaceTransaction_setAlpha ASurfaceTransaction_setAlpha = nullptr;
   PFN_ASurfaceTransaction_setOpaque ASurfaceTransaction_setOpaque = nullptr;
+  PFN_ASurfaceTransaction_setBufferTransparency ASurfaceTransaction_setBufferTransparency =
+      nullptr;
   PFN_ANativeWindow_fromSurfaceControl ANativeWindow_fromSurfaceControl = nullptr;
   PFN_ANativeWindow_lock ANativeWindow_lock = nullptr;
   PFN_ANativeWindow_unlockAndPost ANativeWindow_unlockAndPost = nullptr;
@@ -740,6 +759,12 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceTransaction_create : empty_list,
                         "ASurfaceTransaction_create"));
+  s.ASurfaceTransaction_delete = reinterpret_cast<PFN_ASurfaceTransaction_delete>(
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ASurfaceTransaction_delete"));
   s.ASurfaceTransaction_release = reinterpret_cast<PFN_ASurfaceTransaction_release>(
       load_symbol_multi(s.libgui,
                         s.libandroid,
@@ -752,6 +777,12 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceTransaction_setBufferSize : empty_list,
                         "ASurfaceTransaction_setBufferSize"));
+  s.ASurfaceTransaction_setGeometry = reinterpret_cast<PFN_ASurfaceTransaction_setGeometry>(
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ASurfaceTransaction_setGeometry"));
   s.ASurfaceTransaction_setVisibility =
       reinterpret_cast<PFN_ASurfaceTransaction_setVisibility>(
           load_symbol_multi(s.libgui,
@@ -765,6 +796,12 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceTransaction_setLayer : empty_list,
                         "ASurfaceTransaction_setLayer"));
+  s.ASurfaceTransaction_setZOrder = reinterpret_cast<PFN_ASurfaceTransaction_setZOrder>(
+      load_symbol_multi(s.libgui,
+                        s.libandroid,
+                        s.libnativewindow,
+                        empty_list,
+                        "ASurfaceTransaction_setZOrder"));
   s.ASurfaceTransaction_apply = reinterpret_cast<PFN_ASurfaceTransaction_apply>(
       load_symbol_multi(s.libgui,
                         s.libandroid,
@@ -789,6 +826,13 @@ static bool load_symbols(EngineSymbols& s) {
                         s.libnativewindow,
                         version ? version->ASurfaceTransaction_setOpaque : empty_list,
                         "ASurfaceTransaction_setOpaque"));
+  s.ASurfaceTransaction_setBufferTransparency =
+      reinterpret_cast<PFN_ASurfaceTransaction_setBufferTransparency>(
+          load_symbol_multi(s.libgui,
+                            s.libandroid,
+                            s.libnativewindow,
+                            empty_list,
+                            "ASurfaceTransaction_setBufferTransparency"));
   s.ANativeWindow_fromSurfaceControl = reinterpret_cast<PFN_ANativeWindow_fromSurfaceControl>(
       load_symbol_multi(s.libgui,
                         s.libandroid,
@@ -927,6 +971,19 @@ static bool setup_ahb_buffer(EngineState& state, int width, int height) {
   return true;
 }
 
+static void release_transaction(EngineSymbols& s, ASurfaceTransaction* tx) {
+  if (!tx) {
+    return;
+  }
+  if (s.ASurfaceTransaction_delete) {
+    s.ASurfaceTransaction_delete(tx);
+    return;
+  }
+  if (s.ASurfaceTransaction_release) {
+    s.ASurfaceTransaction_release(tx);
+  }
+}
+
 static bool create_surface_asurface(EngineState& state,
                                     int width,
                                     int height,
@@ -934,9 +991,10 @@ static bool create_surface_asurface(EngineState& state,
   EngineSymbols& s = state.symbols;
   const bool can_window =
       s.ANativeWindow_fromSurfaceControl && s.ANativeWindow_lock && s.ANativeWindow_unlockAndPost;
-  const bool can_ahb = s.ASurfaceTransaction_setBuffer && s.AHardwareBuffer_allocate &&
-                       s.AHardwareBuffer_lock && s.AHardwareBuffer_unlock &&
-                       s.AHardwareBuffer_release && s.AHardwareBuffer_describe;
+  const bool can_ahb = s.ASurfaceTransaction_setBuffer && s.ASurfaceTransaction_apply &&
+                       s.AHardwareBuffer_allocate && s.AHardwareBuffer_lock &&
+                       s.AHardwareBuffer_unlock && s.AHardwareBuffer_release &&
+                       s.AHardwareBuffer_describe;
   if ((!s.ASurfaceControl_createFromWindow && !s.ASurfaceControl_create) ||
       !s.ASurfaceTransaction_create ||
       (!can_window && !can_ahb)) {
@@ -981,22 +1039,26 @@ static bool create_surface_asurface(EngineState& state,
   }
   if (s.ASurfaceTransaction_setLayer) {
     s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
+  } else if (s.ASurfaceTransaction_setZOrder) {
+    s.ASurfaceTransaction_setZOrder(tx, state.surface, INT_MAX);
   }
-  if (s.ASurfaceTransaction_setAlpha) {
-    s.ASurfaceTransaction_setAlpha(tx, state.surface, 1.0f);
-  }
-  if (s.ASurfaceTransaction_setOpaque) {
+  if (s.ASurfaceTransaction_setBufferTransparency) {
+    s.ASurfaceTransaction_setBufferTransparency(tx, state.surface,
+                                                kBufferTransparencyTranslucent);
+  } else if (s.ASurfaceTransaction_setOpaque) {
     s.ASurfaceTransaction_setOpaque(tx, state.surface, 0);
   }
   if (s.ASurfaceTransaction_setBufferSize && width > 0 && height > 0) {
     s.ASurfaceTransaction_setBufferSize(tx, state.surface, width, height);
+  } else if (s.ASurfaceTransaction_setGeometry && width > 0 && height > 0) {
+    const ARect src{0, 0, width, height};
+    const ARect dst{0, 0, width, height};
+    s.ASurfaceTransaction_setGeometry(tx, state.surface, src, dst, 0);
   }
   if (s.ASurfaceTransaction_apply) {
     s.ASurfaceTransaction_apply(tx);
   }
-  if (s.ASurfaceTransaction_release) {
-    s.ASurfaceTransaction_release(tx);
-  }
+  release_transaction(s, tx);
 
   const int sdk = read_sdk_version();
   const bool prefer_ahb = (sdk >= 34);
@@ -1169,25 +1231,38 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
   int sdk = read_sdk_version();
   const bool can_ahb = s.ASurfaceControl_createFromWindow && s.ASurfaceTransaction_create &&
-                       s.ASurfaceTransaction_setBuffer && s.ASurfaceTransaction_setBufferSize &&
-                       s.ASurfaceTransaction_setVisibility && s.ASurfaceTransaction_setLayer &&
-                       s.ASurfaceTransaction_setAlpha && s.ASurfaceTransaction_setOpaque &&
-                       s.ASurfaceTransaction_apply;
+                       s.ASurfaceTransaction_setBuffer && s.ASurfaceTransaction_apply;
   if (can_ahb) {
     fprintf(stderr, "Attempting AHB path via ASurfaceControl_createFromWindow\n");
     state.surface = s.ASurfaceControl_createFromWindow(state.window, "SystemProfiler");
     if (state.surface) {
       ASurfaceTransaction* tx = s.ASurfaceTransaction_create();
       if (tx) {
-        s.ASurfaceTransaction_setVisibility(tx, state.surface, 1);
-        s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
-        s.ASurfaceTransaction_setAlpha(tx, state.surface, 1.0f);
-        s.ASurfaceTransaction_setOpaque(tx, state.surface, 0);
-        s.ASurfaceTransaction_setBufferSize(tx, state.surface, width, height);
-        s.ASurfaceTransaction_apply(tx);
-        if (s.ASurfaceTransaction_release) {
-          s.ASurfaceTransaction_release(tx);
+        if (s.ASurfaceTransaction_setVisibility) {
+          s.ASurfaceTransaction_setVisibility(tx, state.surface, 1);
         }
+        if (s.ASurfaceTransaction_setLayer) {
+          s.ASurfaceTransaction_setLayer(tx, state.surface, INT_MAX);
+        } else if (s.ASurfaceTransaction_setZOrder) {
+          s.ASurfaceTransaction_setZOrder(tx, state.surface, INT_MAX);
+        }
+        if (s.ASurfaceTransaction_setBufferTransparency) {
+          s.ASurfaceTransaction_setBufferTransparency(tx, state.surface,
+                                                      kBufferTransparencyTranslucent);
+        } else if (s.ASurfaceTransaction_setOpaque) {
+          s.ASurfaceTransaction_setOpaque(tx, state.surface, 0);
+        }
+        if (s.ASurfaceTransaction_setBufferSize) {
+          s.ASurfaceTransaction_setBufferSize(tx, state.surface, width, height);
+        } else if (s.ASurfaceTransaction_setGeometry) {
+          const ARect src{0, 0, width, height};
+          const ARect dst{0, 0, width, height};
+          s.ASurfaceTransaction_setGeometry(tx, state.surface, src, dst, 0);
+        }
+        if (s.ASurfaceTransaction_apply) {
+          s.ASurfaceTransaction_apply(tx);
+        }
+        release_transaction(s, tx);
       }
       if (setup_ahb_buffer(state, width, height)) {
         fprintf(stderr, "AHB path enabled\n");
@@ -1263,9 +1338,7 @@ static void unlock_post(EngineState& state) {
       if (tx) {
         state.symbols.ASurfaceTransaction_setBuffer(tx, state.surface, state.buffer, -1);
         state.symbols.ASurfaceTransaction_apply(tx);
-        if (state.symbols.ASurfaceTransaction_release) {
-          state.symbols.ASurfaceTransaction_release(tx);
-        }
+        release_transaction(state.symbols, tx);
       }
     }
     state.pixels = nullptr;
