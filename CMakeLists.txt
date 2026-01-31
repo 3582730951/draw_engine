@@ -6,6 +6,7 @@ option(MIDRAW_BUILD_SHARED "Build shared library" ON)
 option(MIDRAW_BUILD_STATIC "Build static library" ON)
 option(MIDRAW_BUILD_BENCHMARK "Build benchmark executable" ON)
 option(MIDRAW_BUILD_OVERLAY "Build overlay engine executable" ON)
+option(MIDRAW_BUILD_DEMO "Build draw demo executable" ON)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -15,10 +16,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(MIDRAW_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/midraw.cpp
     ${CMAKE_CURRENT_LIST_DIR}/midraw_window.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/draw_engine.cpp
 )
 
 set(MIDRAW_PUBLIC_HEADERS
     ${CMAKE_CURRENT_LIST_DIR}/include/midraw.h
+    ${CMAKE_CURRENT_LIST_DIR}/include/draw_engine.h
 )
 
 set(FONT8X8_ROOT "" CACHE PATH "Path to font8x8 install prefix")
@@ -42,6 +45,7 @@ if(MIDRAW_BUILD_SHARED)
   add_library(midraw_shared SHARED ${MIDRAW_SOURCES})
   set_target_properties(midraw_shared PROPERTIES OUTPUT_NAME midraw)
   target_include_directories(midraw_shared PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
   target_link_libraries(midraw_shared PUBLIC dl)
   if(FONT8X8_INCLUDE_DIR AND FONT8X8_LIBRARY)
     target_include_directories(midraw_shared PRIVATE ${FONT8X8_INCLUDE_DIR})
@@ -59,6 +63,7 @@ if(MIDRAW_BUILD_STATIC)
   add_library(midraw_static STATIC ${MIDRAW_SOURCES})
   set_target_properties(midraw_static PROPERTIES OUTPUT_NAME midraw)
   target_include_directories(midraw_static PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
   target_link_libraries(midraw_static PUBLIC dl)
   if(FONT8X8_INCLUDE_DIR AND FONT8X8_LIBRARY)
     target_include_directories(midraw_static PRIVATE ${FONT8X8_INCLUDE_DIR})
@@ -79,6 +84,16 @@ if(MIDRAW_BUILD_BENCHMARK)
     target_link_libraries(benchmark PRIVATE midraw_static dl)
   elseif(TARGET midraw_shared)
     target_link_libraries(benchmark PRIVATE midraw_shared dl)
+  endif()
+endif()
+
+if(MIDRAW_BUILD_DEMO)
+  add_executable(draw_demo ${CMAKE_CURRENT_LIST_DIR}/demo.cpp)
+  target_include_directories(draw_demo PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+  if(TARGET midraw_static)
+    target_link_libraries(draw_demo PRIVATE midraw_static dl)
+  elseif(TARGET midraw_shared)
+    target_link_libraries(draw_demo PRIVATE midraw_shared dl)
   endif()
 endif()
 

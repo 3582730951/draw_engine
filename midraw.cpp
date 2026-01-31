@@ -47,7 +47,7 @@ struct FontAtlas {
   bool valid = false;
 };
 
-enum class DrawCommandType : uint8_t { Pixel, Line, Rect, Circle, Text };
+enum class DrawCommandType : uint8_t { Pixel, Line, Rect, Circle, Text, Image };
 
 struct DrawCommand {
   DrawCommandType type = DrawCommandType::Pixel;
@@ -58,6 +58,7 @@ struct DrawCommand {
   int e = 0;
   int f = 0;
   uint32_t color = 0;
+  uintptr_t ptr = 0;
 };
 
 static constexpr size_t kCommandCapacity = 4096;
@@ -472,6 +473,40 @@ static inline void reset_rect(int& min_x, int& min_y, int& max_x, int& max_y) {
 
 static inline bool rect_valid(int min_x, int min_y, int max_x, int max_y) {
   return min_x < max_x && min_y < max_y;
+}
+
+static inline bool intersect_rect(int ax0,
+                                  int ay0,
+                                  int ax1,
+                                  int ay1,
+                                  int bx0,
+                                  int by0,
+                                  int bx1,
+                                  int by1,
+                                  int* out_x0,
+                                  int* out_y0,
+                                  int* out_x1,
+                                  int* out_y1) {
+  const int rx0 = ax0 > bx0 ? ax0 : bx0;
+  const int ry0 = ay0 > by0 ? ay0 : by0;
+  const int rx1 = ax1 < bx1 ? ax1 : bx1;
+  const int ry1 = ay1 < by1 ? ay1 : by1;
+  if (rx0 >= rx1 || ry0 >= ry1) {
+    return false;
+  }
+  if (out_x0) {
+    *out_x0 = rx0;
+  }
+  if (out_y0) {
+    *out_y0 = ry0;
+  }
+  if (out_x1) {
+    *out_x1 = rx1;
+  }
+  if (out_y1) {
+    *out_y1 = ry1;
+  }
+  return true;
 }
 
 static inline void reset_dirty(RenderContext& ctx) {
@@ -1034,6 +1069,78 @@ static void draw_text(RenderContext& ctx, const char* text, int x, int y, uint32
   }
 }
 
+static void draw_char_clipped(RenderContext& ctx,
+                              char c,
+                              int x,
+                              int y,
+                              int clip_x0,
+                              int clip_y0,
+                              int clip_x1,
+                              int clip_y1,
+                              uint32_t color) {
+  const uint8_t* glyph = font_for_char(c);
+  for (int row = 0; row < 8; ++row) {
+    int py = y + row;
+    if (py < clip_y0 || py >= clip_y1) {
+      continue;
+    }
+    uint8_t bits = glyph[row];
+    for (int col = 0; col < 8; ++col) {
+      if (!(bits & (1u << (7 - col)))) {
+        continue;
+      }
+      int px = x + col;
+      if (px < clip_x0 || px >= clip_x1) {
+        continue;
+      }
+      plot_pixel(ctx, px, py, color);
+    }
+  }
+}
+
+static void draw_text_clipped(RenderContext& ctx,
+                              const char* text,
+                              int x,
+                              int y,
+                              int clip_x0,
+                              int clip_y0,
+                              int clip_x1,
+                              int clip_y1,
+                              uint32_t color) {
+  if (!text || !ctx.pixels) {
+    return;
+  }
+  if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
+    draw_text(ctx, text, x, y, color);
+    return;
+  }
+  int cursor_x = x;
+  int cursor_y = y;
+  while (*text) {
+    char c = *text++;
+    if (c == '\n') {
+      cursor_x = x;
+      cursor_y += 8;
+      continue;
+    }
+    int gx0 = cursor_x;
+    int gy0 = cursor_y;
+    int gx1 = cursor_x + 8;
+    int gy1 = cursor_y + 8;
+    int ix0 = 0;
+    int iy0 = 0;
+    int ix1 = 0;
+    int iy1 = 0;
+    if (intersect_rect(gx0, gy0, gx1, gy1, clip_x0, clip_y0, clip_x1, clip_y1,
+                       &ix0, &iy0, &ix1, &iy1)) {
+      expand_dirty_rect(ctx, ix0, iy0, ix1 - ix0, iy1 - iy0);
+      draw_char_clipped(ctx, c, cursor_x, cursor_y, clip_x0, clip_y0, clip_x1, clip_y1,
+                        color);
+    }
+    cursor_x += 8;
+  }
+}
+
 #if defined(MIDRAW_USE_STB_TRUETYPE)
 static void expand_text_dirty_atlas(MidrawContext& ctx, const char* text, int x, int y) {
   if (!text || !ctx.atlas.valid) {
@@ -1117,8 +1224,13 @@ static void expand_text_dirty_font8x8(RenderContext& render, const char* text, i
   expand_dirty_rect(render, x, y, max_line * 8, lines * 8);
 }
 
-static inline void record_text(MidrawContext& ctx, const char* text, int x, int y,
-                               uint32_t color) {
+static inline void record_text_rect(MidrawContext& ctx,
+                                    const char* text,
+                                    int x,
+                                    int y,
+                                    int clip_x1,
+                                    int clip_y1,
+                                    uint32_t color) {
   if (!text) {
     return;
   }
@@ -1139,6 +1251,8 @@ static inline void record_text(MidrawContext& ctx, const char* text, int x, int 
   cmd.type = DrawCommandType::Text;
   cmd.a = x;
   cmd.b = y;
+  cmd.c = clip_x1;
+  cmd.d = clip_y1;
   cmd.e = static_cast<int>(offset);
   cmd.f = static_cast<int>(len);
   cmd.color = color;
@@ -1155,6 +1269,29 @@ static inline void record_text(MidrawContext& ctx, const char* text, int x, int 
 #else
   expand_text_dirty_font8x8(ctx.render, text, x, y);
 #endif
+
+  if (clip_x1 > x && clip_y1 > y &&
+      rect_valid(ctx.render.dirty_min_x, ctx.render.dirty_min_y,
+                 ctx.render.dirty_max_x, ctx.render.dirty_max_y)) {
+    int ix0 = 0;
+    int iy0 = 0;
+    int ix1 = 0;
+    int iy1 = 0;
+    if (intersect_rect(ctx.render.dirty_min_x, ctx.render.dirty_min_y,
+                       ctx.render.dirty_max_x, ctx.render.dirty_max_y,
+                       x, y, clip_x1, clip_y1,
+                       &ix0, &iy0, &ix1, &iy1)) {
+      ctx.render.dirty_min_x = ix0;
+      ctx.render.dirty_min_y = iy0;
+      ctx.render.dirty_max_x = ix1;
+      ctx.render.dirty_max_y = iy1;
+    }
+  }
+}
+
+static inline void record_text(MidrawContext& ctx, const char* text, int x, int y,
+                               uint32_t color) {
+  record_text_rect(ctx, text, x, y, 0, 0, color);
 }
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
@@ -1333,6 +1470,173 @@ static void blit_glyph_slow(RenderContext& ctx,
   }
 }
 
+static void blit_glyph_fast_clipped(RenderContext& ctx,
+                                    const FontAtlas& atlas,
+                                    const GlyphInfo& glyph,
+                                    int dst_x,
+                                    int dst_y,
+                                    uint32_t color,
+                                    int clip_x0,
+                                    int clip_y0,
+                                    int clip_x1,
+                                    int clip_y1) {
+  if (!ctx.pixels || !atlas.pixels) {
+    return;
+  }
+  if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
+    blit_glyph_fast(ctx, atlas, glyph, dst_x, dst_y, color);
+    return;
+  }
+  int src_w = glyph.x1 - glyph.x0;
+  int src_h = glyph.y1 - glyph.y0;
+  if (src_w <= 0 || src_h <= 0) {
+    return;
+  }
+
+  const int gx0 = dst_x;
+  const int gy0 = dst_y;
+  const int gx1 = dst_x + src_w;
+  const int gy1 = dst_y + src_h;
+
+  int ix0 = 0;
+  int iy0 = 0;
+  int ix1 = 0;
+  int iy1 = 0;
+  if (!intersect_rect(gx0, gy0, gx1, gy1, clip_x0, clip_y0, clip_x1, clip_y1,
+                      &ix0, &iy0, &ix1, &iy1)) {
+    return;
+  }
+  if (!intersect_rect(ix0, iy0, ix1, iy1, 0, 0, ctx.width, ctx.height,
+                      &ix0, &iy0, &ix1, &iy1)) {
+    return;
+  }
+
+  int src_x = glyph.x0 + (ix0 - dst_x);
+  int src_y = glyph.y0 + (iy0 - dst_y);
+  int dx = ix0;
+  int dy = iy0;
+  src_w = ix1 - ix0;
+  src_h = iy1 - iy0;
+  if (src_w <= 0 || src_h <= 0) {
+    return;
+  }
+
+  ColorComponents src_comp{
+      static_cast<uint8_t>((color >> 24) & 0xFF),
+      static_cast<uint8_t>((color >> 16) & 0xFF),
+      static_cast<uint8_t>((color >> 8) & 0xFF),
+      static_cast<uint8_t>(color & 0xFF),
+  };
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+  const uint32x4_t vcolor = vdupq_n_u32(color);
+#endif
+
+  for (int row = 0; row < src_h; ++row) {
+    const uint8_t* src = atlas.pixels + (src_y + row) * atlas.width + src_x;
+    uint32_t* dst = ctx.pixels + (dy + row) * ctx.stride + dx;
+
+    if (src_comp.a == 255) {
+      int col = 0;
+      while (col < src_w) {
+        const uint8_t a = src[col];
+        if (a == 0) {
+          ++col;
+          continue;
+        }
+        if (a == 255) {
+          int run = 1;
+          while (col + run < src_w && src[col + run] == 255) {
+            ++run;
+          }
+          uint32_t* d = dst + col;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+          int n = run;
+          while (n >= 4) {
+            vst1q_u32(d, vcolor);
+            d += 4;
+            n -= 4;
+          }
+          while (n-- > 0) {
+            *d++ = color;
+          }
+#else
+          for (int i = 0; i < run; ++i) {
+            d[i] = color;
+          }
+#endif
+          col += run;
+          continue;
+        }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+        if (src_w - col >= 8) {
+          blend8_pixels_neon(dst + col, src + col, src_comp);
+          col += 8;
+          continue;
+        }
+#endif
+        dst[col] = blend_pixel(dst[col], src_comp, a);
+        ++col;
+      }
+    } else {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+      int col = 0;
+      for (; col + 8 <= src_w; col += 8) {
+        blend8_pixels_neon(dst + col, src + col, src_comp);
+      }
+      for (; col < src_w; ++col) {
+#else
+      for (int col = 0; col < src_w; ++col) {
+#endif
+        const uint8_t a = src[col];
+        if (a == 0) {
+          continue;
+        }
+        dst[col] = blend_pixel(dst[col], src_comp, a);
+      }
+    }
+  }
+}
+
+static void blit_glyph_slow_clipped(RenderContext& ctx,
+                                    const FontAtlas& atlas,
+                                    const GlyphInfo& glyph,
+                                    int dst_x,
+                                    int dst_y,
+                                    const ColorComponents& src_comp,
+                                    int clip_x0,
+                                    int clip_y0,
+                                    int clip_x1,
+                                    int clip_y1) {
+  if (!atlas.pixels) {
+    return;
+  }
+  const int src_w = glyph.x1 - glyph.x0;
+  const int src_h = glyph.y1 - glyph.y0;
+  if (src_w <= 0 || src_h <= 0) {
+    return;
+  }
+
+  for (int row = 0; row < src_h; ++row) {
+    const int y = dst_y + row;
+    if (y < clip_y0 || y >= clip_y1) {
+      continue;
+    }
+    const uint8_t* src = atlas.pixels + (glyph.y0 + row) * atlas.width + glyph.x0;
+    for (int col = 0; col < src_w; ++col) {
+      const int x = dst_x + col;
+      if (x < clip_x0 || x >= clip_x1) {
+        continue;
+      }
+      const uint8_t a = src[col];
+      if (a == 0) {
+        continue;
+      }
+      blend_pixel_mapped(ctx, x, y, src_comp, a);
+    }
+  }
+}
+
 static void draw_text_atlas(MidrawContext& ctx,
                             const char* text,
                             int x,
@@ -1380,6 +1684,162 @@ static void draw_text_atlas(MidrawContext& ctx,
       blit_glyph_slow(ctx.render, ctx.atlas, glyph, dst_x, dst_y, src_comp);
     }
     cursor_x += glyph.xadvance;
+  }
+}
+
+static void draw_text_atlas_clipped(MidrawContext& ctx,
+                                    const char* text,
+                                    int x,
+                                    int y,
+                                    int clip_x0,
+                                    int clip_y0,
+                                    int clip_x1,
+                                    int clip_y1,
+                                    uint32_t color) {
+  if (!text || !ctx.atlas.valid) {
+    return;
+  }
+  if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
+    draw_text_atlas(ctx, text, x, y, color);
+    return;
+  }
+
+  ColorComponents src_comp{
+      static_cast<uint8_t>((color >> 24) & 0xFF),
+      static_cast<uint8_t>((color >> 16) & 0xFF),
+      static_cast<uint8_t>((color >> 8) & 0xFF),
+      static_cast<uint8_t>(color & 0xFF),
+  };
+
+  int cursor_x = x;
+  int cursor_y = y;
+  const int first_char = ctx.atlas.first_char;
+  const int last_char = ctx.atlas.first_char + ctx.atlas.num_chars - 1;
+
+  while (*text) {
+    char c = *text++;
+    if (c == '\n') {
+      cursor_x = x;
+      cursor_y += (ctx.atlas.line_advance > 0 ? ctx.atlas.line_advance : 16);
+      continue;
+    }
+    if (c < first_char || c > last_char) {
+      cursor_x += 8;
+      continue;
+    }
+    const GlyphInfo& glyph = ctx.atlas.glyphs[c - first_char];
+    const int dst_x = cursor_x + glyph.xoff;
+    const int dst_y = cursor_y + ctx.atlas.baseline + glyph.yoff;
+    const int glyph_w = glyph.x1 - glyph.x0;
+    const int glyph_h = glyph.y1 - glyph.y0;
+    if (glyph_w > 0 && glyph_h > 0) {
+      int ix0 = 0;
+      int iy0 = 0;
+      int ix1 = 0;
+      int iy1 = 0;
+      if (intersect_rect(dst_x, dst_y, dst_x + glyph_w, dst_y + glyph_h,
+                         clip_x0, clip_y0, clip_x1, clip_y1,
+                         &ix0, &iy0, &ix1, &iy1)) {
+        expand_dirty_rect(ctx.render, ix0, iy0, ix1 - ix0, iy1 - iy0);
+      }
+    }
+
+    if (ctx.render.rotation == 0 && ctx.render.pixels) {
+      blit_glyph_fast_clipped(ctx.render, ctx.atlas, glyph, dst_x, dst_y, color,
+                              clip_x0, clip_y0, clip_x1, clip_y1);
+    } else {
+      blit_glyph_slow_clipped(ctx.render, ctx.atlas, glyph, dst_x, dst_y, src_comp,
+                              clip_x0, clip_y0, clip_x1, clip_y1);
+    }
+    cursor_x += glyph.xadvance;
+  }
+}
+
+static void draw_image(RenderContext& ctx,
+                       const uint32_t* src_pixels,
+                       int src_w,
+                       int src_h,
+                       int dst_x,
+                       int dst_y) {
+  if (!ctx.pixels || !src_pixels || src_w <= 0 || src_h <= 0) {
+    return;
+  }
+  expand_dirty_rect(ctx, dst_x, dst_y, src_w, src_h);
+
+  if (ctx.rotation != 0) {
+    for (int row = 0; row < src_h; ++row) {
+      const int y = dst_y + row;
+      for (int col = 0; col < src_w; ++col) {
+        const int x = dst_x + col;
+        const uint32_t src = src_pixels[row * src_w + col];
+        const uint8_t a = static_cast<uint8_t>((src >> 24) & 0xFF);
+        if (a == 0) {
+          continue;
+        }
+        ColorComponents comp{
+            a,
+            static_cast<uint8_t>((src >> 16) & 0xFF),
+            static_cast<uint8_t>((src >> 8) & 0xFF),
+            static_cast<uint8_t>(src & 0xFF),
+        };
+        if (a == 255) {
+          plot_pixel(ctx, x, y, src);
+        } else {
+          blend_pixel_mapped(ctx, x, y, comp, 255);
+        }
+      }
+    }
+    return;
+  }
+
+  int sx = 0;
+  int sy = 0;
+  int dx = dst_x;
+  int dy = dst_y;
+  int w = src_w;
+  int h = src_h;
+
+  if (dx < 0) {
+    sx -= dx;
+    w += dx;
+    dx = 0;
+  }
+  if (dy < 0) {
+    sy -= dy;
+    h += dy;
+    dy = 0;
+  }
+  if (dx + w > ctx.width) {
+    w = ctx.width - dx;
+  }
+  if (dy + h > ctx.height) {
+    h = ctx.height - dy;
+  }
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+
+  for (int row = 0; row < h; ++row) {
+    const uint32_t* src_row = src_pixels + (sy + row) * src_w + sx;
+    uint32_t* dst_row = ctx.pixels + (dy + row) * ctx.stride + dx;
+    for (int col = 0; col < w; ++col) {
+      const uint32_t src = src_row[col];
+      const uint8_t a = static_cast<uint8_t>((src >> 24) & 0xFF);
+      if (a == 0) {
+        continue;
+      }
+      if (a == 255) {
+        dst_row[col] = src;
+        continue;
+      }
+      ColorComponents comp{
+          a,
+          static_cast<uint8_t>((src >> 16) & 0xFF),
+          static_cast<uint8_t>((src >> 8) & 0xFF),
+          static_cast<uint8_t>(src & 0xFF),
+      };
+      dst_row[col] = blend_pixel(dst_row[col], comp, 255);
+    }
   }
 }
 
@@ -1493,11 +1953,26 @@ static void replay_commands(MidrawContext& ctx) {
         break;
       case DrawCommandType::Text: {
         const char* text = &ctx.text_pool[cmd.e];
+        const bool has_clip = (cmd.c > cmd.a && cmd.d > cmd.b);
         if (ctx.atlas.valid) {
-          draw_text_atlas(ctx, text, cmd.a, cmd.b, cmd.color);
+          if (has_clip) {
+            draw_text_atlas_clipped(ctx, text, cmd.a, cmd.b, cmd.a, cmd.b, cmd.c, cmd.d,
+                                    cmd.color);
+          } else {
+            draw_text_atlas(ctx, text, cmd.a, cmd.b, cmd.color);
+          }
         } else {
-          draw_text(ctx.render, text, cmd.a, cmd.b, cmd.color);
+          if (has_clip) {
+            draw_text_clipped(ctx.render, text, cmd.a, cmd.b, cmd.a, cmd.b, cmd.c, cmd.d,
+                              cmd.color);
+          } else {
+            draw_text(ctx.render, text, cmd.a, cmd.b, cmd.color);
+          }
         }
+      } break;
+      case DrawCommandType::Image: {
+        const uint32_t* pixels = reinterpret_cast<const uint32_t*>(cmd.ptr);
+        draw_image(ctx.render, pixels, cmd.c, cmd.d, cmd.a, cmd.b);
       } break;
       default:
         break;
@@ -1861,4 +2336,55 @@ void midraw_draw_text(MidrawContext* ctx, const char* text, int x, int y, uint32
   } else {
     draw_text(ctx->render, text, x, y, color);
   }
+}
+
+void midraw_draw_text_rect(MidrawContext* ctx,
+                           const char* text,
+                           int x0,
+                           int y0,
+                           int x1,
+                           int y1,
+                           uint32_t color) {
+  if (!ctx) {
+    return;
+  }
+  if (ctx->defer_lock && ctx->recording) {
+    record_text_rect(*ctx, text, x0, y0, x1, y1, color);
+    return;
+  }
+  if (x1 <= x0 || y1 <= y0) {
+    midraw_draw_text(ctx, text, x0, y0, color);
+    return;
+  }
+  if (ctx->atlas.valid) {
+    draw_text_atlas_clipped(*ctx, text, x0, y0, x0, y0, x1, y1, color);
+  } else {
+    draw_text_clipped(ctx->render, text, x0, y0, x0, y0, x1, y1, color);
+  }
+}
+
+void midraw_draw_image(MidrawContext* ctx,
+                       const uint32_t* pixels,
+                       int img_w,
+                       int img_h,
+                       int x,
+                       int y) {
+  if (!ctx || !pixels || img_w <= 0 || img_h <= 0) {
+    return;
+  }
+  if (ctx->defer_lock && ctx->recording) {
+    DrawCommand cmd;
+    cmd.type = DrawCommandType::Image;
+    cmd.a = x;
+    cmd.b = y;
+    cmd.c = img_w;
+    cmd.d = img_h;
+    cmd.ptr = reinterpret_cast<uintptr_t>(pixels);
+    if (!push_command(*ctx, cmd)) {
+      return;
+    }
+    expand_dirty_rect(ctx->render, x, y, img_w, img_h);
+    return;
+  }
+  draw_image(ctx->render, pixels, img_w, img_h, x, y);
 }

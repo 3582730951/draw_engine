@@ -42,6 +42,19 @@ MIDRAW_API void midraw_draw_circle(MidrawContext* ctx, int cx, int cy, int radiu
                                    uint32_t color);
 MIDRAW_API void midraw_draw_text(MidrawContext* ctx, const char* text, int x, int y,
                                  uint32_t color);
+MIDRAW_API void midraw_draw_text_rect(MidrawContext* ctx,
+                                      const char* text,
+                                      int x0,
+                                      int y0,
+                                      int x1,
+                                      int y1,
+                                      uint32_t color);
+MIDRAW_API void midraw_draw_image(MidrawContext* ctx,
+                                  const uint32_t* pixels,
+                                  int img_w,
+                                  int img_h,
+                                  int x,
+                                  int y);
 
 #ifdef __cplusplus
 }
