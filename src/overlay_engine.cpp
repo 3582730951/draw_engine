@@ -2347,7 +2347,7 @@ int main(int argc, char** argv) {
         debug_x = 0;
       }
       clear_rect(state.pixels, state.stride, debug_x, debug_y, debug_w, debug_h,
-                 0xFFFF0000);
+                 0xFF0000FF);
     }
 
     unlock_post(state);
