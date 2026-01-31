@@ -1030,6 +1030,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     fprintf(stderr, "SurfaceComposerClient_getDefault returned null\n");
     return false;
   }
+  fprintf(stderr, "SurfaceComposerClient client=%p\n", client_sp.ptr);
 
   String8Storage name_storage{};
   s.String8_ctor(name_storage.data, "SystemProfiler");
@@ -1105,6 +1106,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
             control_sp.ptr);
     return false;
   }
+  fprintf(stderr, "SurfaceControl control=%p\n", control_sp.ptr);
 
   if (s.SurfaceComposerClient_openGlobalTransaction &&
       s.SurfaceComposerClient_closeGlobalTransaction) {
@@ -1136,6 +1138,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   if (!surface_sp.ptr) {
     return false;
   }
+  fprintf(stderr, "Surface surface=%p\n", surface_sp.ptr);
 
   state.window = reinterpret_cast<ANativeWindow*>(surface_sp.ptr);
   if (s.ANativeWindow_setBuffersGeometry) {
