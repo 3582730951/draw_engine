@@ -1418,7 +1418,7 @@ static bool create_surface_osimgui(EngineState& state, int width, int height) {
             reinterpret_cast<void*>(s.GraphicBuffer_unlock));
   }
 
-  if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
+  if (s.ANativeWindow_setBuffersGeometry) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
   }
 
@@ -1769,7 +1769,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
   if (sdk >= 34) {
     fprintf(stderr, "API %d using legacy ANativeWindow path (AHB unavailable)\n", sdk);
   }
-  if (s.ANativeWindow_setBuffersGeometry && (sdk > 0 && sdk < 34)) {
+  if (s.ANativeWindow_setBuffersGeometry) {
     s.ANativeWindow_setBuffersGeometry(state.window, width, height, WINDOW_FORMAT_RGBA_8888);
   }
   return true;
@@ -1811,6 +1811,12 @@ static bool lock_buffer(EngineState& state) {
     int fence_fd = -1;
     int res = s.Surface_dequeueBuffer(state.surface_native, &buffer, &fence_fd);
     if (res != 0 || !buffer) {
+      static int log_count = 0;
+      if (log_count < 5) {
+        fprintf(stderr, "Surface_dequeueBuffer failed: res=%d buffer=%p\n", res,
+                buffer);
+        ++log_count;
+      }
       if (fence_fd >= 0) {
         close(fence_fd);
       }
@@ -1819,6 +1825,11 @@ static bool lock_buffer(EngineState& state) {
     wait_for_fence(fence_fd);
     SpObject graphic_sp = s.GraphicBuffer_from(buffer);
     if (!graphic_sp.ptr) {
+      static int log_count = 0;
+      if (log_count < 5) {
+        fprintf(stderr, "GraphicBuffer_from returned null (buffer=%p)\n", buffer);
+        ++log_count;
+      }
       if (s.Surface_cancelBuffer) {
         s.Surface_cancelBuffer(state.surface_native, buffer, -1);
       }
@@ -1832,6 +1843,12 @@ static bool lock_buffer(EngineState& state) {
                              &out,
                              &out_bpp,
                              &out_stride) != 0 || !out) {
+      static int log_count = 0;
+      if (log_count < 5) {
+        fprintf(stderr, "GraphicBuffer_lock failed: buf=%p out=%p\n",
+                graphic_sp.ptr, out);
+        ++log_count;
+      }
       if (s.Surface_cancelBuffer) {
         s.Surface_cancelBuffer(state.surface_native, buffer, -1);
       }
@@ -2004,6 +2021,12 @@ int main(int argc, char** argv) {
     }
     const int graph_width = max_w < 240 ? max_w : 240;
     const int graph_height = max_h / 6 > 0 ? max_h / 6 : 1;
+
+    const int debug_w = state.width > 80 ? 80 : state.width;
+    const int debug_h = state.height > 80 ? 80 : state.height;
+    if (debug_w > 0 && debug_h > 0) {
+      clear_rect(state.pixels, state.stride, 8, 8, debug_w, debug_h, 0xFFFF0000);
+    }
 
     clear_rect(state.pixels, state.stride, graph_x, graph_y, graph_width, graph_height,
                0x00000000);
