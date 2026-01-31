@@ -197,6 +197,7 @@ using PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint =
                 android::gui::LayerMetadata metadata,
                 uint32_t* out_transform_hint);
 using PFN_SurfaceControl_getSurface = SpObject (*)(void* control);
+using PFN_SurfaceControl_createSurface = SpObject (*)(void* control);
 using PFN_SurfaceControl_setLayer = int32_t (*)(void* control, int32_t layer);
 using PFN_SurfaceControl_setPosition = int32_t (*)(void* control, float x, float y);
 using PFN_SurfaceControl_setSize = int32_t (*)(void* control, uint32_t w, uint32_t h);
@@ -260,6 +261,7 @@ struct EngineSymbols {
   PFN_SurfaceComposerClient_createSurfaceChecked_v2_handle_hint
       SurfaceComposerClient_createSurfaceChecked_v2_handle_hint = nullptr;
   PFN_SurfaceControl_getSurface SurfaceControl_getSurface = nullptr;
+  PFN_SurfaceControl_createSurface SurfaceControl_createSurface = nullptr;
   PFN_SurfaceControl_setLayer SurfaceControl_setLayer = nullptr;
   PFN_SurfaceControl_setPosition SurfaceControl_setPosition = nullptr;
   PFN_SurfaceControl_setSize SurfaceControl_setSize = nullptr;
@@ -623,6 +625,7 @@ static void resolve_create_surface_checked_dynamic(EngineSymbols& s) {
 enum SurfaceControlSymbolKind {
   kSC_None = 0,
   kSC_GetSurface,
+  kSC_CreateSurface,
   kSC_SetLayer,
   kSC_SetPosition,
   kSC_SetSize,
@@ -639,6 +642,9 @@ static SurfaceControlSymbolKind classify_surfacecontrol_symbol(const char* deman
   }
   if (strstr(demangled, "SurfaceControl::getSurface")) {
     return kSC_GetSurface;
+  }
+  if (strstr(demangled, "SurfaceControl::createSurface")) {
+    return kSC_CreateSurface;
   }
   if (strstr(demangled, "SurfaceControl::setLayer")) {
     return kSC_SetLayer;
@@ -689,6 +695,12 @@ static void resolve_surfacecontrol_symbols_dynamic(EngineSymbols& s) {
         if (!s.SurfaceControl_getSurface) {
           s.SurfaceControl_getSurface =
               reinterpret_cast<PFN_SurfaceControl_getSurface>(sym);
+        }
+        break;
+      case kSC_CreateSurface:
+        if (!s.SurfaceControl_createSurface) {
+          s.SurfaceControl_createSurface =
+              reinterpret_cast<PFN_SurfaceControl_createSurface>(sym);
         }
         break;
       case kSC_SetLayer:
@@ -941,6 +953,8 @@ static bool load_symbols(EngineSymbols& s) {
       load_symbol_list(s.libgui,
                        version ? version->SurfaceControl_getSurface : empty_list,
                        nullptr));
+  s.SurfaceControl_createSurface = reinterpret_cast<PFN_SurfaceControl_createSurface>(
+      load_symbol_list(s.libgui, empty_list, "_ZN7android14SurfaceControl13createSurfaceEv"));
   s.SurfaceControl_setLayer = reinterpret_cast<PFN_SurfaceControl_setLayer>(
       load_symbol_list(s.libgui,
                        version ? version->SurfaceControl_setLayer : empty_list,
@@ -1130,10 +1144,12 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
        !s.SurfaceComposerClient_createSurfaceChecked_v2_parent_hint &&
        !s.SurfaceComposerClient_createSurfaceChecked_v2_handle &&
       !s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint) ||
-      !s.SurfaceControl_getSurface || !s.String8_ctor || !s.String8_dtor) {
+      (!s.SurfaceControl_getSurface && !s.SurfaceControl_createSurface) ||
+      !s.String8_ctor || !s.String8_dtor) {
     fprintf(stderr,
             "legacy symbols missing: getDefault=%p v1=%p v2_parent=%p v2_parent_hint=%p "
-            "v2_handle=%p v2_handle_hint=%p getSurface=%p String8_ctor=%p String8_dtor=%p\n",
+            "v2_handle=%p v2_handle_hint=%p getSurface=%p createSurface=%p String8_ctor=%p "
+            "String8_dtor=%p\n",
             reinterpret_cast<void*>(s.SurfaceComposerClient_getDefault),
             reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v1),
             reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_parent),
@@ -1141,6 +1157,7 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
             reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_handle),
             reinterpret_cast<void*>(s.SurfaceComposerClient_createSurfaceChecked_v2_handle_hint),
             reinterpret_cast<void*>(s.SurfaceControl_getSurface),
+            reinterpret_cast<void*>(s.SurfaceControl_createSurface),
             reinterpret_cast<void*>(s.String8_ctor),
             reinterpret_cast<void*>(s.String8_dtor));
     return false;
@@ -1255,7 +1272,9 @@ static bool create_surface_legacy(EngineState& state, int width, int height) {
     s.SurfaceComposerClient_closeGlobalTransaction();
   }
 
-  SpObject surface_sp = s.SurfaceControl_getSurface(control_sp.ptr);
+  SpObject surface_sp = s.SurfaceControl_createSurface
+                            ? s.SurfaceControl_createSurface(control_sp.ptr)
+                            : s.SurfaceControl_getSurface(control_sp.ptr);
   if (!surface_sp.ptr) {
     return false;
   }
