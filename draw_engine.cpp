@@ -99,6 +99,8 @@ struct DrawEngineState {
 static void gpu_shutdown(struct GpuState& gpu);
 static bool gpu_init(struct GpuState& gpu, BackendType backend, ANativeWindow* window, int width,
                      int height, int rotation);
+static void gpu_refresh_size_and_rotation();
+static uint64_t now_ns();
 
 struct GpuVertex {
   float x;
