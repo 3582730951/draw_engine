@@ -2466,7 +2466,9 @@ static void configure_fastpath(MidrawContext& ctx) {
     return;
   }
 
-  const bool force_direct = env_truthy("MIDRAW_USE_DIRECT") || env_truthy("MIDRAW_FORCE_DIRECT");
+  const bool force_direct = env_truthy("MIDRAW_FORCE_DIRECT");
+  const bool allow_direct =
+      force_direct || env_truthy("MIDRAW_USE_DIRECT") || env_truthy("MIDRAW_ALLOW_DIRECT");
   const bool force_ahb = env_truthy("MIDRAW_USE_AHB");
   const int sdk = read_sdk_version();
 
@@ -2509,7 +2511,7 @@ static void configure_fastpath(MidrawContext& ctx) {
       fprintf(stderr, "midraw: using AHB path (API %d)\n", sdk);
       return;
     }
-    if (can_use_surface_direct(ctx)) {
+    if (allow_direct && can_use_surface_direct(ctx)) {
       ctx.render.use_surface_direct = true;
       fprintf(stderr, "midraw: using Surface direct buffer path (API %d)\n", sdk);
       return;
