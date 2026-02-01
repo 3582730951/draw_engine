@@ -3,7 +3,10 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+
+extern "C" void draw_engine_demo_scene(uint64_t frame);
 
 static const unsigned char kDemoPng[] = {
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
@@ -15,7 +18,12 @@ static const unsigned char kDemoPng[] = {
 };
 
 int main() {
-  if (init_draw_engine(0) != 0) {
+  int mode = 0;
+  const char* env_mode = getenv("DRAW_ENGINE_MODE");
+  if (env_mode && env_mode[0]) {
+    mode = atoi(env_mode);
+  }
+  if (init_draw_engine(mode) != 0) {
     fprintf(stderr, "init_draw_engine failed\n");
     return 1;
   }
@@ -59,6 +67,8 @@ int main() {
       int iy = 64;
       draw_image(img, ix, iy);
     }
+
+    draw_engine_demo_scene(frame);
 
     draw_end_frame();
     ++frame;

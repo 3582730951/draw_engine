@@ -2236,6 +2236,13 @@ int midraw_logical_height(const MidrawContext* ctx) {
   return logical_height(ctx->render);
 }
 
+void* midraw_get_native_window(MidrawContext* ctx) {
+  if (!ctx) {
+    return nullptr;
+  }
+  return reinterpret_cast<void*>(ctx->render.window);
+}
+
 void midraw_draw_pixel(MidrawContext* ctx, int x, int y, uint32_t color) {
   if (!ctx) {
     return;

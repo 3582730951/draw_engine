@@ -32,6 +32,7 @@ MIDRAW_API void midraw_unlock_post(MidrawContext* ctx);
 
 MIDRAW_API int midraw_logical_width(const MidrawContext* ctx);
 MIDRAW_API int midraw_logical_height(const MidrawContext* ctx);
+MIDRAW_API void* midraw_get_native_window(MidrawContext* ctx);
 
 MIDRAW_API void midraw_draw_pixel(MidrawContext* ctx, int x, int y, uint32_t color);
 MIDRAW_API void midraw_draw_line(MidrawContext* ctx, int x1, int y1, int x2, int y2,

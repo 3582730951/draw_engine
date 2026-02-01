@@ -1,11 +1,29 @@
 #include "include/draw_engine.h"
 #include "include/midraw.h"
+#include "shaders/vk_shaders.h"
 
+#include <android/native_window.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <vector>
+
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
+#define VK_USE_PLATFORM_ANDROID_KHR
+#endif
+#include <vulkan/vulkan.h>
+
+#ifndef DRAW_ENGINE_HAS_VULKAN
+#define DRAW_ENGINE_HAS_VULKAN 1
+#endif
+#ifndef DRAW_ENGINE_HAS_GLES
+#define DRAW_ENGINE_HAS_GLES 1
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
@@ -14,6 +32,14 @@ struct DrawImage {
   int width;
   int height;
   uint32_t* pixels;
+  unsigned char* rgba;
+  bool vk_ready;
+  VkImage vk_image;
+  VkImageView vk_view;
+  VkDeviceMemory vk_memory;
+  VkDescriptorSet vk_desc;
+  bool gl_ready;
+  GLuint gl_tex;
 };
 
 enum BackendType {
@@ -32,7 +58,113 @@ struct DrawEngineState {
   bool initialized;
 };
 
+struct GpuVertex {
+  float x;
+  float y;
+  float z;
+  float u;
+  float v;
+  uint32_t color;
+};
+
+enum class GpuCmdType : uint8_t { Rect, Line, Circle, Text, Image };
+
+struct GpuCommand {
+  GpuCmdType type;
+  int a;
+  int b;
+  int c;
+  int d;
+  uint32_t color;
+  uintptr_t ptr;
+};
+
+struct GpuBatch {
+  int first;
+  int count;
+  bool use_texture;
+  bool use_3d;
+  bool line;
+  const void* texture;
+};
+
+struct GpuFontAtlas {
+  int width;
+  int height;
+  float u0[96];
+  float v0[96];
+  float u1[96];
+  float v1[96];
+  bool ready;
+};
+
+struct VulkanContext {
+  bool ready;
+  VkInstance instance;
+  VkPhysicalDevice physical;
+  VkDevice device;
+  VkQueue queue;
+  uint32_t queue_family;
+  VkSurfaceKHR surface;
+  VkSwapchainKHR swapchain;
+  VkFormat swapchain_format;
+  VkExtent2D extent;
+  std::vector<VkImage> images;
+  std::vector<VkImageView> image_views;
+  std::vector<VkFramebuffer> framebuffers;
+  VkRenderPass render_pass;
+  VkPipelineLayout pipeline_layout;
+  VkPipeline pipeline_tri;
+  VkPipeline pipeline_line;
+  VkCommandPool command_pool;
+  VkCommandBuffer command_buffer;
+  VkSemaphore image_available;
+  VkSemaphore render_finished;
+  VkFence in_flight;
+  VkDescriptorSetLayout desc_layout;
+  VkDescriptorPool desc_pool;
+  VkSampler sampler;
+  VkBuffer vertex_buffer;
+  VkDeviceMemory vertex_memory;
+  size_t vertex_capacity;
+  void* vertex_map;
+};
+
+struct GlesContext {
+  bool ready;
+  EGLDisplay display;
+  EGLSurface surface;
+  EGLContext context;
+  EGLConfig config;
+  GLuint program;
+  GLuint vao;
+  GLuint vbo;
+  GLint u_mvp;
+  GLint u_tex;
+  int major;
+  int minor;
+};
+
+struct GpuState {
+  BackendType backend;
+  ANativeWindow* window;
+  int width;
+  int height;
+  int rotation;
+  VulkanContext vk;
+  GlesContext gl;
+  std::vector<GpuCommand> commands;
+  std::vector<GpuVertex> vertices;
+  std::vector<GpuBatch> batches;
+  char text_pool[65536];
+  size_t text_offset;
+  GpuFontAtlas font;
+  DrawImage font_image;
+  DrawImage white_image;
+};
+
 static DrawEngineState g_engine{};
+static GpuState g_gpu{};
 
 static bool has_library(const char* name) {
   if (!name || !name[0]) {
@@ -86,25 +218,1681 @@ static void warn_no_frame() {
   }
 }
 
+static inline uint32_t color_to_rgba(uint32_t abgr) {
+  const uint8_t a = static_cast<uint8_t>((abgr >> 24) & 0xFF);
+  const uint8_t b = static_cast<uint8_t>((abgr >> 16) & 0xFF);
+  const uint8_t g = static_cast<uint8_t>((abgr >> 8) & 0xFF);
+  const uint8_t r = static_cast<uint8_t>(abgr & 0xFF);
+  return (static_cast<uint32_t>(a) << 24) |
+         (static_cast<uint32_t>(b) << 16) |
+         (static_cast<uint32_t>(g) << 8) |
+         static_cast<uint32_t>(r);
+}
+
+static void mat4_identity(float* out) {
+  for (int i = 0; i < 16; ++i) {
+    out[i] = 0.0f;
+  }
+  out[0] = out[5] = out[10] = out[15] = 1.0f;
+}
+
+static void mat4_ortho(float* out, float left, float right, float bottom, float top) {
+  mat4_identity(out);
+  out[0] = 2.0f / (right - left);
+  out[5] = 2.0f / (top - bottom);
+  out[10] = -1.0f;
+  out[12] = -(right + left) / (right - left);
+  out[13] = -(top + bottom) / (top - bottom);
+}
+
+static void mat4_perspective(float* out, float fovy, float aspect, float znear, float zfar) {
+  const float f = 1.0f / tanf(fovy * 0.5f);
+  for (int i = 0; i < 16; ++i) {
+    out[i] = 0.0f;
+  }
+  out[0] = f / aspect;
+  out[5] = f;
+  out[10] = (zfar + znear) / (znear - zfar);
+  out[11] = -1.0f;
+  out[14] = (2.0f * zfar * znear) / (znear - zfar);
+}
+
+static void mat4_mul(float* out, const float* a, const float* b) {
+  float r[16];
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      r[row * 4 + col] =
+          a[row * 4 + 0] * b[0 * 4 + col] +
+          a[row * 4 + 1] * b[1 * 4 + col] +
+          a[row * 4 + 2] * b[2 * 4 + col] +
+          a[row * 4 + 3] * b[3 * 4 + col];
+    }
+  }
+  memcpy(out, r, sizeof(r));
+}
+
+static void mat4_translate(float* out, float x, float y, float z) {
+  mat4_identity(out);
+  out[12] = x;
+  out[13] = y;
+  out[14] = z;
+}
+
+static void mat4_rotate_y(float* out, float angle) {
+  mat4_identity(out);
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  out[0] = c;
+  out[2] = s;
+  out[8] = -s;
+  out[10] = c;
+}
+
+static const uint8_t kFont8x8Digits[10][8] = {
+    {0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00}, // 0
+    {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00}, // 1
+    {0x3C, 0x66, 0x06, 0x0C, 0x30, 0x60, 0x7E, 0x00}, // 2
+    {0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00}, // 3
+    {0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00}, // 4
+    {0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00}, // 5
+    {0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00}, // 6
+    {0x7E, 0x66, 0x06, 0x0C, 0x18, 0x18, 0x18, 0x00}, // 7
+    {0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00}, // 8
+    {0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00}  // 9
+};
+
+static const uint8_t kFont8x8Upper[26][8] = {
+    {0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00}, // A
+    {0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00}, // B
+    {0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00}, // C
+    {0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00}, // D
+    {0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00}, // E
+    {0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00}, // F
+    {0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00}, // G
+    {0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00}, // H
+    {0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00}, // I
+    {0x1E, 0x0C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0x00}, // J
+    {0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00}, // K
+    {0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00}, // L
+    {0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00}, // M
+    {0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00}, // N
+    {0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00}, // O
+    {0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00}, // P
+    {0x3C, 0x66, 0x66, 0x66, 0x6E, 0x3C, 0x0E, 0x00}, // Q
+    {0x7C, 0x66, 0x66, 0x7C, 0x78, 0x6C, 0x66, 0x00}, // R
+    {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00}, // S
+    {0x7E, 0x5A, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00}, // T
+    {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00}, // U
+    {0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00}, // V
+    {0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00}, // W
+    {0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00}, // X
+    {0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x3C, 0x00}, // Y
+    {0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00}  // Z
+};
+
+static const uint8_t kFont8x8Space[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+static const uint8_t kFont8x8Colon[8] = {0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00};
+
+static const uint8_t* font_for_char(char c) {
+  if (c >= '0' && c <= '9') {
+    return kFont8x8Digits[c - '0'];
+  }
+  if (c >= 'A' && c <= 'Z') {
+    return kFont8x8Upper[c - 'A'];
+  }
+  if (c >= 'a' && c <= 'z') {
+    return kFont8x8Upper[c - 'a'];
+  }
+  if (c == ':') {
+    return kFont8x8Colon;
+  }
+  return kFont8x8Space;
+}
+
+static void init_gpu_font(GpuState& gpu) {
+  if (gpu.font.ready) {
+    return;
+  }
+  const int glyph_w = 8;
+  const int glyph_h = 8;
+  const int cols = 16;
+  const int rows = 6;
+  const int atlas_w = cols * glyph_w;
+  const int atlas_h = rows * glyph_h;
+
+  unsigned char* rgba = static_cast<unsigned char*>(malloc(atlas_w * atlas_h * 4));
+  if (!rgba) {
+    return;
+  }
+  memset(rgba, 0, atlas_w * atlas_h * 4);
+
+  const int first_char = 32;
+  for (int i = 0; i < 96; ++i) {
+    const int code = first_char + i;
+    const int col = i % cols;
+    const int row = i / cols;
+    const int x0 = col * glyph_w;
+    const int y0 = row * glyph_h;
+    const uint8_t* glyph = font_for_char(static_cast<char>(code));
+    for (int y = 0; y < glyph_h; ++y) {
+      const uint8_t bits = glyph[y];
+      for (int x = 0; x < glyph_w; ++x) {
+        if (!(bits & (1u << (7 - x)))) {
+          continue;
+        }
+        const int px = x0 + x;
+        const int py = y0 + y;
+        unsigned char* dst = rgba + (py * atlas_w + px) * 4;
+        dst[0] = 255;
+        dst[1] = 255;
+        dst[2] = 255;
+        dst[3] = 255;
+      }
+    }
+    gpu.font.u0[i] = static_cast<float>(x0) / static_cast<float>(atlas_w);
+    gpu.font.v0[i] = static_cast<float>(y0) / static_cast<float>(atlas_h);
+    gpu.font.u1[i] = static_cast<float>(x0 + glyph_w) / static_cast<float>(atlas_w);
+    gpu.font.v1[i] = static_cast<float>(y0 + glyph_h) / static_cast<float>(atlas_h);
+  }
+
+  gpu.font.width = atlas_w;
+  gpu.font.height = atlas_h;
+  gpu.font.ready = true;
+
+  gpu.font_image.width = atlas_w;
+  gpu.font_image.height = atlas_h;
+  gpu.font_image.rgba = rgba;
+  gpu.font_image.pixels = nullptr;
+}
+
+static void gpu_reset_frame(GpuState& gpu) {
+  gpu.commands.clear();
+  gpu.vertices.clear();
+  gpu.batches.clear();
+  gpu.text_offset = 0;
+}
+
+static void gpu_add_batch(GpuState& gpu,
+                          int first,
+                          int count,
+                          const DrawImage* texture,
+                          bool line,
+                          bool use_3d) {
+  GpuBatch batch{};
+  batch.first = first;
+  batch.count = count;
+  batch.use_texture = texture != nullptr;
+  batch.use_3d = use_3d;
+  batch.line = line;
+  batch.texture = texture;
+  gpu.batches.push_back(batch);
+}
+
+static void gpu_push_vertex(GpuState& gpu,
+                            float x,
+                            float y,
+                            float z,
+                            float u,
+                            float v,
+                            uint32_t color) {
+  GpuVertex vert{};
+  vert.x = x;
+  vert.y = y;
+  vert.z = z;
+  vert.u = u;
+  vert.v = v;
+  vert.color = color_to_rgba(color);
+  gpu.vertices.push_back(vert);
+}
+
+static void gpu_push_rect(GpuState& gpu,
+                          int x,
+                          int y,
+                          int w,
+                          int h,
+                          uint32_t color,
+                          bool filled) {
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  const float x0 = static_cast<float>(x);
+  const float y0 = static_cast<float>(y);
+  const float x1 = static_cast<float>(x + w);
+  const float y1 = static_cast<float>(y + h);
+  const uint32_t col = color;
+  const DrawImage* tex = &gpu.white_image;
+
+  if (filled) {
+    const int first = static_cast<int>(gpu.vertices.size());
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, col);
+    gpu_add_batch(gpu, first, 6, tex, false, false);
+  } else {
+    const int first = static_cast<int>(gpu.vertices.size());
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_add_batch(gpu, first, 8, tex, true, false);
+  }
+}
+
+static void gpu_push_line(GpuState& gpu,
+                          int x1,
+                          int y1,
+                          int x2,
+                          int y2,
+                          uint32_t color) {
+  const int first = static_cast<int>(gpu.vertices.size());
+  gpu_push_vertex(gpu, static_cast<float>(x1), static_cast<float>(y1), 0.0f, 0.0f, 0.0f,
+                  color);
+  gpu_push_vertex(gpu, static_cast<float>(x2), static_cast<float>(y2), 0.0f, 0.0f, 0.0f,
+                  color);
+  gpu_add_batch(gpu, first, 2, &gpu.white_image, true, false);
+}
+
+static void gpu_push_circle(GpuState& gpu, int cx, int cy, int radius, uint32_t color) {
+  if (radius <= 0) {
+    return;
+  }
+  const int segments = 32;
+  const float step = (2.0f * 3.1415926f) / static_cast<float>(segments);
+  const int first = static_cast<int>(gpu.vertices.size());
+  for (int i = 0; i < segments; ++i) {
+    const float a0 = step * static_cast<float>(i);
+    const float a1 = step * static_cast<float>(i + 1);
+    const float x0 = static_cast<float>(cx) + cosf(a0) * radius;
+    const float y0 = static_cast<float>(cy) + sinf(a0) * radius;
+    const float x1 = static_cast<float>(cx) + cosf(a1) * radius;
+    const float y1 = static_cast<float>(cy) + sinf(a1) * radius;
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, color);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, color);
+  }
+  gpu_add_batch(gpu, first, segments * 2, &gpu.white_image, true, false);
+}
+
+static void gpu_push_text(GpuState& gpu,
+                          const char* text,
+                          int x0,
+                          int y0,
+                          int x1,
+                          int y1,
+                          uint32_t color) {
+  if (!text || !gpu.font.ready) {
+    return;
+  }
+  const int clip_x0 = x0;
+  const int clip_y0 = y0;
+  const int clip_x1 = (x1 > x0) ? x1 : 0;
+  const int clip_y1 = (y1 > y0) ? y1 : 0;
+
+  int cursor_x = x0;
+  int cursor_y = y0;
+  const int first_char = 32;
+  const int last_char = 127;
+  const int glyph_w = 8;
+  const int glyph_h = 8;
+  const int first = static_cast<int>(gpu.vertices.size());
+
+  while (*text) {
+    char c = *text++;
+    if (c == '\n') {
+      cursor_x = x0;
+      cursor_y += glyph_h;
+      continue;
+    }
+    if (c < first_char || c > last_char) {
+      cursor_x += glyph_w;
+      continue;
+    }
+    int idx = c - first_char;
+    const float u0 = gpu.font.u0[idx];
+    const float v0 = gpu.font.v0[idx];
+    const float u1 = gpu.font.u1[idx];
+    const float v1 = gpu.font.v1[idx];
+
+    const int gx0 = cursor_x;
+    const int gy0 = cursor_y;
+    const int gx1 = cursor_x + glyph_w;
+    const int gy1 = cursor_y + glyph_h;
+    if (clip_x1 > clip_x0 && clip_y1 > clip_y0) {
+      if (gx1 <= clip_x0 || gx0 >= clip_x1 || gy1 <= clip_y0 || gy0 >= clip_y1) {
+        cursor_x += glyph_w;
+        continue;
+      }
+    }
+
+    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
+                    color);
+    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy0), 0.0f, u1, v0,
+                    color);
+    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
+                    color);
+    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
+                    color);
+    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
+                    color);
+    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy1), 0.0f, u0, v1,
+                    color);
+    cursor_x += glyph_w;
+  }
+
+  const int count = static_cast<int>(gpu.vertices.size()) - first;
+  if (count > 0) {
+    gpu_add_batch(gpu, first, count, &gpu.font_image, false, false);
+  }
+}
+
+static void gpu_push_image(GpuState& gpu, const DrawImage* image, int x, int y) {
+  if (!image) {
+    return;
+  }
+  const int w = image->width;
+  const int h = image->height;
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  const float x0 = static_cast<float>(x);
+  const float y0 = static_cast<float>(y);
+  const float x1 = static_cast<float>(x + w);
+  const float y1 = static_cast<float>(y + h);
+  const int first = static_cast<int>(gpu.vertices.size());
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu);
+  gpu_add_batch(gpu, first, 6, image, false, false);
+}
+
+static void gpu_push_triangle3d(GpuState& gpu,
+                                float x0,
+                                float y0,
+                                float z0,
+                                float x1,
+                                float y1,
+                                float z1,
+                                float x2,
+                                float y2,
+                                float z2,
+                                uint32_t color) {
+  const int first = static_cast<int>(gpu.vertices.size());
+  gpu_push_vertex(gpu, x0, y0, z0, 0.0f, 0.0f, color);
+  gpu_push_vertex(gpu, x1, y1, z1, 0.0f, 0.0f, color);
+  gpu_push_vertex(gpu, x2, y2, z2, 0.0f, 0.0f, color);
+  gpu_add_batch(gpu, first, 3, &gpu.white_image, false, true);
+}
+
+#if DRAW_ENGINE_HAS_VULKAN
+static uint32_t vk_find_memory_type(VkPhysicalDevice physical,
+                                    uint32_t type_filter,
+                                    VkMemoryPropertyFlags props) {
+  VkPhysicalDeviceMemoryProperties mem_props{};
+  vkGetPhysicalDeviceMemoryProperties(physical, &mem_props);
+  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+    if ((type_filter & (1u << i)) &&
+        (mem_props.memoryTypes[i].propertyFlags & props) == props) {
+      return i;
+    }
+  }
+  return UINT32_MAX;
+}
+
+static bool vk_create_buffer(VulkanContext& vk,
+                             VkDeviceSize size,
+                             VkBufferUsageFlags usage,
+                             VkMemoryPropertyFlags props,
+                             VkBuffer* out_buffer,
+                             VkDeviceMemory* out_memory) {
+  VkBufferCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  info.size = size;
+  info.usage = usage;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(vk.device, &info, nullptr, out_buffer) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements mem_req{};
+  vkGetBufferMemoryRequirements(vk.device, *out_buffer, &mem_req);
+  uint32_t type = vk_find_memory_type(vk.physical, mem_req.memoryTypeBits, props);
+  if (type == UINT32_MAX) {
+    return false;
+  }
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.allocationSize = mem_req.size;
+  alloc.memoryTypeIndex = type;
+  if (vkAllocateMemory(vk.device, &alloc, nullptr, out_memory) != VK_SUCCESS) {
+    return false;
+  }
+  vkBindBufferMemory(vk.device, *out_buffer, *out_memory, 0);
+  return true;
+}
+
+static bool vk_create_image(VulkanContext& vk,
+                            int width,
+                            int height,
+                            VkImage* out_image,
+                            VkDeviceMemory* out_memory) {
+  VkImageCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.extent.width = static_cast<uint32_t>(width);
+  info.extent.height = static_cast<uint32_t>(height);
+  info.extent.depth = 1;
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  if (vkCreateImage(vk.device, &info, nullptr, out_image) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements mem_req{};
+  vkGetImageMemoryRequirements(vk.device, *out_image, &mem_req);
+  uint32_t type = vk_find_memory_type(vk.physical,
+                                      mem_req.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (type == UINT32_MAX) {
+    return false;
+  }
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.allocationSize = mem_req.size;
+  alloc.memoryTypeIndex = type;
+  if (vkAllocateMemory(vk.device, &alloc, nullptr, out_memory) != VK_SUCCESS) {
+    return false;
+  }
+  vkBindImageMemory(vk.device, *out_image, *out_memory, 0);
+  return true;
+}
+
+static VkCommandBuffer vk_begin_single(VulkanContext& vk) {
+  VkCommandBufferAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  alloc.commandPool = vk.command_pool;
+  alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk.device, &alloc, &cmd) != VK_SUCCESS) {
+    return VK_NULL_HANDLE;
+  }
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+  return cmd;
+}
+
+static void vk_end_single(VulkanContext& vk, VkCommandBuffer cmd) {
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(vk.queue, 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(vk.queue);
+  vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &cmd);
+}
+
+static void vk_transition_image(VulkanContext& vk,
+                                VkImage image,
+                                VkImageLayout old_layout,
+                                VkImageLayout new_layout) {
+  VkCommandBuffer cmd = vk_begin_single(vk);
+  if (cmd == VK_NULL_HANDLE) {
+    return;
+  }
+  VkImageMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barrier.oldLayout = old_layout;
+  barrier.newLayout = new_layout;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = image;
+  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.baseMipLevel = 0;
+  barrier.subresourceRange.levelCount = 1;
+  barrier.subresourceRange.baseArrayLayer = 0;
+  barrier.subresourceRange.layerCount = 1;
+  VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  if (old_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+      new_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (old_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+             new_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    src_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  }
+  vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+  vk_end_single(vk, cmd);
+}
+
+static bool vk_upload_texture(VulkanContext& vk, DrawImage* image) {
+  if (!image || !image->rgba || image->width <= 0 || image->height <= 0) {
+    return false;
+  }
+  if (image->vk_ready) {
+    return true;
+  }
+  if (!vk_create_image(vk, image->width, image->height, &image->vk_image, &image->vk_memory)) {
+    return false;
+  }
+
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  const VkDeviceSize size = static_cast<VkDeviceSize>(image->width * image->height * 4);
+  if (!vk_create_buffer(vk,
+                        size,
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &staging,
+                        &staging_mem)) {
+    return false;
+  }
+  void* mapped = nullptr;
+  vkMapMemory(vk.device, staging_mem, 0, size, 0, &mapped);
+  memcpy(mapped, image->rgba, static_cast<size_t>(size));
+  vkUnmapMemory(vk.device, staging_mem);
+
+  vk_transition_image(vk, image->vk_image, VK_IMAGE_LAYOUT_UNDEFINED,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+  VkCommandBuffer cmd = vk_begin_single(vk);
+  if (cmd == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkBufferImageCopy region{};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.imageSubresource.mipLevel = 0;
+  region.imageSubresource.baseArrayLayer = 0;
+  region.imageSubresource.layerCount = 1;
+  region.imageExtent.width = static_cast<uint32_t>(image->width);
+  region.imageExtent.height = static_cast<uint32_t>(image->height);
+  region.imageExtent.depth = 1;
+  vkCmdCopyBufferToImage(cmd, staging, image->vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &region);
+  vk_end_single(vk, cmd);
+
+  vk_transition_image(vk, image->vk_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  vkDestroyBuffer(vk.device, staging, nullptr);
+  vkFreeMemory(vk.device, staging_mem, nullptr);
+
+  VkImageViewCreateInfo view{};
+  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view.image = image->vk_image;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = VK_FORMAT_R8G8B8A8_UNORM;
+  view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  view.subresourceRange.baseMipLevel = 0;
+  view.subresourceRange.levelCount = 1;
+  view.subresourceRange.baseArrayLayer = 0;
+  view.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(vk.device, &view, nullptr, &image->vk_view) != VK_SUCCESS) {
+    return false;
+  }
+
+  VkDescriptorSetAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  alloc.descriptorPool = vk.desc_pool;
+  alloc.descriptorSetCount = 1;
+  alloc.pSetLayouts = &vk.desc_layout;
+  if (vkAllocateDescriptorSets(vk.device, &alloc, &image->vk_desc) != VK_SUCCESS) {
+    return false;
+  }
+  VkDescriptorImageInfo img_info{};
+  img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  img_info.imageView = image->vk_view;
+  img_info.sampler = vk.sampler;
+  VkWriteDescriptorSet write{};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = image->vk_desc;
+  write.dstBinding = 0;
+  write.dstArrayElement = 0;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  write.descriptorCount = 1;
+  write.pImageInfo = &img_info;
+  vkUpdateDescriptorSets(vk.device, 1, &write, 0, nullptr);
+
+  image->vk_ready = true;
+  return true;
+}
+
+static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width, int height) {
+  memset(&vk, 0, sizeof(vk));
+
+  uint32_t api_version = VK_API_VERSION_1_1;
+  PFN_vkEnumerateInstanceVersion enumerate_instance_version =
+      reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+          vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+  if (enumerate_instance_version) {
+    uint32_t available = 0;
+    if (enumerate_instance_version(&available) == VK_SUCCESS) {
+      api_version = available;
+    }
+  }
+  if (VK_VERSION_MAJOR(api_version) < 1 ||
+      (VK_VERSION_MAJOR(api_version) == 1 && VK_VERSION_MINOR(api_version) < 1)) {
+    fprintf(stderr, "Vulkan 1.1 not supported\n");
+    return false;
+  }
+
+  VkApplicationInfo app{};
+  app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app.pApplicationName = "DrawEngine";
+  app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+  app.pEngineName = "DrawEngine";
+  app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+  app.apiVersion = api_version;
+
+  const char* extensions[] = {
+      VK_KHR_SURFACE_EXTENSION_NAME,
+      VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
+  };
+
+  VkInstanceCreateInfo inst{};
+  inst.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  inst.pApplicationInfo = &app;
+  inst.enabledExtensionCount = 2;
+  inst.ppEnabledExtensionNames = extensions;
+  if (vkCreateInstance(&inst, nullptr, &vk.instance) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateInstance failed\n");
+    return false;
+  }
+
+  VkAndroidSurfaceCreateInfoKHR surface_info{};
+  surface_info.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+  surface_info.window = window;
+  if (vkCreateAndroidSurfaceKHR(vk.instance, &surface_info, nullptr, &vk.surface) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateAndroidSurfaceKHR failed\n");
+    return false;
+  }
+
+  uint32_t device_count = 0;
+  vkEnumeratePhysicalDevices(vk.instance, &device_count, nullptr);
+  if (device_count == 0) {
+    fprintf(stderr, "No Vulkan devices\n");
+    return false;
+  }
+  std::vector<VkPhysicalDevice> devices(device_count);
+  vkEnumeratePhysicalDevices(vk.instance, &device_count, devices.data());
+  for (VkPhysicalDevice dev : devices) {
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(dev, &queue_family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(dev, &queue_family_count, families.data());
+    for (uint32_t i = 0; i < queue_family_count; ++i) {
+      VkBool32 present = VK_FALSE;
+      vkGetPhysicalDeviceSurfaceSupportKHR(dev, i, vk.surface, &present);
+      if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
+        vk.physical = dev;
+        vk.queue_family = i;
+        break;
+      }
+    }
+    if (vk.physical != VK_NULL_HANDLE) {
+      break;
+    }
+  }
+  if (vk.physical == VK_NULL_HANDLE) {
+    fprintf(stderr, "No suitable Vulkan device\n");
+    return false;
+  }
+
+  float priority = 1.0f;
+  VkDeviceQueueCreateInfo qinfo{};
+  qinfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  qinfo.queueFamilyIndex = vk.queue_family;
+  qinfo.queueCount = 1;
+  qinfo.pQueuePriorities = &priority;
+
+  const char* dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+
+  VkPhysicalDeviceFeatures features{};
+  VkDeviceCreateInfo dinfo{};
+  dinfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  dinfo.queueCreateInfoCount = 1;
+  dinfo.pQueueCreateInfos = &qinfo;
+  dinfo.enabledExtensionCount = 1;
+  dinfo.ppEnabledExtensionNames = dev_exts;
+  dinfo.pEnabledFeatures = &features;
+  if (vkCreateDevice(vk.physical, &dinfo, nullptr, &vk.device) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateDevice failed\n");
+    return false;
+  }
+  vkGetDeviceQueue(vk.device, vk.queue_family, 0, &vk.queue);
+
+  VkSurfaceCapabilitiesKHR caps{};
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.physical, vk.surface, &caps);
+  uint32_t fmt_count = 0;
+  vkGetPhysicalDeviceSurfaceFormatsKHR(vk.physical, vk.surface, &fmt_count, nullptr);
+  std::vector<VkSurfaceFormatKHR> formats(fmt_count);
+  vkGetPhysicalDeviceSurfaceFormatsKHR(vk.physical, vk.surface, &fmt_count, formats.data());
+  VkSurfaceFormatKHR chosen = formats[0];
+  for (const auto& fmt : formats) {
+    if (fmt.format == VK_FORMAT_R8G8B8A8_UNORM ||
+        fmt.format == VK_FORMAT_B8G8R8A8_UNORM) {
+      chosen = fmt;
+      break;
+    }
+  }
+  vk.swapchain_format = chosen.format;
+
+  uint32_t present_count = 0;
+  vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count, nullptr);
+  std::vector<VkPresentModeKHR> present_modes(present_count);
+  vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count,
+                                            present_modes.data());
+  VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+  for (auto mode : present_modes) {
+    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+      present_mode = mode;
+      break;
+    }
+  }
+
+  VkExtent2D extent{};
+  if (caps.currentExtent.width != UINT32_MAX) {
+    extent = caps.currentExtent;
+  } else {
+    extent.width = static_cast<uint32_t>(width);
+    extent.height = static_cast<uint32_t>(height);
+  }
+  vk.extent = extent;
+
+  uint32_t image_count = caps.minImageCount + 1;
+  if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
+    image_count = caps.maxImageCount;
+  }
+
+  VkCompositeAlphaFlagBitsKHR composite = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+  if (!(caps.supportedCompositeAlpha & composite)) {
+    composite = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+  }
+  if (!(caps.supportedCompositeAlpha & composite)) {
+    composite = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+  }
+
+  VkSwapchainCreateInfoKHR sw{};
+  sw.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+  sw.surface = vk.surface;
+  sw.minImageCount = image_count;
+  sw.imageFormat = vk.swapchain_format;
+  sw.imageColorSpace = chosen.colorSpace;
+  sw.imageExtent = extent;
+  sw.imageArrayLayers = 1;
+  sw.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  sw.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  sw.preTransform = caps.currentTransform;
+  sw.compositeAlpha = composite;
+  sw.presentMode = present_mode;
+  sw.clipped = VK_TRUE;
+  if (vkCreateSwapchainKHR(vk.device, &sw, nullptr, &vk.swapchain) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateSwapchainKHR failed\n");
+    return false;
+  }
+
+  uint32_t swap_count = 0;
+  vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &swap_count, nullptr);
+  vk.images.resize(swap_count);
+  vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &swap_count, vk.images.data());
+
+  vk.image_views.resize(vk.images.size());
+  for (size_t i = 0; i < vk.images.size(); ++i) {
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = vk.images[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = vk.swapchain_format;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.baseMipLevel = 0;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.baseArrayLayer = 0;
+    view.subresourceRange.layerCount = 1;
+    vkCreateImageView(vk.device, &view, nullptr, &vk.image_views[i]);
+  }
+
+  VkAttachmentDescription color{};
+  color.format = vk.swapchain_format;
+  color.samples = VK_SAMPLE_COUNT_1_BIT;
+  color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+  VkAttachmentReference color_ref{};
+  color_ref.attachment = 0;
+  color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkSubpassDescription subpass{};
+  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  subpass.colorAttachmentCount = 1;
+  subpass.pColorAttachments = &color_ref;
+
+  VkRenderPassCreateInfo rp{};
+  rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+  rp.attachmentCount = 1;
+  rp.pAttachments = &color;
+  rp.subpassCount = 1;
+  rp.pSubpasses = &subpass;
+  vkCreateRenderPass(vk.device, &rp, nullptr, &vk.render_pass);
+
+  VkDescriptorSetLayoutBinding binding{};
+  binding.binding = 0;
+  binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  binding.descriptorCount = 1;
+  binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  VkDescriptorSetLayoutCreateInfo layout{};
+  layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  layout.bindingCount = 1;
+  layout.pBindings = &binding;
+  vkCreateDescriptorSetLayout(vk.device, &layout, nullptr, &vk.desc_layout);
+
+  VkPushConstantRange push{};
+  push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  push.offset = 0;
+  push.size = sizeof(float) * 16;
+
+  VkPipelineLayoutCreateInfo pl{};
+  pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pl.setLayoutCount = 1;
+  pl.pSetLayouts = &vk.desc_layout;
+  pl.pushConstantRangeCount = 1;
+  pl.pPushConstantRanges = &push;
+  vkCreatePipelineLayout(vk.device, &pl, nullptr, &vk.pipeline_layout);
+
+  auto create_shader = [&](const uint32_t* code, size_t count) -> VkShaderModule {
+    VkShaderModuleCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    info.codeSize = count * sizeof(uint32_t);
+    info.pCode = code;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(vk.device, &info, nullptr, &module) != VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    return module;
+  };
+
+  VkShaderModule vert = create_shader(kSimpleVertSpv, sizeof(kSimpleVertSpv) / sizeof(uint32_t));
+  VkShaderModule frag = create_shader(kSimpleFragSpv, sizeof(kSimpleFragSpv) / sizeof(uint32_t));
+  if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+    fprintf(stderr, "vkCreateShaderModule failed\n");
+    return false;
+  }
+
+  VkPipelineShaderStageCreateInfo stages[2]{};
+  stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages[0].module = vert;
+  stages[0].pName = "main";
+  stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages[1].module = frag;
+  stages[1].pName = "main";
+
+  VkVertexInputBindingDescription binding_desc{};
+  binding_desc.binding = 0;
+  binding_desc.stride = sizeof(GpuVertex);
+  binding_desc.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+  VkVertexInputAttributeDescription attrs[3]{};
+  attrs[0].location = 0;
+  attrs[0].binding = 0;
+  attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+  attrs[0].offset = 0;
+  attrs[1].location = 1;
+  attrs[1].binding = 0;
+  attrs[1].format = VK_FORMAT_R32G32_SFLOAT;
+  attrs[1].offset = 12;
+  attrs[2].location = 2;
+  attrs[2].binding = 0;
+  attrs[2].format = VK_FORMAT_R8G8B8A8_UNORM;
+  attrs[2].offset = 20;
+
+  VkPipelineVertexInputStateCreateInfo vi{};
+  vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  vi.vertexBindingDescriptionCount = 1;
+  vi.pVertexBindingDescriptions = &binding_desc;
+  vi.vertexAttributeDescriptionCount = 3;
+  vi.pVertexAttributeDescriptions = attrs;
+
+  VkPipelineInputAssemblyStateCreateInfo ia{};
+  ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  ia.primitiveRestartEnable = VK_FALSE;
+
+  VkViewport viewport{};
+  viewport.width = static_cast<float>(extent.width);
+  viewport.height = static_cast<float>(extent.height);
+  viewport.maxDepth = 1.0f;
+
+  VkRect2D scissor{};
+  scissor.extent = extent;
+
+  VkPipelineViewportStateCreateInfo vp{};
+  vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  vp.viewportCount = 1;
+  vp.pViewports = &viewport;
+  vp.scissorCount = 1;
+  vp.pScissors = &scissor;
+
+  VkPipelineRasterizationStateCreateInfo rs{};
+  rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.lineWidth = 1.0f;
+  rs.cullMode = VK_CULL_MODE_NONE;
+  rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+  VkPipelineMultisampleStateCreateInfo ms{};
+  ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState blend{};
+  blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  blend.blendEnable = VK_TRUE;
+  blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  blend.colorBlendOp = VK_BLEND_OP_ADD;
+  blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  blend.alphaBlendOp = VK_BLEND_OP_ADD;
+
+  VkPipelineColorBlendStateCreateInfo cb{};
+  cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  cb.attachmentCount = 1;
+  cb.pAttachments = &blend;
+
+  VkPipelineDynamicStateCreateInfo dyn{};
+  VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+  dyn.dynamicStateCount = 2;
+  dyn.pDynamicStates = dyn_states;
+
+  VkGraphicsPipelineCreateInfo gp{};
+  gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  gp.stageCount = 2;
+  gp.pStages = stages;
+  gp.pVertexInputState = &vi;
+  gp.pInputAssemblyState = &ia;
+  gp.pViewportState = &vp;
+  gp.pRasterizationState = &rs;
+  gp.pMultisampleState = &ms;
+  gp.pColorBlendState = &cb;
+  gp.pDynamicState = &dyn;
+  gp.layout = vk.pipeline_layout;
+  gp.renderPass = vk.render_pass;
+  gp.subpass = 0;
+  if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr,
+                                &vk.pipeline_tri) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateGraphicsPipelines failed\n");
+    return false;
+  }
+
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+  if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr,
+                                &vk.pipeline_line) != VK_SUCCESS) {
+    fprintf(stderr, "vkCreateGraphicsPipelines line failed\n");
+    return false;
+  }
+  vkDestroyShaderModule(vk.device, vert, nullptr);
+  vkDestroyShaderModule(vk.device, frag, nullptr);
+
+  vk.framebuffers.resize(vk.image_views.size());
+  for (size_t i = 0; i < vk.image_views.size(); ++i) {
+    VkImageView attachments[] = {vk.image_views[i]};
+    VkFramebufferCreateInfo fb{};
+    fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb.renderPass = vk.render_pass;
+    fb.attachmentCount = 1;
+    fb.pAttachments = attachments;
+    fb.width = extent.width;
+    fb.height = extent.height;
+    fb.layers = 1;
+    vkCreateFramebuffer(vk.device, &fb, nullptr, &vk.framebuffers[i]);
+  }
+
+  VkCommandPoolCreateInfo pool{};
+  pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  pool.queueFamilyIndex = vk.queue_family;
+  pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  vkCreateCommandPool(vk.device, &pool, nullptr, &vk.command_pool);
+
+  VkCommandBufferAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  alloc.commandPool = vk.command_pool;
+  alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  alloc.commandBufferCount = 1;
+  vkAllocateCommandBuffers(vk.device, &alloc, &vk.command_buffer);
+
+  VkSemaphoreCreateInfo sem{};
+  sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  vkCreateSemaphore(vk.device, &sem, nullptr, &vk.image_available);
+  vkCreateSemaphore(vk.device, &sem, nullptr, &vk.render_finished);
+  VkFenceCreateInfo fence{};
+  fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+  vkCreateFence(vk.device, &fence, nullptr, &vk.in_flight);
+
+  VkDescriptorPoolSize pool_size{};
+  pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  pool_size.descriptorCount = 64;
+  VkDescriptorPoolCreateInfo pool_info{};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &pool_size;
+  pool_info.maxSets = 64;
+  vkCreateDescriptorPool(vk.device, &pool_info, nullptr, &vk.desc_pool);
+
+  VkSamplerCreateInfo samp{};
+  samp.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  samp.magFilter = VK_FILTER_LINEAR;
+  samp.minFilter = VK_FILTER_LINEAR;
+  samp.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  samp.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  samp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  samp.maxAnisotropy = 1.0f;
+  vkCreateSampler(vk.device, &samp, nullptr, &vk.sampler);
+
+  const size_t max_vertices = 200000;
+  vk.vertex_capacity = max_vertices * sizeof(GpuVertex);
+  if (!vk_create_buffer(vk,
+                        vk.vertex_capacity,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &vk.vertex_buffer,
+                        &vk.vertex_memory)) {
+    fprintf(stderr, "vk vertex buffer failed\n");
+    return false;
+  }
+  vkMapMemory(vk.device, vk.vertex_memory, 0, vk.vertex_capacity, 0, &vk.vertex_map);
+
+  vk.ready = true;
+  return true;
+}
+
+static void vk_cleanup(VulkanContext& vk) {
+  if (!vk.ready) {
+    return;
+  }
+  vkDeviceWaitIdle(vk.device);
+  if (vk.vertex_map) {
+    vkUnmapMemory(vk.device, vk.vertex_memory);
+  }
+  if (vk.vertex_buffer) {
+    vkDestroyBuffer(vk.device, vk.vertex_buffer, nullptr);
+  }
+  if (vk.vertex_memory) {
+    vkFreeMemory(vk.device, vk.vertex_memory, nullptr);
+  }
+  if (vk.sampler) {
+    vkDestroySampler(vk.device, vk.sampler, nullptr);
+  }
+  if (vk.desc_pool) {
+    vkDestroyDescriptorPool(vk.device, vk.desc_pool, nullptr);
+  }
+  if (vk.desc_layout) {
+    vkDestroyDescriptorSetLayout(vk.device, vk.desc_layout, nullptr);
+  }
+  if (vk.image_available) {
+    vkDestroySemaphore(vk.device, vk.image_available, nullptr);
+  }
+  if (vk.render_finished) {
+    vkDestroySemaphore(vk.device, vk.render_finished, nullptr);
+  }
+  if (vk.in_flight) {
+    vkDestroyFence(vk.device, vk.in_flight, nullptr);
+  }
+  if (vk.command_pool) {
+    vkDestroyCommandPool(vk.device, vk.command_pool, nullptr);
+  }
+  if (vk.pipeline_tri) {
+    vkDestroyPipeline(vk.device, vk.pipeline_tri, nullptr);
+  }
+  if (vk.pipeline_line) {
+    vkDestroyPipeline(vk.device, vk.pipeline_line, nullptr);
+  }
+  if (vk.pipeline_layout) {
+    vkDestroyPipelineLayout(vk.device, vk.pipeline_layout, nullptr);
+  }
+  if (vk.render_pass) {
+    vkDestroyRenderPass(vk.device, vk.render_pass, nullptr);
+  }
+  for (auto fb : vk.framebuffers) {
+    vkDestroyFramebuffer(vk.device, fb, nullptr);
+  }
+  for (auto view : vk.image_views) {
+    vkDestroyImageView(vk.device, view, nullptr);
+  }
+  if (vk.swapchain) {
+    vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
+  }
+  if (vk.surface) {
+    vkDestroySurfaceKHR(vk.instance, vk.surface, nullptr);
+  }
+  if (vk.device) {
+    vkDestroyDevice(vk.device, nullptr);
+  }
+  if (vk.instance) {
+    vkDestroyInstance(vk.instance, nullptr);
+  }
+  memset(&vk, 0, sizeof(vk));
+}
+
+static bool vk_draw_frame(GpuState& gpu) {
+  VulkanContext& vk = gpu.vk;
+  if (!vk.ready) {
+    return false;
+  }
+  if (gpu.vertices.empty()) {
+    return true;
+  }
+  if (gpu.vertices.size() * sizeof(GpuVertex) > vk.vertex_capacity) {
+    fprintf(stderr, "vk vertex overflow\n");
+    return false;
+  }
+
+  memcpy(vk.vertex_map, gpu.vertices.data(), gpu.vertices.size() * sizeof(GpuVertex));
+
+  uint32_t image_index = 0;
+  vkWaitForFences(vk.device, 1, &vk.in_flight, VK_TRUE, UINT64_MAX);
+  vkResetFences(vk.device, 1, &vk.in_flight);
+
+  if (vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX, vk.image_available,
+                            VK_NULL_HANDLE, &image_index) != VK_SUCCESS) {
+    return false;
+  }
+
+  vkResetCommandBuffer(vk.command_buffer, 0);
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  vkBeginCommandBuffer(vk.command_buffer, &begin);
+
+  VkClearValue clear{};
+  clear.color.float32[0] = 0.0f;
+  clear.color.float32[1] = 0.0f;
+  clear.color.float32[2] = 0.0f;
+  clear.color.float32[3] = 0.0f;
+
+  VkRenderPassBeginInfo rp{};
+  rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  rp.renderPass = vk.render_pass;
+  rp.framebuffer = vk.framebuffers[image_index];
+  rp.renderArea.offset = {0, 0};
+  rp.renderArea.extent = vk.extent;
+  rp.clearValueCount = 1;
+  rp.pClearValues = &clear;
+  vkCmdBeginRenderPass(vk.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+  VkViewport viewport{};
+  viewport.x = 0.0f;
+  viewport.y = 0.0f;
+  viewport.width = static_cast<float>(vk.extent.width);
+  viewport.height = static_cast<float>(vk.extent.height);
+  viewport.minDepth = 0.0f;
+  viewport.maxDepth = 1.0f;
+  VkRect2D scissor{};
+  scissor.extent = vk.extent;
+  vkCmdSetViewport(vk.command_buffer, 0, 1, &viewport);
+  vkCmdSetScissor(vk.command_buffer, 0, 1, &scissor);
+
+  VkBuffer vb = vk.vertex_buffer;
+  VkDeviceSize offsets[] = {0};
+  vkCmdBindVertexBuffers(vk.command_buffer, 0, 1, &vb, offsets);
+
+  float ortho[16];
+  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.width),
+             static_cast<float>(gpu.height), 0.0f);
+  float perspective[16];
+  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.width) /
+                                           static_cast<float>(gpu.height),
+                   0.1f, 100.0f);
+
+  VkPipeline current_pipeline = VK_NULL_HANDLE;
+  VkDescriptorSet current_desc = VK_NULL_HANDLE;
+  bool current_3d = false;
+
+  for (const auto& batch : gpu.batches) {
+    VkPipeline desired = batch.line ? vk.pipeline_line : vk.pipeline_tri;
+    if (desired != current_pipeline) {
+      vkCmdBindPipeline(vk.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, desired);
+      current_pipeline = desired;
+    }
+    const DrawImage* texture = static_cast<const DrawImage*>(batch.texture);
+    VkDescriptorSet desc = texture ? texture->vk_desc : VK_NULL_HANDLE;
+    if (desc != current_desc) {
+      vkCmdBindDescriptorSets(vk.command_buffer,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              vk.pipeline_layout,
+                              0,
+                              1,
+                              &desc,
+                              0,
+                              nullptr);
+      current_desc = desc;
+    }
+    if (batch.use_3d != current_3d) {
+      current_3d = batch.use_3d;
+    }
+    const float* mvp = current_3d ? perspective : ortho;
+    vkCmdPushConstants(vk.command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(float) * 16, mvp);
+    vkCmdDraw(vk.command_buffer, batch.count, 1, batch.first, 0);
+  }
+
+  vkCmdEndRenderPass(vk.command_buffer);
+  vkEndCommandBuffer(vk.command_buffer);
+
+  VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.waitSemaphoreCount = 1;
+  submit.pWaitSemaphores = &vk.image_available;
+  submit.pWaitDstStageMask = &wait_stage;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &vk.command_buffer;
+  submit.signalSemaphoreCount = 1;
+  submit.pSignalSemaphores = &vk.render_finished;
+  vkQueueSubmit(vk.queue, 1, &submit, vk.in_flight);
+
+  VkPresentInfoKHR present{};
+  present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+  present.waitSemaphoreCount = 1;
+  present.pWaitSemaphores = &vk.render_finished;
+  present.swapchainCount = 1;
+  present.pSwapchains = &vk.swapchain;
+  present.pImageIndices = &image_index;
+  vkQueuePresentKHR(vk.queue, &present);
+  return true;
+}
+
+#else  // DRAW_ENGINE_HAS_VULKAN
+
+static bool vk_upload_texture(VulkanContext&, DrawImage*) {
+  return false;
+}
+
+static bool vk_init_context(VulkanContext&, ANativeWindow*, int, int) {
+  return false;
+}
+
+static void vk_cleanup(VulkanContext&) {}
+
+static bool vk_draw_frame(GpuState&) {
+  return false;
+}
+
+#endif  // DRAW_ENGINE_HAS_VULKAN
+
+#if DRAW_ENGINE_HAS_GLES
+static GLuint gl_compile(GLenum type, const char* src) {
+  GLuint shader = glCreateShader(type);
+  glShaderSource(shader, 1, &src, nullptr);
+  glCompileShader(shader);
+  GLint ok = 0;
+  glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+    fprintf(stderr, "GL shader compile error: %s\n", log);
+  }
+  return shader;
+}
+
+static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
+  memset(&gl, 0, sizeof(gl));
+  gl.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  if (gl.display == EGL_NO_DISPLAY) {
+    return false;
+  }
+  if (!eglInitialize(gl.display, nullptr, nullptr)) {
+    return false;
+  }
+
+  const EGLint config_attrs[] = {
+      EGL_RED_SIZE, 8,
+      EGL_GREEN_SIZE, 8,
+      EGL_BLUE_SIZE, 8,
+      EGL_ALPHA_SIZE, 8,
+      EGL_DEPTH_SIZE, 0,
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+      EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+      EGL_NONE
+  };
+  EGLint num_configs = 0;
+  if (!eglChooseConfig(gl.display, config_attrs, &gl.config, 1, &num_configs) ||
+      num_configs == 0) {
+    return false;
+  }
+
+  EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+  gl.context = eglCreateContext(gl.display, gl.config, EGL_NO_CONTEXT, ctx_attribs);
+  if (gl.context == EGL_NO_CONTEXT) {
+    return false;
+  }
+  gl.surface = eglCreateWindowSurface(gl.display, gl.config, window, nullptr);
+  if (gl.surface == EGL_NO_SURFACE) {
+    return false;
+  }
+  if (!eglMakeCurrent(gl.display, gl.surface, gl.surface, gl.context)) {
+    return false;
+  }
+
+  const char* vs_src =
+      "#version 300 es\n"
+      "layout(location=0) in vec3 aPos;\n"
+      "layout(location=1) in vec2 aUV;\n"
+      "layout(location=2) in vec4 aColor;\n"
+      "uniform mat4 uMVP;\n"
+      "out vec2 vUV;\n"
+      "out vec4 vColor;\n"
+      "void main(){\n"
+      "  gl_Position = uMVP * vec4(aPos,1.0);\n"
+      "  vUV = aUV;\n"
+      "  vColor = aColor;\n"
+      "}\n";
+  const char* fs_src =
+      "#version 300 es\n"
+      "precision mediump float;\n"
+      "in vec2 vUV;\n"
+      "in vec4 vColor;\n"
+      "uniform sampler2D uTex;\n"
+      "out vec4 fragColor;\n"
+      "void main(){\n"
+      "  vec4 tex = texture(uTex, vUV);\n"
+      "  fragColor = tex * vColor;\n"
+      "}\n";
+  GLuint vs = gl_compile(GL_VERTEX_SHADER, vs_src);
+  GLuint fs = gl_compile(GL_FRAGMENT_SHADER, fs_src);
+  gl.program = glCreateProgram();
+  glAttachShader(gl.program, vs);
+  glAttachShader(gl.program, fs);
+  glLinkProgram(gl.program);
+  glDeleteShader(vs);
+  glDeleteShader(fs);
+  GLint linked = 0;
+  glGetProgramiv(gl.program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    char log[512];
+    glGetProgramInfoLog(gl.program, sizeof(log), nullptr, log);
+    fprintf(stderr, "GL program link error: %s\n", log);
+    return false;
+  }
+
+  glGenVertexArrays(1, &gl.vao);
+  glGenBuffers(1, &gl.vbo);
+
+  glBindVertexArray(gl.vao);
+  glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(GpuVertex) * 200000, nullptr, GL_DYNAMIC_DRAW);
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                        reinterpret_cast<void*>(0));
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
+                        reinterpret_cast<void*>(12));
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GpuVertex),
+                        reinterpret_cast<void*>(20));
+
+  gl.u_mvp = glGetUniformLocation(gl.program, "uMVP");
+  gl.u_tex = glGetUniformLocation(gl.program, "uTex");
+
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  gl.ready = true;
+  return true;
+}
+
+static bool gl_upload_texture(DrawImage* image) {
+  if (!image || !image->rgba || image->width <= 0 || image->height <= 0) {
+    return false;
+  }
+  if (image->gl_ready) {
+    return true;
+  }
+  glGenTextures(1, &image->gl_tex);
+  glBindTexture(GL_TEXTURE_2D, image->gl_tex);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->width, image->height, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, image->rgba);
+  image->gl_ready = true;
+  return true;
+}
+
+static void gl_cleanup(GlesContext& gl) {
+  if (!gl.ready) {
+    return;
+  }
+  glDeleteBuffers(1, &gl.vbo);
+  glDeleteVertexArrays(1, &gl.vao);
+  glDeleteProgram(gl.program);
+  eglMakeCurrent(gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (gl.surface != EGL_NO_SURFACE) {
+    eglDestroySurface(gl.display, gl.surface);
+  }
+  if (gl.context != EGL_NO_CONTEXT) {
+    eglDestroyContext(gl.display, gl.context);
+  }
+  eglTerminate(gl.display);
+  memset(&gl, 0, sizeof(gl));
+}
+
+static bool gl_draw_frame(GpuState& gpu) {
+  GlesContext& gl = gpu.gl;
+  if (!gl.ready) {
+    return false;
+  }
+  if (gpu.vertices.empty()) {
+    return true;
+  }
+  glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, gpu.vertices.size() * sizeof(GpuVertex),
+                  gpu.vertices.data());
+
+  glViewport(0, 0, gpu.width, gpu.height);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+
+  glUseProgram(gl.program);
+  glBindVertexArray(gl.vao);
+
+  float ortho[16];
+  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.width),
+             static_cast<float>(gpu.height), 0.0f);
+  float perspective[16];
+  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.width) /
+                                           static_cast<float>(gpu.height),
+                   0.1f, 100.0f);
+
+  for (const auto& batch : gpu.batches) {
+    const DrawImage* texture = static_cast<const DrawImage*>(batch.texture);
+    if (texture && texture->gl_ready) {
+      glBindTexture(GL_TEXTURE_2D, texture->gl_tex);
+    }
+    glUniform1i(gl.u_tex, 0);
+    glUniformMatrix4fv(gl.u_mvp, 1, GL_FALSE, batch.use_3d ? perspective : ortho);
+    GLenum mode = batch.line ? GL_LINES : GL_TRIANGLES;
+    glDrawArrays(mode, batch.first, batch.count);
+  }
+  eglSwapBuffers(gl.display, gl.surface);
+  return true;
+}
+
+#else  // DRAW_ENGINE_HAS_GLES
+
+static bool gl_init_context(GlesContext&, ANativeWindow*) {
+  return false;
+}
+
+static bool gl_upload_texture(DrawImage*) {
+  return false;
+}
+
+static void gl_cleanup(GlesContext&) {}
+
+static bool gl_draw_frame(GpuState&) {
+  return false;
+}
+
+#endif  // DRAW_ENGINE_HAS_GLES
+
+static void gpu_destroy_image(GpuState& gpu, DrawImage* image) {
+  if (!image) {
+    return;
+  }
+  if (gpu.backend == BACKEND_VULKAN && image->vk_ready) {
+#if DRAW_ENGINE_HAS_VULKAN
+    VulkanContext& vk = gpu.vk;
+    if (image->vk_desc && vk.desc_pool) {
+      vkFreeDescriptorSets(vk.device, vk.desc_pool, 1, &image->vk_desc);
+    }
+    if (image->vk_view) {
+      vkDestroyImageView(vk.device, image->vk_view, nullptr);
+    }
+    if (image->vk_image) {
+      vkDestroyImage(vk.device, image->vk_image, nullptr);
+    }
+    if (image->vk_memory) {
+      vkFreeMemory(vk.device, image->vk_memory, nullptr);
+    }
+    image->vk_ready = false;
+#else
+    (void)gpu;
+    (void)image;
+#endif
+  }
+  if (gpu.backend == BACKEND_GLES && image->gl_ready) {
+#if DRAW_ENGINE_HAS_GLES
+    glDeleteTextures(1, &image->gl_tex);
+    image->gl_ready = false;
+#else
+    (void)gpu;
+    (void)image;
+#endif
+  }
+}
+
+static void init_white_image(GpuState& gpu) {
+  if (gpu.white_image.rgba) {
+    return;
+  }
+  gpu.white_image.width = 1;
+  gpu.white_image.height = 1;
+  gpu.white_image.rgba = static_cast<unsigned char*>(malloc(4));
+  gpu.white_image.pixels = nullptr;
+  if (gpu.white_image.rgba) {
+    gpu.white_image.rgba[0] = 255;
+    gpu.white_image.rgba[1] = 255;
+    gpu.white_image.rgba[2] = 255;
+    gpu.white_image.rgba[3] = 255;
+  }
+}
+
+static bool gpu_prepare_texture(GpuState& gpu, DrawImage* image) {
+  if (!image) {
+    return false;
+  }
+  if (gpu.backend == BACKEND_VULKAN) {
+    return vk_upload_texture(gpu.vk, image);
+  }
+  if (gpu.backend == BACKEND_GLES) {
+    return gl_upload_texture(image);
+  }
+  return false;
+}
+
+static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, int width,
+                     int height, int rotation) {
+  memset(&gpu, 0, sizeof(gpu));
+  gpu.backend = backend;
+  gpu.window = window;
+  gpu.width = width;
+  gpu.height = height;
+  gpu.rotation = rotation;
+
+  init_white_image(gpu);
+  init_gpu_font(gpu);
+
+  bool ok = false;
+  if (backend == BACKEND_VULKAN) {
+    if (DRAW_ENGINE_HAS_VULKAN) {
+      ok = vk_init_context(gpu.vk, window, width, height);
+    }
+  } else if (backend == BACKEND_GLES) {
+    if (DRAW_ENGINE_HAS_GLES) {
+      ok = gl_init_context(gpu.gl, window);
+    }
+  }
+  if (!ok) {
+    return false;
+  }
+  gpu_prepare_texture(gpu, &gpu.white_image);
+  gpu_prepare_texture(gpu, &gpu.font_image);
+  return true;
+}
+
+static void gpu_shutdown(GpuState& gpu) {
+  gpu_destroy_image(gpu, &gpu.font_image);
+  gpu_destroy_image(gpu, &gpu.white_image);
+  if (gpu.backend == BACKEND_VULKAN) {
+    vk_cleanup(gpu.vk);
+  } else if (gpu.backend == BACKEND_GLES) {
+    gl_cleanup(gpu.gl);
+  }
+  if (gpu.font_image.rgba) {
+    free(gpu.font_image.rgba);
+    gpu.font_image.rgba = nullptr;
+  }
+  if (gpu.white_image.rgba) {
+    free(gpu.white_image.rgba);
+    gpu.white_image.rgba = nullptr;
+  }
+  memset(&gpu, 0, sizeof(gpu));
+}
+
 int init_draw_engine(int mode) {
   memset(&g_engine, 0, sizeof(g_engine));
   g_engine.mode = mode;
   g_engine.backend = BACKEND_CPU;
 
   if (mode == 1) {
-    if (has_library("libvulkan.so")) {
+    if (DRAW_ENGINE_HAS_VULKAN && has_library("libvulkan.so")) {
       g_engine.backend = BACKEND_VULKAN;
-    } else if (has_library("libGLESv3.so") || has_library("libGLESv2.so")) {
+    } else if (DRAW_ENGINE_HAS_GLES &&
+               (has_library("libGLESv3.so") || has_library("libGLESv2.so"))) {
       g_engine.backend = BACKEND_GLES;
     } else {
       g_engine.backend = BACKEND_CPU;
     }
-  }
-
-  if (g_engine.backend != BACKEND_CPU) {
-    fprintf(stderr,
-            "draw_engine: GPU backend selected (vk/gl). Demo build will fall back to CPU.\n");
-    g_engine.backend = BACKEND_CPU;
   }
 
   g_engine.initialized = true;
@@ -151,6 +1939,19 @@ int init_draw_windows(const char* name, int randomize_name) {
     fprintf(stderr, "draw_engine: midraw_init failed\n");
     return -1;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    ANativeWindow* window =
+        reinterpret_cast<ANativeWindow*>(midraw_get_native_window(g_engine.cpu_ctx));
+    const int w = midraw_logical_width(g_engine.cpu_ctx);
+    const int h = midraw_logical_height(g_engine.cpu_ctx);
+    if (!window || !gpu_init(g_gpu, g_engine.backend, window, w, h, g_engine.rotation)) {
+      fprintf(stderr, "draw_engine: GPU init failed, fallback CPU\n");
+      gpu_shutdown(g_gpu);
+      g_engine.backend = BACKEND_CPU;
+    }
+  } else {
+    gpu_shutdown(g_gpu);
+  }
   return 0;
 }
 
@@ -159,6 +1960,7 @@ void shutdown_draw_engine(void) {
     midraw_shutdown(g_engine.cpu_ctx);
     g_engine.cpu_ctx = nullptr;
   }
+  gpu_shutdown(g_gpu);
   if (g_engine.surface_name) {
     free(g_engine.surface_name);
     g_engine.surface_name = nullptr;
@@ -173,8 +1975,12 @@ int draw_begin_frame(void) {
   if (g_engine.in_frame) {
     return 0;
   }
-  if (midraw_lock(g_engine.cpu_ctx) != 0) {
-    return -1;
+  if (g_engine.backend == BACKEND_CPU) {
+    if (midraw_lock(g_engine.cpu_ctx) != 0) {
+      return -1;
+    }
+  } else {
+    gpu_reset_frame(g_gpu);
   }
   g_engine.in_frame = true;
   return 0;
@@ -184,7 +1990,13 @@ void draw_end_frame(void) {
   if (!g_engine.cpu_ctx || !g_engine.in_frame) {
     return;
   }
-  midraw_unlock_post(g_engine.cpu_ctx);
+  if (g_engine.backend == BACKEND_CPU) {
+    midraw_unlock_post(g_engine.cpu_ctx);
+  } else if (g_engine.backend == BACKEND_VULKAN) {
+    vk_draw_frame(g_gpu);
+  } else if (g_engine.backend == BACKEND_GLES) {
+    gl_draw_frame(g_gpu);
+  }
   g_engine.in_frame = false;
 }
 
@@ -210,6 +2022,10 @@ void draw_text(const char* text, int x0, int y0, int x1, int y1, uint32_t color)
     warn_no_frame();
     return;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_push_text(g_gpu, text, x0, y0, x1, y1, color);
+    return;
+  }
   if (x1 > x0 && y1 > y0) {
     midraw_draw_text_rect(g_engine.cpu_ctx, text, x0, y0, x1, y1, color);
   } else {
@@ -225,6 +2041,10 @@ void draw_rect(int x, int y, int w, int h, int filled, uint32_t color) {
     warn_no_frame();
     return;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_push_rect(g_gpu, x, y, w, h, color, filled != 0);
+    return;
+  }
   midraw_draw_rect(g_engine.cpu_ctx, x, y, w, h, filled, color);
 }
 
@@ -236,6 +2056,10 @@ void draw_circle(int cx, int cy, int radius, uint32_t color) {
     warn_no_frame();
     return;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_push_circle(g_gpu, cx, cy, radius, color);
+    return;
+  }
   midraw_draw_circle(g_engine.cpu_ctx, cx, cy, radius, color);
 }
 
@@ -245,6 +2069,10 @@ void draw_line(int x1, int y1, int x2, int y2, uint32_t color) {
   }
   if (!g_engine.in_frame) {
     warn_no_frame();
+    return;
+  }
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_push_line(g_gpu, x1, y1, x2, y2, color);
     return;
   }
   midraw_draw_line(g_engine.cpu_ctx, x1, y1, x2, y2, color);
@@ -272,6 +2100,7 @@ DrawImage* draw_load_image_from_memory(const unsigned char* data, int size) {
   }
   image->width = w;
   image->height = h;
+  image->rgba = decoded;
   image->pixels = static_cast<uint32_t*>(malloc(sizeof(uint32_t) * w * h));
   if (!image->pixels) {
     free(image);
@@ -291,13 +2120,17 @@ DrawImage* draw_load_image_from_memory(const unsigned char* data, int size) {
         (static_cast<uint32_t>(g) << 8) |
         static_cast<uint32_t>(r);
   }
-  stbi_image_free(decoded);
   return image;
 }
 
 void draw_free_image(DrawImage* image) {
   if (!image) {
     return;
+  }
+  gpu_destroy_image(g_gpu, image);
+  if (image->rgba) {
+    stbi_image_free(image->rgba);
+    image->rgba = nullptr;
   }
   if (image->pixels) {
     free(image->pixels);
@@ -314,5 +2147,72 @@ void draw_image(const DrawImage* image, int x, int y) {
     warn_no_frame();
     return;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    DrawImage* mutable_image = const_cast<DrawImage*>(image);
+    gpu_prepare_texture(g_gpu, mutable_image);
+    gpu_push_image(g_gpu, image, x, y);
+    return;
+  }
   midraw_draw_image(g_engine.cpu_ctx, image->pixels, image->width, image->height, x, y);
+}
+
+extern "C" void draw_engine_demo_scene(uint64_t frame) {
+  if (!g_engine.cpu_ctx || !g_engine.in_frame) {
+    return;
+  }
+  const int w = midraw_logical_width(g_engine.cpu_ctx);
+  const int h = midraw_logical_height(g_engine.cpu_ctx);
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  const float aspect = static_cast<float>(w) / static_cast<float>(h);
+  const float angle = static_cast<float>(frame) * 0.02f;
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+
+  const float tri[3][3] = {
+      {-0.6f, 0.4f, -2.5f},
+      {0.6f, 0.4f, -2.5f},
+      {0.0f, -0.6f, -2.5f},
+  };
+
+  float vx[3], vy[3], vz[3];
+  for (int i = 0; i < 3; ++i) {
+    const float x = tri[i][0];
+    const float y = tri[i][1];
+    const float z = tri[i][2];
+    vx[i] = x * c + z * s;
+    vz[i] = -x * s + z * c;
+    vy[i] = y;
+  }
+
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_push_triangle3d(g_gpu, vx[0], vy[0], vz[0], vx[1], vy[1], vz[1],
+                        vx[2], vy[2], vz[2], 0xFF0000FF);
+
+    const float ground_y = -0.9f;
+    const float z0 = -2.0f;
+    const float z1 = -4.0f;
+    gpu_push_triangle3d(g_gpu, -1.5f, ground_y, z0, 1.5f, ground_y, z0,
+                        1.5f, ground_y, z1, 0xFF00FF00);
+    gpu_push_triangle3d(g_gpu, -1.5f, ground_y, z0, 1.5f, ground_y, z1,
+                        -1.5f, ground_y, z1, 0xFF00FF00);
+    return;
+  }
+
+  auto project = [&](float x, float y, float z, int* out_x, int* out_y) {
+    const float f = 1.0f / tanf(0.5f);
+    float ndc_x = (x / -z) * f / aspect;
+    float ndc_y = (y / -z) * f;
+    *out_x = static_cast<int>((ndc_x * 0.5f + 0.5f) * w);
+    *out_y = static_cast<int>((1.0f - (ndc_y * 0.5f + 0.5f)) * h);
+  };
+
+  int sx[3], sy[3];
+  for (int i = 0; i < 3; ++i) {
+    project(vx[i], vy[i], vz[i], &sx[i], &sy[i]);
+  }
+  draw_line(sx[0], sy[0], sx[1], sy[1], 0xFF0000FF);
+  draw_line(sx[1], sy[1], sx[2], sy[2], 0xFF0000FF);
+  draw_line(sx[2], sy[2], sx[0], sy[0], 0xFF0000FF);
 }
