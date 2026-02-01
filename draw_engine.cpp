@@ -18,6 +18,13 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
 #ifndef DRAW_ENGINE_HAS_VULKAN
 #define DRAW_ENGINE_HAS_VULKAN 1
 #endif
@@ -114,8 +121,10 @@ struct VulkanContext {
   std::vector<VkFramebuffer> framebuffers;
   VkRenderPass render_pass;
   VkPipelineLayout pipeline_layout;
-  VkPipeline pipeline_tri;
-  VkPipeline pipeline_line;
+  VkPipeline pipeline_tri_2d;
+  VkPipeline pipeline_line_2d;
+  VkPipeline pipeline_tri_3d;
+  VkPipeline pipeline_line_3d;
   VkCommandPool command_pool;
   VkCommandBuffer command_buffer;
   VkSemaphore image_available;
@@ -128,6 +137,13 @@ struct VulkanContext {
   VkDeviceMemory vertex_memory;
   size_t vertex_capacity;
   void* vertex_map;
+  VkImage depth_image;
+  VkDeviceMemory depth_memory;
+  VkImageView depth_view;
+  VkFormat depth_format;
+  float max_anisotropy;
+  bool supports_anisotropy;
+  bool supports_wide_lines;
 };
 
 struct GlesContext {
@@ -143,13 +159,17 @@ struct GlesContext {
   GLint u_tex;
   int major;
   int minor;
+  bool supports_anisotropy;
+  float max_anisotropy;
 };
 
 struct GpuState {
   BackendType backend;
   ANativeWindow* window;
-  int width;
-  int height;
+  int logical_width;
+  int logical_height;
+  int physical_width;
+  int physical_height;
   int rotation;
   VulkanContext vk;
   GlesContext gl;
@@ -428,16 +448,50 @@ static void gpu_add_batch(GpuState& gpu,
   gpu.batches.push_back(batch);
 }
 
+static inline void map_logical_to_physical(const GpuState& gpu,
+                                           float x,
+                                           float y,
+                                           float* out_x,
+                                           float* out_y) {
+  switch (gpu.rotation) {
+    case 90:
+      *out_x = static_cast<float>(gpu.physical_height - 1) - y;
+      *out_y = x;
+      break;
+    case 180:
+      *out_x = static_cast<float>(gpu.physical_width - 1) - x;
+      *out_y = static_cast<float>(gpu.physical_height - 1) - y;
+      break;
+    case 270:
+      *out_x = y;
+      *out_y = static_cast<float>(gpu.physical_width - 1) - x;
+      break;
+    default:
+      *out_x = x;
+      *out_y = y;
+      break;
+  }
+}
+
 static void gpu_push_vertex(GpuState& gpu,
                             float x,
                             float y,
                             float z,
                             float u,
                             float v,
-                            uint32_t color) {
+                            uint32_t color,
+                            bool map2d) {
   GpuVertex vert{};
-  vert.x = x;
-  vert.y = y;
+  if (map2d && gpu.rotation != 0) {
+    float px = 0.0f;
+    float py = 0.0f;
+    map_logical_to_physical(gpu, x, y, &px, &py);
+    vert.x = px;
+    vert.y = py;
+  } else {
+    vert.x = x;
+    vert.y = y;
+  }
   vert.z = z;
   vert.u = u;
   vert.v = v;
@@ -464,23 +518,23 @@ static void gpu_push_rect(GpuState& gpu,
 
   if (filled) {
     const int first = static_cast<int>(gpu.vertices.size());
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col);
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col);
-    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, col);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col, true);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, col, true);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, col, true);
     gpu_add_batch(gpu, first, 6, tex, false, false);
   } else {
     const int first = static_cast<int>(gpu.vertices.size());
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col);
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col, true);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
     gpu_add_batch(gpu, first, 8, tex, true, false);
   }
 }
@@ -493,9 +547,9 @@ static void gpu_push_line(GpuState& gpu,
                           uint32_t color) {
   const int first = static_cast<int>(gpu.vertices.size());
   gpu_push_vertex(gpu, static_cast<float>(x1), static_cast<float>(y1), 0.0f, 0.0f, 0.0f,
-                  color);
+                  color, true);
   gpu_push_vertex(gpu, static_cast<float>(x2), static_cast<float>(y2), 0.0f, 0.0f, 0.0f,
-                  color);
+                  color, true);
   gpu_add_batch(gpu, first, 2, &gpu.white_image, true, false);
 }
 
@@ -513,8 +567,8 @@ static void gpu_push_circle(GpuState& gpu, int cx, int cy, int radius, uint32_t 
     const float y0 = static_cast<float>(cy) + sinf(a0) * radius;
     const float x1 = static_cast<float>(cx) + cosf(a1) * radius;
     const float y1 = static_cast<float>(cy) + sinf(a1) * radius;
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, color);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, color);
+    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, color, true);
   }
   gpu_add_batch(gpu, first, segments * 2, &gpu.white_image, true, false);
 }
@@ -571,17 +625,17 @@ static void gpu_push_text(GpuState& gpu,
     }
 
     gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
-                    color);
+                    color, true);
     gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy0), 0.0f, u1, v0,
-                    color);
+                    color, true);
     gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
-                    color);
+                    color, true);
     gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
-                    color);
+                    color, true);
     gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
-                    color);
+                    color, true);
     gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy1), 0.0f, u0, v1,
-                    color);
+                    color, true);
     cursor_x += glyph_w;
   }
 
@@ -605,12 +659,12 @@ static void gpu_push_image(GpuState& gpu, const DrawImage* image, int x, int y) 
   const float x1 = static_cast<float>(x + w);
   const float y1 = static_cast<float>(y + h);
   const int first = static_cast<int>(gpu.vertices.size());
-  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu);
-  gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, 0xFFFFFFFFu);
-  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu);
-  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu);
-  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu);
-  gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, true);
   gpu_add_batch(gpu, first, 6, image, false, false);
 }
 
@@ -626,9 +680,9 @@ static void gpu_push_triangle3d(GpuState& gpu,
                                 float z2,
                                 uint32_t color) {
   const int first = static_cast<int>(gpu.vertices.size());
-  gpu_push_vertex(gpu, x0, y0, z0, 0.0f, 0.0f, color);
-  gpu_push_vertex(gpu, x1, y1, z1, 0.0f, 0.0f, color);
-  gpu_push_vertex(gpu, x2, y2, z2, 0.0f, 0.0f, color);
+  gpu_push_vertex(gpu, x0, y0, z0, 0.0f, 0.0f, color, false);
+  gpu_push_vertex(gpu, x1, y1, z1, 0.0f, 0.0f, color, false);
+  gpu_push_vertex(gpu, x2, y2, z2, 0.0f, 0.0f, color, false);
   gpu_add_batch(gpu, first, 3, &gpu.white_image, false, true);
 }
 
@@ -645,6 +699,22 @@ static uint32_t vk_find_memory_type(VkPhysicalDevice physical,
     }
   }
   return UINT32_MAX;
+}
+
+static VkFormat vk_find_depth_format(VkPhysicalDevice physical) {
+  VkFormat candidates[] = {
+      VK_FORMAT_D32_SFLOAT,
+      VK_FORMAT_D24_UNORM_S8_UINT,
+      VK_FORMAT_D32_SFLOAT_S8_UINT,
+  };
+  for (VkFormat fmt : candidates) {
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(physical, fmt, &props);
+    if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+      return fmt;
+    }
+  }
+  return VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
 static bool vk_create_buffer(VulkanContext& vk,
@@ -717,6 +787,59 @@ static bool vk_create_image(VulkanContext& vk,
     return false;
   }
   vkBindImageMemory(vk.device, *out_image, *out_memory, 0);
+  return true;
+}
+
+static bool vk_create_depth_image(VulkanContext& vk, int width, int height) {
+  vk.depth_format = vk_find_depth_format(vk.physical);
+  VkImageCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.extent.width = static_cast<uint32_t>(width);
+  info.extent.height = static_cast<uint32_t>(height);
+  info.extent.depth = 1;
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  info.format = vk.depth_format;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  if (vkCreateImage(vk.device, &info, nullptr, &vk.depth_image) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements mem_req{};
+  vkGetImageMemoryRequirements(vk.device, vk.depth_image, &mem_req);
+  uint32_t type = vk_find_memory_type(vk.physical,
+                                      mem_req.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (type == UINT32_MAX) {
+    return false;
+  }
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.allocationSize = mem_req.size;
+  alloc.memoryTypeIndex = type;
+  if (vkAllocateMemory(vk.device, &alloc, nullptr, &vk.depth_memory) != VK_SUCCESS) {
+    return false;
+  }
+  vkBindImageMemory(vk.device, vk.depth_image, vk.depth_memory, 0);
+
+  VkImageViewCreateInfo view{};
+  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view.image = vk.depth_image;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = vk.depth_format;
+  view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  view.subresourceRange.baseMipLevel = 0;
+  view.subresourceRange.levelCount = 1;
+  view.subresourceRange.baseArrayLayer = 0;
+  view.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(vk.device, &view, nullptr, &vk.depth_view) != VK_SUCCESS) {
+    return false;
+  }
   return true;
 }
 
@@ -960,6 +1083,19 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     return false;
   }
 
+  VkPhysicalDeviceProperties props{};
+  VkPhysicalDeviceFeatures supported{};
+  vkGetPhysicalDeviceProperties(vk.physical, &props);
+  vkGetPhysicalDeviceFeatures(vk.physical, &supported);
+  vk.supports_anisotropy = supported.samplerAnisotropy == VK_TRUE;
+  vk.supports_wide_lines = supported.wideLines == VK_TRUE;
+  vk.max_anisotropy = vk.supports_anisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
+  fprintf(stderr, "Vulkan device: %s api=%u.%u.%u\n",
+          props.deviceName,
+          VK_VERSION_MAJOR(props.apiVersion),
+          VK_VERSION_MINOR(props.apiVersion),
+          VK_VERSION_PATCH(props.apiVersion));
+
   float priority = 1.0f;
   VkDeviceQueueCreateInfo qinfo{};
   qinfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -970,6 +1106,12 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   const char* dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
   VkPhysicalDeviceFeatures features{};
+  if (vk.supports_anisotropy) {
+    features.samplerAnisotropy = VK_TRUE;
+  }
+  if (vk.supports_wide_lines) {
+    features.wideLines = VK_TRUE;
+  }
   VkDeviceCreateInfo dinfo{};
   dinfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dinfo.queueCreateInfoCount = 1;
@@ -1073,6 +1215,11 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     vkCreateImageView(vk.device, &view, nullptr, &vk.image_views[i]);
   }
 
+  if (!vk_create_depth_image(vk, static_cast<int>(extent.width), static_cast<int>(extent.height))) {
+    fprintf(stderr, "vk depth image failed\n");
+    return false;
+  }
+
   VkAttachmentDescription color{};
   color.format = vk.swapchain_format;
   color.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1083,19 +1230,35 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
+  VkAttachmentDescription depth{};
+  depth.format = vk.depth_format;
+  depth.samples = VK_SAMPLE_COUNT_1_BIT;
+  depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
   VkAttachmentReference color_ref{};
   color_ref.attachment = 0;
   color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkAttachmentReference depth_ref{};
+  depth_ref.attachment = 1;
+  depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   VkSubpassDescription subpass{};
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.colorAttachmentCount = 1;
   subpass.pColorAttachments = &color_ref;
+  subpass.pDepthStencilAttachment = &depth_ref;
 
+  VkAttachmentDescription attachments[2] = {color, depth};
   VkRenderPassCreateInfo rp{};
   rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  rp.attachmentCount = 1;
-  rp.pAttachments = &color;
+  rp.attachmentCount = 2;
+  rp.pAttachments = attachments;
   rp.subpassCount = 1;
   rp.pSubpasses = &subpass;
   vkCreateRenderPass(vk.device, &rp, nullptr, &vk.render_pass);
@@ -1180,11 +1343,6 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   vi.vertexAttributeDescriptionCount = 3;
   vi.pVertexAttributeDescriptions = attrs;
 
-  VkPipelineInputAssemblyStateCreateInfo ia{};
-  ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  ia.primitiveRestartEnable = VK_FALSE;
-
   VkViewport viewport{};
   viewport.width = static_cast<float>(extent.width);
   viewport.height = static_cast<float>(extent.height);
@@ -1233,30 +1391,51 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   dyn.dynamicStateCount = 2;
   dyn.pDynamicStates = dyn_states;
 
-  VkGraphicsPipelineCreateInfo gp{};
-  gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  gp.stageCount = 2;
-  gp.pStages = stages;
-  gp.pVertexInputState = &vi;
-  gp.pInputAssemblyState = &ia;
-  gp.pViewportState = &vp;
-  gp.pRasterizationState = &rs;
-  gp.pMultisampleState = &ms;
-  gp.pColorBlendState = &cb;
-  gp.pDynamicState = &dyn;
-  gp.layout = vk.pipeline_layout;
-  gp.renderPass = vk.render_pass;
-  gp.subpass = 0;
-  if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr,
-                                &vk.pipeline_tri) != VK_SUCCESS) {
-    fprintf(stderr, "vkCreateGraphicsPipelines failed\n");
-    return false;
-  }
+  auto create_pipeline = [&](VkPrimitiveTopology topology, bool depth_enable) -> VkPipeline {
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = topology;
+    ia.primitiveRestartEnable = VK_FALSE;
 
-  ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-  if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr,
-                                &vk.pipeline_line) != VK_SUCCESS) {
-    fprintf(stderr, "vkCreateGraphicsPipelines line failed\n");
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = depth_enable ? VK_TRUE : VK_FALSE;
+    ds.depthWriteEnable = depth_enable ? VK_TRUE : VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    ds.depthBoundsTestEnable = VK_FALSE;
+    ds.stencilTestEnable = VK_FALSE;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = depth_enable ? &ds : nullptr;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dyn;
+    gp.layout = vk.pipeline_layout;
+    gp.renderPass = vk.render_pass;
+    gp.subpass = 0;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline) !=
+        VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    return pipeline;
+  };
+
+  vk.pipeline_tri_2d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
+  vk.pipeline_line_2d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
+  vk.pipeline_tri_3d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
+  vk.pipeline_line_3d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, true);
+
+  if (vk.pipeline_tri_2d == VK_NULL_HANDLE || vk.pipeline_line_2d == VK_NULL_HANDLE ||
+      vk.pipeline_tri_3d == VK_NULL_HANDLE || vk.pipeline_line_3d == VK_NULL_HANDLE) {
+    fprintf(stderr, "vkCreateGraphicsPipelines failed\n");
     return false;
   }
   vkDestroyShaderModule(vk.device, vert, nullptr);
@@ -1264,11 +1443,11 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
 
   vk.framebuffers.resize(vk.image_views.size());
   for (size_t i = 0; i < vk.image_views.size(); ++i) {
-    VkImageView attachments[] = {vk.image_views[i]};
+    VkImageView attachments[] = {vk.image_views[i], vk.depth_view};
     VkFramebufferCreateInfo fb{};
     fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fb.renderPass = vk.render_pass;
-    fb.attachmentCount = 1;
+    fb.attachmentCount = 2;
     fb.pAttachments = attachments;
     fb.width = extent.width;
     fb.height = extent.height;
@@ -1315,7 +1494,8 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   samp.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samp.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samp.maxAnisotropy = 1.0f;
+  samp.anisotropyEnable = vk.supports_anisotropy ? VK_TRUE : VK_FALSE;
+  samp.maxAnisotropy = vk.supports_anisotropy ? vk.max_anisotropy : 1.0f;
   vkCreateSampler(vk.device, &samp, nullptr, &vk.sampler);
 
   const size_t max_vertices = 200000;
@@ -1370,11 +1550,17 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.command_pool) {
     vkDestroyCommandPool(vk.device, vk.command_pool, nullptr);
   }
-  if (vk.pipeline_tri) {
-    vkDestroyPipeline(vk.device, vk.pipeline_tri, nullptr);
+  if (vk.pipeline_tri_2d) {
+    vkDestroyPipeline(vk.device, vk.pipeline_tri_2d, nullptr);
   }
-  if (vk.pipeline_line) {
-    vkDestroyPipeline(vk.device, vk.pipeline_line, nullptr);
+  if (vk.pipeline_line_2d) {
+    vkDestroyPipeline(vk.device, vk.pipeline_line_2d, nullptr);
+  }
+  if (vk.pipeline_tri_3d) {
+    vkDestroyPipeline(vk.device, vk.pipeline_tri_3d, nullptr);
+  }
+  if (vk.pipeline_line_3d) {
+    vkDestroyPipeline(vk.device, vk.pipeline_line_3d, nullptr);
   }
   if (vk.pipeline_layout) {
     vkDestroyPipelineLayout(vk.device, vk.pipeline_layout, nullptr);
@@ -1387,6 +1573,15 @@ static void vk_cleanup(VulkanContext& vk) {
   }
   for (auto view : vk.image_views) {
     vkDestroyImageView(vk.device, view, nullptr);
+  }
+  if (vk.depth_view) {
+    vkDestroyImageView(vk.device, vk.depth_view, nullptr);
+  }
+  if (vk.depth_image) {
+    vkDestroyImage(vk.device, vk.depth_image, nullptr);
+  }
+  if (vk.depth_memory) {
+    vkFreeMemory(vk.device, vk.depth_memory, nullptr);
   }
   if (vk.swapchain) {
     vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
@@ -1432,11 +1627,13 @@ static bool vk_draw_frame(GpuState& gpu) {
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(vk.command_buffer, &begin);
 
-  VkClearValue clear{};
-  clear.color.float32[0] = 0.0f;
-  clear.color.float32[1] = 0.0f;
-  clear.color.float32[2] = 0.0f;
-  clear.color.float32[3] = 0.0f;
+  VkClearValue clear[2]{};
+  clear[0].color.float32[0] = 0.0f;
+  clear[0].color.float32[1] = 0.0f;
+  clear[0].color.float32[2] = 0.0f;
+  clear[0].color.float32[3] = 0.0f;
+  clear[1].depthStencil.depth = 1.0f;
+  clear[1].depthStencil.stencil = 0;
 
   VkRenderPassBeginInfo rp{};
   rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1444,8 +1641,8 @@ static bool vk_draw_frame(GpuState& gpu) {
   rp.framebuffer = vk.framebuffers[image_index];
   rp.renderArea.offset = {0, 0};
   rp.renderArea.extent = vk.extent;
-  rp.clearValueCount = 1;
-  rp.pClearValues = &clear;
+  rp.clearValueCount = 2;
+  rp.pClearValues = clear;
   vkCmdBeginRenderPass(vk.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
   VkViewport viewport{};
@@ -1465,11 +1662,11 @@ static bool vk_draw_frame(GpuState& gpu) {
   vkCmdBindVertexBuffers(vk.command_buffer, 0, 1, &vb, offsets);
 
   float ortho[16];
-  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.width),
-             static_cast<float>(gpu.height), 0.0f);
+  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.physical_width),
+             static_cast<float>(gpu.physical_height), 0.0f);
   float perspective[16];
-  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.width) /
-                                           static_cast<float>(gpu.height),
+  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.physical_width) /
+                                           static_cast<float>(gpu.physical_height),
                    0.1f, 100.0f);
 
   VkPipeline current_pipeline = VK_NULL_HANDLE;
@@ -1477,7 +1674,12 @@ static bool vk_draw_frame(GpuState& gpu) {
   bool current_3d = false;
 
   for (const auto& batch : gpu.batches) {
-    VkPipeline desired = batch.line ? vk.pipeline_line : vk.pipeline_tri;
+    VkPipeline desired = VK_NULL_HANDLE;
+    if (batch.use_3d) {
+      desired = batch.line ? vk.pipeline_line_3d : vk.pipeline_tri_3d;
+    } else {
+      desired = batch.line ? vk.pipeline_line_2d : vk.pipeline_tri_2d;
+    }
     if (desired != current_pipeline) {
       vkCmdBindPipeline(vk.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, desired);
       current_pipeline = desired;
@@ -1578,7 +1780,7 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
       EGL_GREEN_SIZE, 8,
       EGL_BLUE_SIZE, 8,
       EGL_ALPHA_SIZE, 8,
-      EGL_DEPTH_SIZE, 0,
+      EGL_DEPTH_SIZE, 16,
       EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
       EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
       EGL_NONE
@@ -1600,6 +1802,33 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
   }
   if (!eglMakeCurrent(gl.display, gl.surface, gl.surface, gl.context)) {
     return false;
+  }
+
+  const char* gl_version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+  const char* gl_renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+  if (gl_version) {
+    fprintf(stderr, "GLES version: %s\n", gl_version);
+  }
+  if (gl_renderer) {
+    fprintf(stderr, "GLES renderer: %s\n", gl_renderer);
+  }
+
+  GLint ext_count = 0;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &ext_count);
+  for (GLint i = 0; i < ext_count; ++i) {
+    const char* ext = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+    if (!ext) {
+      continue;
+    }
+    if (strcmp(ext, "GL_EXT_texture_filter_anisotropic") == 0) {
+      gl.supports_anisotropy = true;
+    }
+  }
+  if (gl.supports_anisotropy) {
+    GLfloat max_aniso = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_aniso);
+    gl.max_anisotropy = max_aniso;
+    fprintf(stderr, "GLES anisotropy: %.1f\n", gl.max_anisotropy);
   }
 
   const char* vs_src =
@@ -1664,6 +1893,8 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
 
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LEQUAL);
 
   gl.ready = true;
   return true;
@@ -1682,6 +1913,9 @@ static bool gl_upload_texture(DrawImage* image) {
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  if (g_gpu.gl.supports_anisotropy) {
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, g_gpu.gl.max_anisotropy);
+  }
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image->width, image->height, 0, GL_RGBA,
                GL_UNSIGNED_BYTE, image->rgba);
   image->gl_ready = true;
@@ -1718,19 +1952,19 @@ static bool gl_draw_frame(GpuState& gpu) {
   glBufferSubData(GL_ARRAY_BUFFER, 0, gpu.vertices.size() * sizeof(GpuVertex),
                   gpu.vertices.data());
 
-  glViewport(0, 0, gpu.width, gpu.height);
+  glViewport(0, 0, gpu.physical_width, gpu.physical_height);
   glClearColor(0, 0, 0, 0);
-  glClear(GL_COLOR_BUFFER_BIT);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   glUseProgram(gl.program);
   glBindVertexArray(gl.vao);
 
   float ortho[16];
-  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.width),
-             static_cast<float>(gpu.height), 0.0f);
+  mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.physical_width),
+             static_cast<float>(gpu.physical_height), 0.0f);
   float perspective[16];
-  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.width) /
-                                           static_cast<float>(gpu.height),
+  mat4_perspective(perspective, 1.0f, static_cast<float>(gpu.physical_width) /
+                                           static_cast<float>(gpu.physical_height),
                    0.1f, 100.0f);
 
   for (const auto& batch : gpu.batches) {
@@ -1740,6 +1974,11 @@ static bool gl_draw_frame(GpuState& gpu) {
     }
     glUniform1i(gl.u_tex, 0);
     glUniformMatrix4fv(gl.u_mvp, 1, GL_FALSE, batch.use_3d ? perspective : ortho);
+    if (batch.use_3d) {
+      glEnable(GL_DEPTH_TEST);
+    } else {
+      glDisable(GL_DEPTH_TEST);
+    }
     GLenum mode = batch.line ? GL_LINES : GL_TRIANGLES;
     glDrawArrays(mode, batch.first, batch.count);
   }
@@ -1835,9 +2074,16 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
   memset(&gpu, 0, sizeof(gpu));
   gpu.backend = backend;
   gpu.window = window;
-  gpu.width = width;
-  gpu.height = height;
+  gpu.logical_width = width;
+  gpu.logical_height = height;
+  gpu.physical_width = width;
+  gpu.physical_height = height;
   gpu.rotation = rotation;
+
+  if (rotation == 90 || rotation == 270) {
+    gpu.physical_width = height;
+    gpu.physical_height = width;
+  }
 
   init_white_image(gpu);
   init_gpu_font(gpu);
@@ -1845,7 +2091,7 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
   bool ok = false;
   if (backend == BACKEND_VULKAN) {
     if (DRAW_ENGINE_HAS_VULKAN) {
-      ok = vk_init_context(gpu.vk, window, width, height);
+      ok = vk_init_context(gpu.vk, window, gpu.physical_width, gpu.physical_height);
     }
   } else if (backend == BACKEND_GLES) {
     if (DRAW_ENGINE_HAS_GLES) {
@@ -2197,6 +2443,47 @@ extern "C" void draw_engine_demo_scene(uint64_t frame) {
                         1.5f, ground_y, z1, 0xFF00FF00);
     gpu_push_triangle3d(g_gpu, -1.5f, ground_y, z0, 1.5f, ground_y, z1,
                         -1.5f, ground_y, z1, 0xFF00FF00);
+
+    const float cube_size = 0.5f;
+    const float cx = 0.0f;
+    const float cy = -0.2f;
+    const float cz = -3.2f;
+    const float cube[8][3] = {
+        {cx - cube_size, cy - cube_size, cz - cube_size},
+        {cx + cube_size, cy - cube_size, cz - cube_size},
+        {cx + cube_size, cy + cube_size, cz - cube_size},
+        {cx - cube_size, cy + cube_size, cz - cube_size},
+        {cx - cube_size, cy - cube_size, cz + cube_size},
+        {cx + cube_size, cy - cube_size, cz + cube_size},
+        {cx + cube_size, cy + cube_size, cz + cube_size},
+        {cx - cube_size, cy + cube_size, cz + cube_size},
+    };
+    const int indices[36] = {
+        0, 1, 2, 0, 2, 3,
+        1, 5, 6, 1, 6, 2,
+        5, 4, 7, 5, 7, 6,
+        4, 0, 3, 4, 3, 7,
+        3, 2, 6, 3, 6, 7,
+        4, 5, 1, 4, 1, 0,
+    };
+    float rot[8][3];
+    for (int i = 0; i < 8; ++i) {
+      const float x = cube[i][0];
+      const float z = cube[i][2];
+      rot[i][0] = x * c + z * s;
+      rot[i][2] = -x * s + z * c;
+      rot[i][1] = cube[i][1];
+    }
+    for (int i = 0; i < 36; i += 3) {
+      const int i0 = indices[i + 0];
+      const int i1 = indices[i + 1];
+      const int i2 = indices[i + 2];
+      gpu_push_triangle3d(g_gpu,
+                          rot[i0][0], rot[i0][1], rot[i0][2],
+                          rot[i1][0], rot[i1][1], rot[i1][2],
+                          rot[i2][0], rot[i2][1], rot[i2][2],
+                          0xFF00FFFF);
+    }
     return;
   }
 
@@ -2215,4 +2502,40 @@ extern "C" void draw_engine_demo_scene(uint64_t frame) {
   draw_line(sx[0], sy[0], sx[1], sy[1], 0xFF0000FF);
   draw_line(sx[1], sy[1], sx[2], sy[2], 0xFF0000FF);
   draw_line(sx[2], sy[2], sx[0], sy[0], 0xFF0000FF);
+
+  const float cube_size = 0.5f;
+  const float cx = 0.0f;
+  const float cy = -0.2f;
+  const float cz = -3.2f;
+  const float cube[8][3] = {
+      {cx - cube_size, cy - cube_size, cz - cube_size},
+      {cx + cube_size, cy - cube_size, cz - cube_size},
+      {cx + cube_size, cy + cube_size, cz - cube_size},
+      {cx - cube_size, cy + cube_size, cz - cube_size},
+      {cx - cube_size, cy - cube_size, cz + cube_size},
+      {cx + cube_size, cy - cube_size, cz + cube_size},
+      {cx + cube_size, cy + cube_size, cz + cube_size},
+      {cx - cube_size, cy + cube_size, cz + cube_size},
+  };
+  float rot[8][3];
+  for (int i = 0; i < 8; ++i) {
+    const float x = cube[i][0];
+    const float z = cube[i][2];
+    rot[i][0] = x * c + z * s;
+    rot[i][2] = -x * s + z * c;
+    rot[i][1] = cube[i][1];
+  }
+  const int edges[24] = {
+      0,1, 1,2, 2,3, 3,0,
+      4,5, 5,6, 6,7, 7,4,
+      0,4, 1,5, 2,6, 3,7,
+  };
+  for (int i = 0; i < 24; i += 2) {
+    int a = edges[i];
+    int b = edges[i + 1];
+    int ax = 0, ay = 0, bx = 0, by = 0;
+    project(rot[a][0], rot[a][1], rot[a][2], &ax, &ay);
+    project(rot[b][0], rot[b][1], rot[b][2], &bx, &by);
+    draw_line(ax, ay, bx, by, 0xFF00FFFF);
+  }
 }
