@@ -95,10 +95,15 @@ static bool read_battery_power_mw(float* out_mw) {
 }
 
 int main() {
-  int mode = 0;
+  int mode = DRAW_ENGINE_MODE_CPU;
   const char* env_mode = getenv("DRAW_ENGINE_MODE");
   if (env_mode && env_mode[0]) {
     mode = atoi(env_mode);
+  }
+  int fps = 120;
+  const char* env_fps = getenv("DRAW_ENGINE_FPS");
+  if (env_fps && env_fps[0]) {
+    fps = atoi(env_fps);
   }
   int stress = 0;
   const char* env_stress = getenv("DRAW_ENGINE_STRESS");
@@ -126,6 +131,7 @@ int main() {
     fprintf(stderr, "init_draw_engine failed\n");
     return 1;
   }
+  draw_engine_set_fps(fps);
   if (init_draw_windows("SystemProfilerDemo", 1) != 0) {
     fprintf(stderr, "init_draw_windows failed\n");
     return 1;
@@ -138,8 +144,6 @@ int main() {
   uint64_t acc_draw_ns = 0;
   uint64_t acc_frame_ns = 0;
   uint64_t acc_frames = 0;
-  const uint64_t target_frame_ns = 8333333ull;
-
   while (true) {
     const uint64_t frame_start_ns = now_ns();
     if (draw_begin_frame() != 0) {
@@ -174,6 +178,11 @@ int main() {
 
     char text[96];
     snprintf(text, sizeof(text), "DEMO FRAME:%" PRIu64, frame);
+    if (mode == DRAW_ENGINE_MODE_HYBRID) {
+      draw_engine_set_sensitive(1);
+      draw_text("SENSITIVE", 16, 96, w - 16, 128, 0xFFFFAA00);
+      draw_engine_set_sensitive(0);
+    }
     draw_text(text, 16, 16, w - 16, 64, 0xFFFFFFFF);
 
     if (img) {
@@ -239,14 +248,10 @@ int main() {
       draw_engine_demo_scene(frame);
     }
 
+    const uint64_t draw_cpu_end_ns = now_ns();
     draw_end_frame();
-    const uint64_t draw_end_ns = now_ns();
-    const uint64_t draw_ns = draw_end_ns - draw_start_ns;
-
-    if (draw_ns < target_frame_ns) {
-      usleep(static_cast<useconds_t>((target_frame_ns - draw_ns) / 1000ull));
-    }
     const uint64_t frame_end_ns = now_ns();
+    const uint64_t draw_ns = draw_cpu_end_ns - draw_start_ns;
 
     ++frame;
 

@@ -1232,6 +1232,157 @@ static void plot_circle_physical(RenderContext& ctx, int cx, int cy, int radius,
   }
 }
 
+static inline ColorComponents color_components(uint32_t color) {
+  return ColorComponents{
+      static_cast<uint8_t>((color >> 24) & 0xFF),
+      static_cast<uint8_t>((color >> 16) & 0xFF),
+      static_cast<uint8_t>((color >> 8) & 0xFF),
+      static_cast<uint8_t>(color & 0xFF),
+  };
+}
+
+static inline uint8_t to_coverage(float value) {
+  if (value <= 0.0f) {
+    return 0;
+  }
+  if (value >= 1.0f) {
+    return 255;
+  }
+  const int v = static_cast<int>(value * 255.0f + 0.5f);
+  return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+static inline float fpart(float x) {
+  return x - floorf(x);
+}
+
+static inline float rfpart(float x) {
+  return 1.0f - fpart(x);
+}
+
+static bool aa_lines_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    const int aa = env_int("MIDRAW_AA", 1);
+    cached = env_int("MIDRAW_AA_LINE", aa);
+  }
+  return cached != 0;
+}
+
+static bool aa_circles_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    const int aa = env_int("MIDRAW_AA", 1);
+    cached = env_int("MIDRAW_AA_CIRCLE", aa);
+  }
+  return cached != 0;
+}
+
+static void draw_line_aa(RenderContext& ctx, int x0, int y0, int x1, int y1, uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  const ColorComponents comp = color_components(color);
+  bool steep = abs(y1 - y0) > abs(x1 - x0);
+  if (steep) {
+    int tmp = x0; x0 = y0; y0 = tmp;
+    tmp = x1; x1 = y1; y1 = tmp;
+  }
+  if (x0 > x1) {
+    int tmp = x0; x0 = x1; x1 = tmp;
+    tmp = y0; y0 = y1; y1 = tmp;
+  }
+  const float dx = static_cast<float>(x1 - x0);
+  const float dy = static_cast<float>(y1 - y0);
+  const float gradient = (dx == 0.0f) ? 1.0f : (dy / dx);
+
+  float xend = roundf(static_cast<float>(x0));
+  float yend = static_cast<float>(y0) + gradient * (xend - static_cast<float>(x0));
+  float xgap = rfpart(static_cast<float>(x0) + 0.5f);
+  int xpxl1 = static_cast<int>(xend);
+  int ypxl1 = static_cast<int>(floorf(yend));
+  if (steep) {
+    blend_pixel_mapped(ctx, ypxl1, xpxl1, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_mapped(ctx, ypxl1 + 1, xpxl1, comp, to_coverage(fpart(yend) * xgap));
+  } else {
+    blend_pixel_mapped(ctx, xpxl1, ypxl1, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_mapped(ctx, xpxl1, ypxl1 + 1, comp, to_coverage(fpart(yend) * xgap));
+  }
+  float intery = yend + gradient;
+
+  xend = roundf(static_cast<float>(x1));
+  yend = static_cast<float>(y1) + gradient * (xend - static_cast<float>(x1));
+  xgap = fpart(static_cast<float>(x1) + 0.5f);
+  int xpxl2 = static_cast<int>(xend);
+  int ypxl2 = static_cast<int>(floorf(yend));
+  if (steep) {
+    blend_pixel_mapped(ctx, ypxl2, xpxl2, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_mapped(ctx, ypxl2 + 1, xpxl2, comp, to_coverage(fpart(yend) * xgap));
+  } else {
+    blend_pixel_mapped(ctx, xpxl2, ypxl2, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_mapped(ctx, xpxl2, ypxl2 + 1, comp, to_coverage(fpart(yend) * xgap));
+  }
+
+  for (int x = xpxl1 + 1; x < xpxl2; ++x) {
+    if (steep) {
+      blend_pixel_mapped(ctx, static_cast<int>(floorf(intery)), x, comp,
+                         to_coverage(rfpart(intery)));
+      blend_pixel_mapped(ctx, static_cast<int>(floorf(intery)) + 1, x, comp,
+                         to_coverage(fpart(intery)));
+    } else {
+      blend_pixel_mapped(ctx, x, static_cast<int>(floorf(intery)), comp,
+                         to_coverage(rfpart(intery)));
+      blend_pixel_mapped(ctx, x, static_cast<int>(floorf(intery)) + 1, comp,
+                         to_coverage(fpart(intery)));
+    }
+    intery += gradient;
+  }
+}
+
+static void draw_circle_aa(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
+  if (!ctx.pixels || radius <= 0) {
+    return;
+  }
+  const ColorComponents comp = color_components(color);
+  const float r = static_cast<float>(radius);
+  const float r2 = r * r;
+  for (int x = 0; x <= radius; ++x) {
+    const float fx = static_cast<float>(x);
+    const float fy = sqrtf(r2 - fx * fx);
+    const int iy = static_cast<int>(floorf(fy));
+    const float frac = fy - static_cast<float>(iy);
+    const uint8_t a0 = to_coverage(1.0f - frac);
+    const uint8_t a1 = to_coverage(frac);
+
+    const int px = cx + x;
+    const int nx = cx - x;
+    const int py = cy + iy;
+    const int ny = cy - iy;
+
+    blend_pixel_mapped(ctx, px, py, comp, a0);
+    blend_pixel_mapped(ctx, px, py + 1, comp, a1);
+    blend_pixel_mapped(ctx, px, ny, comp, a0);
+    blend_pixel_mapped(ctx, px, ny - 1, comp, a1);
+    blend_pixel_mapped(ctx, nx, py, comp, a0);
+    blend_pixel_mapped(ctx, nx, py + 1, comp, a1);
+    blend_pixel_mapped(ctx, nx, ny, comp, a0);
+    blend_pixel_mapped(ctx, nx, ny - 1, comp, a1);
+
+    const int py2 = cy + x;
+    const int ny2 = cy - x;
+    const int px2 = cx + iy;
+    const int nx2 = cx - iy;
+    blend_pixel_mapped(ctx, px2, py2, comp, a0);
+    blend_pixel_mapped(ctx, px2 + 1, py2, comp, a1);
+    blend_pixel_mapped(ctx, px2, ny2, comp, a0);
+    blend_pixel_mapped(ctx, px2 + 1, ny2, comp, a1);
+    blend_pixel_mapped(ctx, nx2, py2, comp, a0);
+    blend_pixel_mapped(ctx, nx2 - 1, py2, comp, a1);
+    blend_pixel_mapped(ctx, nx2, ny2, comp, a0);
+    blend_pixel_mapped(ctx, nx2 - 1, ny2, comp, a1);
+  }
+}
+
 static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32_t color) {
   if (!ctx.pixels) {
     return;
@@ -1240,6 +1391,14 @@ static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
   const int max_x = x1 > x2 ? x1 : x2;
   const int min_y = y1 < y2 ? y1 : y2;
   const int max_y = y1 > y2 ? y1 : y2;
+  if (aa_lines_enabled()) {
+    const int pad = 1;
+    expand_dirty_rect(ctx, min_x - pad, min_y - pad,
+                      (max_x - min_x + 1) + pad * 2,
+                      (max_y - min_y + 1) + pad * 2);
+    draw_line_aa(ctx, x1, y1, x2, y2, color);
+    return;
+  }
   expand_dirty_rect(ctx, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
   if (ctx.rotation == 0) {
     plot_line_physical(ctx, x1, y1, x2, y2, color);
@@ -1256,6 +1415,13 @@ static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
 
 static void draw_circle(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
   if (!ctx.pixels) {
+    return;
+  }
+  if (aa_circles_enabled()) {
+    const int pad = 1;
+    expand_dirty_rect(ctx, cx - radius - pad, cy - radius - pad,
+                      radius * 2 + 1 + pad * 2, radius * 2 + 1 + pad * 2);
+    draw_circle_aa(ctx, cx, cy, radius, color);
     return;
   }
   expand_dirty_rect(ctx, cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1);
@@ -2752,20 +2918,20 @@ static void unlock_and_post(MidrawContext& ctx) {
 
 int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
   if (!out_ctx) {
-    return -1;
+    return MIDRAW_EINVAL;
   }
   *out_ctx = nullptr;
 
   MidrawContext* ctx = static_cast<MidrawContext*>(calloc(1, sizeof(MidrawContext)));
   if (!ctx) {
-    return -1;
+    return MIDRAW_EFAILED;
   }
 
   ctx->defer_lock = should_defer_lock();
 
   if (!init_symbols(&ctx->symbols)) {
     free(ctx);
-    return -1;
+    return MIDRAW_EFAILED;
   }
 
   if (config) {
@@ -2786,7 +2952,7 @@ int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
   if (!midraw_create_window(ctx->symbols, ctx->render, ctx->requested_width,
                             ctx->requested_height, config)) {
     midraw_shutdown(ctx);
-    return -1;
+    return MIDRAW_EFAILED;
   }
 
   update_dimensions(*ctx);
@@ -2804,7 +2970,7 @@ int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
 #endif
 
   *out_ctx = ctx;
-  return 0;
+  return MIDRAW_OK;
 }
 
 void midraw_shutdown(MidrawContext* ctx) {
@@ -2863,7 +3029,7 @@ void midraw_shutdown(MidrawContext* ctx) {
 
 int midraw_lock(MidrawContext* ctx) {
   if (!ctx) {
-    return -1;
+    return MIDRAW_EINVAL;
   }
   refresh_display_state(*ctx);
   if (ctx->defer_lock) {
@@ -2883,11 +3049,11 @@ int midraw_lock(MidrawContext* ctx) {
     return 0;
   }
   if (!lock_buffer(*ctx)) {
-    return -1;
+    return MIDRAW_EFAILED;
   }
   ensure_prev_dirty_initialized(ctx->render);
   reset_dirty(ctx->render);
-  return 0;
+  return MIDRAW_OK;
 }
 
 void midraw_unlock_post(MidrawContext* ctx) {
@@ -2917,15 +3083,15 @@ int midraw_logical_height(const MidrawContext* ctx) {
 
 int midraw_resize(MidrawContext* ctx, int width, int height) {
   if (!ctx) {
-    return -1;
+    return MIDRAW_EINVAL;
   }
   if (width <= 0 || height <= 0) {
-    return -1;
+    return MIDRAW_EINVAL;
   }
   ctx->requested_width = width;
   ctx->requested_height = height;
   if (width == ctx->render.width && height == ctx->render.height) {
-    return 0;
+    return MIDRAW_OK;
   }
   int result = midraw_resize_window(ctx->symbols, ctx->render, width, height);
   if (result == 0) {
@@ -2934,8 +3100,9 @@ int midraw_resize(MidrawContext* ctx, int width, int height) {
     if (ctx->render.use_ahb) {
       setup_ahb_buffer(*ctx, width, height);
     }
+    return MIDRAW_OK;
   }
-  return result;
+  return MIDRAW_EFAILED;
 }
 
 void* midraw_get_native_window(MidrawContext* ctx) {
@@ -2945,12 +3112,37 @@ void* midraw_get_native_window(MidrawContext* ctx) {
   return reinterpret_cast<void*>(ctx->render.window);
 }
 
+int midraw_set_layer(MidrawContext* ctx, int32_t layer) {
+  if (!ctx || !ctx->render.surface) {
+    return MIDRAW_EINVAL;
+  }
+  if (!ctx->symbols.ASurfaceTransaction_create || !ctx->symbols.ASurfaceTransaction_release ||
+      !ctx->symbols.ASurfaceTransaction_apply) {
+    return MIDRAW_EFAILED;
+  }
+  if (!ctx->symbols.ASurfaceTransaction_setLayer && !ctx->symbols.ASurfaceTransaction_setZOrder) {
+    return MIDRAW_EFAILED;
+  }
+  ASurfaceTransaction* tx = ctx->symbols.ASurfaceTransaction_create();
+  if (!tx) {
+    return MIDRAW_EFAILED;
+  }
+  if (ctx->symbols.ASurfaceTransaction_setLayer) {
+    ctx->symbols.ASurfaceTransaction_setLayer(tx, ctx->render.surface, layer);
+  } else if (ctx->symbols.ASurfaceTransaction_setZOrder) {
+    ctx->symbols.ASurfaceTransaction_setZOrder(tx, ctx->render.surface, layer);
+  }
+  ctx->symbols.ASurfaceTransaction_apply(tx);
+  ctx->symbols.ASurfaceTransaction_release(tx);
+  return MIDRAW_OK;
+}
+
 int midraw_display_rotation(MidrawContext* ctx,
                             int* out_rotation,
                             int* out_width,
                             int* out_height) {
   if (!ctx) {
-    return -1;
+    return MIDRAW_EINVAL;
   }
   return midraw_query_display_rotation(ctx->symbols, out_rotation, out_width, out_height);
 }
@@ -2993,7 +3185,10 @@ void midraw_draw_line(MidrawContext* ctx, int x1, int y1, int x2, int y2, uint32
     const int max_x = x1 > x2 ? x1 : x2;
     const int min_y = y1 < y2 ? y1 : y2;
     const int max_y = y1 > y2 ? y1 : y2;
-    expand_dirty_rect(ctx->render, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
+    const int pad = aa_lines_enabled() ? 1 : 0;
+    expand_dirty_rect(ctx->render, min_x - pad, min_y - pad,
+                      (max_x - min_x + 1) + pad * 2,
+                      (max_y - min_y + 1) + pad * 2);
     return;
   }
   draw_line(ctx->render, x1, y1, x2, y2, color);
@@ -3036,7 +3231,10 @@ void midraw_draw_circle(MidrawContext* ctx, int cx, int cy, int radius, uint32_t
     if (!push_command(*ctx, cmd)) {
       return;
     }
-    expand_dirty_rect(ctx->render, cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1);
+    const int pad = aa_circles_enabled() ? 1 : 0;
+    expand_dirty_rect(ctx->render, cx - radius - pad, cy - radius - pad,
+                      radius * 2 + 1 + pad * 2,
+                      radius * 2 + 1 + pad * 2);
     return;
   }
   draw_circle(ctx->render, cx, cy, radius, color);

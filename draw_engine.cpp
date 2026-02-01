@@ -10,7 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <vector>
+#include <string>
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -39,6 +41,8 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "third_party/stb_truetype/stb_truetype.h"
 
+struct AChoreographer;
+
 struct DrawImage {
   int width;
   int height;
@@ -63,11 +67,33 @@ struct DrawEngineState {
   int mode;
   BackendType backend;
   MidrawContext* cpu_ctx;
+  MidrawContext* overlay_ctx;
   char* surface_name;
   int rotation;
   bool rotation_forced;
   bool in_frame;
   bool initialized;
+  bool hybrid;
+  float render_scale;
+  int render_width;
+  int render_height;
+  bool render_scale_manual;
+  bool render_size_manual;
+  int target_fps;
+  bool fps_manual;
+  float auto_fps;
+  double avg_draw_ns;
+  uint64_t frame_start_ns;
+  uint32_t hybrid_cpu_mask;
+  bool hybrid_sensitive_only;
+  bool sensitive;
+  int circle_segments;
+  bool circle_segments_manual;
+  int auto_quality;
+  int quality_level;
+  int quality_min;
+  int quality_max;
+  uint64_t last_quality_ns;
 };
 
 static void gpu_shutdown(struct GpuState& gpu);
@@ -75,6 +101,15 @@ static bool gpu_init(struct GpuState& gpu, BackendType backend, ANativeWindow* w
                      int height, int rotation);
 
 struct GpuVertex {
+  float x;
+  float y;
+  float z;
+  float u;
+  float v;
+  uint32_t color;
+};
+
+struct CachedTextVertex {
   float x;
   float y;
   float z;
@@ -120,6 +155,22 @@ struct GpuFontAtlas {
   float line_advance;
   bool truetype;
   bool ready;
+};
+
+struct CachedText {
+  std::string text;
+  int x0;
+  int y0;
+  int x1;
+  int y1;
+  uint32_t color;
+  int font_w;
+  int font_h;
+  float font_ascent;
+  float font_line;
+  bool font_truetype;
+  std::vector<CachedTextVertex> vertices;
+  uint64_t last_used;
 };
 
 struct VulkanContext {
@@ -197,13 +248,21 @@ struct GpuState {
   int physical_width;
   int physical_height;
   int rotation;
+  float scale_x;
+  float scale_y;
   VulkanContext vk;
   GlesContext gl;
   std::vector<GpuCommand> commands;
   std::vector<GpuVertex> vertices;
   std::vector<GpuBatch> batches;
+  std::vector<float> circle_lut;
+  int circle_segments;
   char text_pool[65536];
   size_t text_offset;
+  std::vector<CachedText> text_cache;
+  size_t text_cache_bytes;
+  size_t text_cache_limit;
+  int text_cache_max_entries;
   GpuFontAtlas font;
   DrawImage font_image;
   DrawImage white_image;
@@ -215,6 +274,8 @@ struct GpuState {
 static DrawEngineState g_engine{};
 static GpuState g_gpu{};
 
+static int env_int(const char* name, int default_value);
+
 static bool has_library(const char* name) {
   if (!name || !name[0]) {
     return false;
@@ -225,6 +286,60 @@ static bool has_library(const char* name) {
   }
   dlclose(handle);
   return true;
+}
+
+static BackendType choose_best_backend() {
+  if (DRAW_ENGINE_HAS_VULKAN && has_library("libvulkan.so")) {
+    return BACKEND_VULKAN;
+  }
+  if (DRAW_ENGINE_HAS_GLES &&
+      (has_library("libGLESv3.so") || has_library("libGLESv2.so"))) {
+    return BACKEND_GLES;
+  }
+  return BACKEND_CPU;
+}
+
+static MidrawContext* active_cpu_ctx() {
+  if (g_engine.hybrid && g_engine.overlay_ctx) {
+    return g_engine.overlay_ctx;
+  }
+  return g_engine.cpu_ctx;
+}
+
+static bool hybrid_use_cpu(GpuCmdType type) {
+  if (!g_engine.hybrid || !g_engine.overlay_ctx) {
+    return false;
+  }
+  if (g_engine.hybrid_sensitive_only && !g_engine.sensitive) {
+    return false;
+  }
+  const uint32_t mask = g_engine.hybrid_cpu_mask;
+  switch (type) {
+    case GpuCmdType::Text:
+      return (mask & DRAW_ENGINE_HYBRID_CPU_TEXT) != 0;
+    case GpuCmdType::Line:
+      return (mask & DRAW_ENGINE_HYBRID_CPU_LINE) != 0;
+    case GpuCmdType::Circle:
+      return (mask & DRAW_ENGINE_HYBRID_CPU_CIRCLE) != 0;
+    case GpuCmdType::Rect:
+      return (mask & DRAW_ENGINE_HYBRID_CPU_RECT) != 0;
+    case GpuCmdType::Image:
+      return (mask & DRAW_ENGINE_HYBRID_CPU_IMAGE) != 0;
+    default:
+      break;
+  }
+  return false;
+}
+
+static bool hybrid_secure_enabled() {
+  if (!g_engine.hybrid) {
+    return false;
+  }
+  return env_int("DRAW_ENGINE_HYBRID_SECURE", 1) != 0;
+}
+
+static bool should_scale_cpu() {
+  return env_int("DRAW_ENGINE_SCALE_CPU", 0) != 0;
 }
 
 static uint32_t lcg(uint32_t& state) {
@@ -298,6 +413,268 @@ static float env_float(const char* name, float default_value) {
   return static_cast<float>(atof(value));
 }
 
+static bool env_present(const char* name) {
+  const char* value = getenv(name);
+  return value && value[0];
+}
+
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+static inline uint64_t fps_to_frame_ns(float fps) {
+  if (fps <= 0.0f) {
+    return 0;
+  }
+  return static_cast<uint64_t>(1000000000.0 / fps);
+}
+
+static float update_auto_fps(uint64_t draw_ns) {
+  if (draw_ns == 0) {
+    if (g_engine.auto_fps > 0.0f) {
+      return g_engine.auto_fps;
+    }
+    return 60.0f;
+  }
+  const double sample = static_cast<double>(draw_ns);
+  if (g_engine.avg_draw_ns <= 0.0) {
+    g_engine.avg_draw_ns = sample;
+  } else {
+    g_engine.avg_draw_ns = g_engine.avg_draw_ns * 0.9 + sample * 0.1;
+  }
+
+  float target_cpu = env_float("DRAW_ENGINE_AUTO_CPU_UTIL", 0.6f);
+  target_cpu = clampf(target_cpu, 0.2f, 0.9f);
+  int min_fps = env_int("DRAW_ENGINE_AUTO_MIN_FPS", 45);
+  int max_fps = env_int("DRAW_ENGINE_AUTO_MAX_FPS", 120);
+  if (min_fps < 10) {
+    min_fps = 10;
+  }
+  if (max_fps < min_fps) {
+    max_fps = min_fps;
+  }
+
+  const double ideal_fps = (g_engine.avg_draw_ns > 0.0)
+                               ? (1000000000.0 * target_cpu / g_engine.avg_draw_ns)
+                               : static_cast<double>(max_fps);
+  float target = static_cast<float>(ideal_fps);
+  if (target > static_cast<float>(max_fps)) {
+    target = static_cast<float>(max_fps);
+  }
+  const double min_frame_ns = 1000000000.0 / static_cast<double>(min_fps);
+  if (g_engine.avg_draw_ns <= min_frame_ns && target < static_cast<float>(min_fps)) {
+    target = static_cast<float>(min_fps);
+  }
+  if (target < 10.0f) {
+    target = 10.0f;
+  }
+
+  if (g_engine.auto_fps <= 0.0f) {
+    g_engine.auto_fps = target;
+  } else {
+    g_engine.auto_fps = g_engine.auto_fps * 0.85f + target * 0.15f;
+  }
+  return g_engine.auto_fps;
+}
+
+static void init_hybrid_policy() {
+  g_engine.hybrid_cpu_mask = DRAW_ENGINE_HYBRID_CPU_TEXT;
+  g_engine.hybrid_sensitive_only = true;
+  g_engine.sensitive = env_int("DRAW_ENGINE_SENSITIVE_DEFAULT", 0) != 0;
+
+  const char* profile = getenv("DRAW_ENGINE_HYBRID_PROFILE");
+  if (profile && profile[0]) {
+    if (strcmp(profile, "secure_text") == 0) {
+      g_engine.hybrid_cpu_mask = DRAW_ENGINE_HYBRID_CPU_TEXT;
+      g_engine.hybrid_sensitive_only = true;
+    } else if (strcmp(profile, "secure_ui") == 0) {
+      g_engine.hybrid_cpu_mask = DRAW_ENGINE_HYBRID_CPU_TEXT |
+                                 DRAW_ENGINE_HYBRID_CPU_LINE |
+                                 DRAW_ENGINE_HYBRID_CPU_CIRCLE;
+      g_engine.hybrid_sensitive_only = true;
+    } else if (strcmp(profile, "balanced") == 0) {
+      g_engine.hybrid_cpu_mask = DRAW_ENGINE_HYBRID_CPU_TEXT;
+      g_engine.hybrid_sensitive_only = false;
+    } else if (strcmp(profile, "gpu_first") == 0) {
+      g_engine.hybrid_cpu_mask = 0;
+      g_engine.hybrid_sensitive_only = true;
+    }
+  }
+
+  const int mask_env = env_int("DRAW_ENGINE_HYBRID_CPU_MASK", -1);
+  if (mask_env >= 0) {
+    g_engine.hybrid_cpu_mask = static_cast<uint32_t>(mask_env);
+  }
+  const int sensitive_env = env_int("DRAW_ENGINE_HYBRID_SENSITIVE_ONLY", -1);
+  if (sensitive_env >= 0) {
+    g_engine.hybrid_sensitive_only = (sensitive_env != 0);
+  }
+}
+
+static bool get_display_logical(MidrawContext* ctx, int* out_w, int* out_h) {
+  if (!ctx) {
+    return false;
+  }
+  int rot = 0;
+  int w = 0;
+  int h = 0;
+  if (midraw_display_rotation(ctx, &rot, &w, &h) != 0) {
+    return false;
+  }
+  int logical_w = w;
+  int logical_h = h;
+  if (w > 0 && h > 0) {
+    const int long_side = (w > h) ? w : h;
+    const int short_side = (w > h) ? h : w;
+    const bool rot_landscape = (rot == 90 || rot == 270);
+    const bool size_landscape = w >= h;
+    if (rot_landscape != size_landscape) {
+      logical_w = long_side;
+      logical_h = short_side;
+    }
+  }
+  if (out_w) {
+    *out_w = logical_w;
+  }
+  if (out_h) {
+    *out_h = logical_h;
+  }
+  return logical_w > 0 && logical_h > 0;
+}
+
+static void compute_render_target(int base_w, int base_h, int* out_w, int* out_h) {
+  int target_w = base_w;
+  int target_h = base_h;
+  if (g_engine.render_width > 0 && g_engine.render_height > 0) {
+    target_w = g_engine.render_width;
+    target_h = g_engine.render_height;
+  } else if (g_engine.render_scale > 0.0f && g_engine.render_scale < 0.999f &&
+             base_w > 0 && base_h > 0) {
+    target_w = static_cast<int>(base_w * g_engine.render_scale + 0.5f);
+    target_h = static_cast<int>(base_h * g_engine.render_scale + 0.5f);
+  }
+  if (out_w) {
+    *out_w = target_w;
+  }
+  if (out_h) {
+    *out_h = target_h;
+  }
+}
+
+static void apply_render_target() {
+  MidrawContext* base_ctx = g_engine.cpu_ctx ? g_engine.cpu_ctx : g_engine.overlay_ctx;
+  int base_w = 0;
+  int base_h = 0;
+  if (!get_display_logical(base_ctx, &base_w, &base_h)) {
+    if (base_ctx) {
+      base_w = midraw_logical_width(base_ctx);
+      base_h = midraw_logical_height(base_ctx);
+    }
+  }
+  if (base_w <= 0 || base_h <= 0) {
+    return;
+  }
+  int target_w = base_w;
+  int target_h = base_h;
+  compute_render_target(base_w, base_h, &target_w, &target_h);
+  if (target_w <= 0 || target_h <= 0) {
+    return;
+  }
+  if (g_engine.backend == BACKEND_CPU) {
+    MidrawContext* ctx = active_cpu_ctx();
+    if (ctx) {
+      midraw_resize(ctx, target_w, target_h);
+    }
+    return;
+  }
+  if (g_engine.cpu_ctx) {
+    midraw_resize(g_engine.cpu_ctx, target_w, target_h);
+  }
+  if (g_engine.hybrid && g_engine.overlay_ctx && should_scale_cpu()) {
+    midraw_resize(g_engine.overlay_ctx, target_w, target_h);
+  }
+}
+
+static void apply_quality_level(int level) {
+  struct QualityEntry {
+    float scale;
+    int segments;
+  };
+  static const QualityEntry kTable[] = {
+      {0.5f, 24},
+      {0.7f, 32},
+      {0.85f, 48},
+      {1.0f, 64},
+  };
+  if (level < 0) {
+    level = 0;
+  } else if (level > 3) {
+    level = 3;
+  }
+  if (!g_engine.render_scale_manual) {
+    g_engine.render_scale = kTable[level].scale;
+  }
+  if (!g_engine.circle_segments_manual) {
+    g_engine.circle_segments = kTable[level].segments;
+  }
+  apply_render_target();
+  if (g_engine.backend != BACKEND_CPU) {
+    gpu_refresh_size_and_rotation();
+  }
+}
+
+static void maybe_adjust_quality(uint64_t draw_ns) {
+  if (g_engine.auto_quality == 0) {
+    return;
+  }
+  if (g_engine.backend == BACKEND_CPU) {
+    return;
+  }
+  if (g_engine.render_size_manual || g_engine.render_scale_manual) {
+    return;
+  }
+  const int target_fps = (g_engine.target_fps > 0) ? g_engine.target_fps : 60;
+  const uint64_t target_ns = fps_to_frame_ns(static_cast<float>(target_fps));
+  if (target_ns == 0) {
+    return;
+  }
+  if (g_engine.avg_draw_ns <= 0.0) {
+    g_engine.avg_draw_ns = static_cast<double>(draw_ns);
+  } else {
+    g_engine.avg_draw_ns = g_engine.avg_draw_ns * 0.9 +
+                           static_cast<double>(draw_ns) * 0.1;
+  }
+  const uint64_t now = now_ns();
+  if (g_engine.last_quality_ns == 0) {
+    g_engine.last_quality_ns = now;
+    return;
+  }
+  if (now - g_engine.last_quality_ns < 1000000000ull) {
+    return;
+  }
+  const double avg = g_engine.avg_draw_ns;
+  bool changed = false;
+  if (avg > static_cast<double>(target_ns) * 1.10 &&
+      g_engine.quality_level > g_engine.quality_min) {
+    g_engine.quality_level -= 1;
+    changed = true;
+  } else if (avg < static_cast<double>(target_ns) * 0.75 &&
+             g_engine.quality_level < g_engine.quality_max) {
+    g_engine.quality_level += 1;
+    changed = true;
+  }
+  if (changed) {
+    apply_quality_level(g_engine.quality_level);
+  }
+  g_engine.last_quality_ns = now;
+}
+
 static uint64_t now_ns() {
   timespec ts{};
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -333,6 +710,84 @@ static bool query_native_window_size(ANativeWindow* window, int* out_w, int* out
     *out_h = h;
   }
   return true;
+}
+
+static float query_native_window_refresh_rate(ANativeWindow* window) {
+  using PFN_GetRefreshRate = float (*)(ANativeWindow*);
+  static void* libandroid = nullptr;
+  static PFN_GetRefreshRate get_refresh = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      get_refresh =
+          reinterpret_cast<PFN_GetRefreshRate>(dlsym(libandroid, "ANativeWindow_getRefreshRate"));
+    }
+    tried = true;
+  }
+  if (!window || !get_refresh) {
+    return 0.0f;
+  }
+  return get_refresh(window);
+}
+
+static float query_choreographer_refresh_rate() {
+  using PFN_GetChoreo = AChoreographer* (*)();
+  using PFN_GetRefresh = float (*)(AChoreographer*);
+  static void* libandroid = nullptr;
+  static PFN_GetChoreo get_choreo = nullptr;
+  static PFN_GetRefresh get_refresh = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      get_choreo = reinterpret_cast<PFN_GetChoreo>(dlsym(libandroid, "AChoreographer_getInstance"));
+      get_refresh =
+          reinterpret_cast<PFN_GetRefresh>(dlsym(libandroid, "AChoreographer_getRefreshRate"));
+    }
+    tried = true;
+  }
+  if (!get_choreo || !get_refresh) {
+    return 0.0f;
+  }
+  AChoreographer* choreo = get_choreo();
+  if (!choreo) {
+    return 0.0f;
+  }
+  return get_refresh(choreo);
+}
+
+static int sanitize_display_fps(float rate) {
+  if (rate < 1.0f) {
+    return 0;
+  }
+  int fps = static_cast<int>(rate + 0.5f);
+  if (fps < 30) {
+    return 0;
+  }
+  if (fps > 1000) {
+    fps = 1000;
+  }
+  return fps;
+}
+
+static void maybe_apply_default_gpu_fps() {
+  if (g_engine.backend == BACKEND_CPU || g_engine.hybrid) {
+    return;
+  }
+  if (g_engine.fps_manual || g_engine.target_fps > 0) {
+    return;
+  }
+  const float window_rate = query_native_window_refresh_rate(g_gpu.window);
+  int fps = sanitize_display_fps(window_rate);
+  if (fps <= 0) {
+    const float choreo_rate = query_choreographer_refresh_rate();
+    fps = sanitize_display_fps(choreo_rate);
+  }
+  if (fps <= 0) {
+    fps = 60;
+  }
+  g_engine.target_fps = fps;
 }
 
 static bool set_native_window_geometry(ANativeWindow* window, int width, int height) {
@@ -698,11 +1153,135 @@ static void init_gpu_font(GpuState& gpu) {
   gpu.font_image.pixels = nullptr;
 }
 
+static void gpu_reserve(GpuState& gpu);
+
 static void gpu_reset_frame(GpuState& gpu) {
+  gpu_reserve(gpu);
   gpu.commands.clear();
   gpu.vertices.clear();
   gpu.batches.clear();
   gpu.text_offset = 0;
+}
+
+static void gpu_reserve(GpuState& gpu) {
+  int expected = env_int("DRAW_ENGINE_EXPECT_SHAPES", 300);
+  if (expected < 0) {
+    expected = 0;
+  }
+  int segments = g_engine.circle_segments > 0 ? g_engine.circle_segments : 64;
+  int reserve_vertices = env_int("DRAW_ENGINE_RESERVE_VERTICES", 0);
+  if (reserve_vertices <= 0) {
+    int worst = expected * (segments * 2);
+    if (worst < 16384) {
+      worst = 16384;
+    } else if (worst > 131072) {
+      worst = 131072;
+    }
+    reserve_vertices = worst;
+  }
+  int reserve_commands = env_int("DRAW_ENGINE_RESERVE_COMMANDS", 0);
+  if (reserve_commands <= 0) {
+    reserve_commands = expected * 2 + 256;
+  }
+  int reserve_batches = env_int("DRAW_ENGINE_RESERVE_BATCHES", 0);
+  if (reserve_batches <= 0) {
+    reserve_batches = expected + 64;
+  }
+  if (gpu.vertices.capacity() < static_cast<size_t>(reserve_vertices)) {
+    gpu.vertices.reserve(static_cast<size_t>(reserve_vertices));
+  }
+  if (gpu.commands.capacity() < static_cast<size_t>(reserve_commands)) {
+    gpu.commands.reserve(static_cast<size_t>(reserve_commands));
+  }
+  if (gpu.batches.capacity() < static_cast<size_t>(reserve_batches)) {
+    gpu.batches.reserve(static_cast<size_t>(reserve_batches));
+  }
+}
+
+static void ensure_circle_lut(GpuState& gpu, int segments) {
+  if (segments < 8) {
+    segments = 8;
+  }
+  if (gpu.circle_segments == segments && !gpu.circle_lut.empty()) {
+    return;
+  }
+  gpu.circle_segments = segments;
+  gpu.circle_lut.resize(static_cast<size_t>(segments * 2));
+  const float step = (2.0f * 3.1415926f) / static_cast<float>(segments);
+  for (int i = 0; i < segments; ++i) {
+    const float a = step * static_cast<float>(i);
+    gpu.circle_lut[static_cast<size_t>(i * 2 + 0)] = cosf(a);
+    gpu.circle_lut[static_cast<size_t>(i * 2 + 1)] = sinf(a);
+  }
+}
+
+static void gpu_text_cache_init(GpuState& gpu) {
+  if (gpu.text_cache_limit != 0 || gpu.text_cache_max_entries != 0) {
+    return;
+  }
+  int limit = env_int("DRAW_ENGINE_TEXT_CACHE_BYTES", 512 * 1024);
+  int max_entries = env_int("DRAW_ENGINE_TEXT_CACHE_ENTRIES", 64);
+  if (limit < 0) {
+    limit = 0;
+  }
+  if (max_entries < 0) {
+    max_entries = 0;
+  }
+  gpu.text_cache_limit = static_cast<size_t>(limit);
+  gpu.text_cache_max_entries = max_entries;
+  gpu.text_cache_bytes = 0;
+}
+
+static size_t text_entry_bytes(const CachedText& entry) {
+  return entry.vertices.size() * sizeof(CachedTextVertex) + entry.text.size() + 1;
+}
+
+static void gpu_text_cache_evict(GpuState& gpu, size_t needed_bytes) {
+  if (gpu.text_cache_limit == 0 || gpu.text_cache_max_entries == 0) {
+    return;
+  }
+  while ((!gpu.text_cache.empty()) &&
+         (gpu.text_cache_bytes + needed_bytes > gpu.text_cache_limit ||
+          static_cast<int>(gpu.text_cache.size()) >= gpu.text_cache_max_entries)) {
+    size_t oldest_index = 0;
+    uint64_t oldest_frame = gpu.text_cache[0].last_used;
+    for (size_t i = 1; i < gpu.text_cache.size(); ++i) {
+      if (gpu.text_cache[i].last_used < oldest_frame) {
+        oldest_frame = gpu.text_cache[i].last_used;
+        oldest_index = i;
+      }
+    }
+    gpu.text_cache_bytes -= text_entry_bytes(gpu.text_cache[oldest_index]);
+    gpu.text_cache.erase(gpu.text_cache.begin() + static_cast<long>(oldest_index));
+  }
+}
+
+static CachedText* gpu_text_cache_find(GpuState& gpu,
+                                       const char* text,
+                                       int x0,
+                                       int y0,
+                                       int x1,
+                                       int y1,
+                                       uint32_t color) {
+  if (!text || gpu.text_cache.empty()) {
+    return nullptr;
+  }
+  for (auto& entry : gpu.text_cache) {
+    if (entry.color != color ||
+        entry.x0 != x0 || entry.y0 != y0 || entry.x1 != x1 || entry.y1 != y1) {
+      continue;
+    }
+    if (entry.font_w != gpu.font.width || entry.font_h != gpu.font.height ||
+        entry.font_truetype != gpu.font.truetype ||
+        entry.font_ascent != gpu.font.ascent ||
+        entry.font_line != gpu.font.line_advance) {
+      continue;
+    }
+    if (entry.text == text) {
+      return &entry;
+    }
+  }
+  return nullptr;
 }
 
 static void gpu_add_batch(GpuState& gpu,
@@ -766,15 +1345,21 @@ static void gpu_push_vertex(GpuState& gpu,
                             uint32_t color,
                             bool map2d) {
   GpuVertex vert{};
+  float sx = x;
+  float sy = y;
+  if (map2d) {
+    sx *= gpu.scale_x;
+    sy *= gpu.scale_y;
+  }
   if (map2d && gpu.rotation != 0) {
     float px = 0.0f;
     float py = 0.0f;
-    map_logical_to_physical(gpu, x, y, &px, &py);
+    map_logical_to_physical(gpu, sx, sy, &px, &py);
     vert.x = px;
     vert.y = py;
   } else {
-    vert.x = x;
-    vert.y = y;
+    vert.x = sx;
+    vert.y = sy;
   }
   vert.z = z;
   vert.u = u;
@@ -872,16 +1457,29 @@ static void gpu_push_circle(GpuState& gpu, int cx, int cy, int radius, uint32_t 
   if (radius <= 0) {
     return;
   }
-  const int segments = 32;
-  const float step = (2.0f * 3.1415926f) / static_cast<float>(segments);
+  int segments = g_engine.circle_segments;
+  if (segments <= 0) {
+    segments = env_int("DRAW_ENGINE_CIRCLE_SEGMENTS", 64);
+  }
+  if (segments < 8) {
+    segments = 8;
+  }
+  ensure_circle_lut(gpu, segments);
   const int first = static_cast<int>(gpu.vertices.size());
   for (int i = 0; i < segments; ++i) {
-    const float a0 = step * static_cast<float>(i);
-    const float a1 = step * static_cast<float>(i + 1);
-    const float x0 = static_cast<float>(cx) + cosf(a0) * radius;
-    const float y0 = static_cast<float>(cy) + sinf(a0) * radius;
-    const float x1 = static_cast<float>(cx) + cosf(a1) * radius;
-    const float y1 = static_cast<float>(cy) + sinf(a1) * radius;
+    const int j = (i + 1) < segments ? (i + 1) : 0;
+    const float x0 = static_cast<float>(cx) +
+                     gpu.circle_lut[static_cast<size_t>(i * 2 + 0)] *
+                         static_cast<float>(radius);
+    const float y0 = static_cast<float>(cy) +
+                     gpu.circle_lut[static_cast<size_t>(i * 2 + 1)] *
+                         static_cast<float>(radius);
+    const float x1 = static_cast<float>(cx) +
+                     gpu.circle_lut[static_cast<size_t>(j * 2 + 0)] *
+                         static_cast<float>(radius);
+    const float y1 = static_cast<float>(cy) +
+                     gpu.circle_lut[static_cast<size_t>(j * 2 + 1)] *
+                         static_cast<float>(radius);
     gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, color, true);
     gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, color, true);
   }
@@ -912,10 +1510,50 @@ static void gpu_push_text(GpuState& gpu,
   if (!text || !gpu.font.ready) {
     return;
   }
+  gpu_text_cache_init(gpu);
+  const char* text_ptr = text;
+  const bool use_cache =
+      (gpu.text_cache_limit > 0 && gpu.text_cache_max_entries > 0);
   const int clip_x0 = x0;
   const int clip_y0 = y0;
   const int clip_x1 = (x1 > x0) ? x1 : 0;
   const int clip_y1 = (y1 > y0) ? y1 : 0;
+
+  if (use_cache) {
+    CachedText* cached =
+        gpu_text_cache_find(gpu, text_ptr, x0, y0, x1, y1, color);
+    if (cached && !cached->vertices.empty()) {
+      const int first = static_cast<int>(gpu.vertices.size());
+      for (const auto& v : cached->vertices) {
+        gpu_push_vertex(gpu, v.x, v.y, v.z, v.u, v.v, v.color, true);
+      }
+      const int count = static_cast<int>(gpu.vertices.size()) - first;
+      if (count > 0) {
+        gpu_add_batch(gpu, first, count, &gpu.font_image, false, false);
+      }
+      cached->last_used = gpu.frame_index;
+      return;
+    }
+  }
+
+  std::vector<CachedTextVertex> cached_vertices;
+  if (use_cache) {
+    cached_vertices.reserve(strlen(text_ptr) * 6);
+  }
+
+  auto emit = [&](float x, float y, float u, float v) {
+    gpu_push_vertex(gpu, x, y, 0.0f, u, v, color, true);
+    if (use_cache) {
+      CachedTextVertex vtx{};
+      vtx.x = x;
+      vtx.y = y;
+      vtx.z = 0.0f;
+      vtx.u = u;
+      vtx.v = v;
+      vtx.color = color;
+      cached_vertices.push_back(vtx);
+    }
+  };
 
   float cursor_x = static_cast<float>(x0);
   float cursor_y = static_cast<float>(y0);
@@ -962,18 +1600,44 @@ static void gpu_push_text(GpuState& gpu,
       }
     }
 
-    gpu_push_vertex(gpu, gx0, gy0, 0.0f, u0, v0, color, true);
-    gpu_push_vertex(gpu, gx1, gy0, 0.0f, u1, v0, color, true);
-    gpu_push_vertex(gpu, gx1, gy1, 0.0f, u1, v1, color, true);
-    gpu_push_vertex(gpu, gx0, gy0, 0.0f, u0, v0, color, true);
-    gpu_push_vertex(gpu, gx1, gy1, 0.0f, u1, v1, color, true);
-    gpu_push_vertex(gpu, gx0, gy1, 0.0f, u0, v1, color, true);
+    emit(gx0, gy0, u0, v0);
+    emit(gx1, gy0, u1, v0);
+    emit(gx1, gy1, u1, v1);
+    emit(gx0, gy0, u0, v0);
+    emit(gx1, gy1, u1, v1);
+    emit(gx0, gy1, u0, v1);
     cursor_x += gpu.font.xadvance[idx];
   }
 
   const int count = static_cast<int>(gpu.vertices.size()) - first;
   if (count > 0) {
     gpu_add_batch(gpu, first, count, &gpu.font_image, false, false);
+  }
+
+  if (use_cache && !cached_vertices.empty()) {
+    CachedText entry{};
+    entry.text = text_ptr;
+    entry.x0 = x0;
+    entry.y0 = y0;
+    entry.x1 = x1;
+    entry.y1 = y1;
+    entry.color = color;
+    entry.font_w = gpu.font.width;
+    entry.font_h = gpu.font.height;
+    entry.font_ascent = gpu.font.ascent;
+    entry.font_line = gpu.font.line_advance;
+    entry.font_truetype = gpu.font.truetype;
+    entry.last_used = gpu.frame_index;
+    entry.vertices.swap(cached_vertices);
+    const size_t bytes = text_entry_bytes(entry);
+    if (bytes <= gpu.text_cache_limit) {
+      gpu_text_cache_evict(gpu, bytes);
+      if (gpu.text_cache_bytes + bytes <= gpu.text_cache_limit &&
+          static_cast<int>(gpu.text_cache.size()) < gpu.text_cache_max_entries) {
+        gpu.text_cache_bytes += bytes;
+        gpu.text_cache.push_back(std::move(entry));
+      }
+    }
   }
 }
 
@@ -2291,6 +2955,7 @@ static bool vk_draw_frame(GpuState& gpu) {
   if (!vk.ready) {
     return false;
   }
+  const bool allow_timestamps = !hybrid_secure_enabled();
   if (gpu.vertices.empty()) {
     return true;
   }
@@ -2315,7 +2980,7 @@ static bool vk_draw_frame(GpuState& gpu) {
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(vk.command_buffer, &begin);
 
-  if (vk.supports_timestamps && vk.query_pool) {
+  if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
     vkCmdResetQueryPool(vk.command_buffer, vk.query_pool, 0, 2);
     vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         vk.query_pool, 0);
@@ -2411,7 +3076,7 @@ static bool vk_draw_frame(GpuState& gpu) {
 
   vkCmdEndRenderPass(vk.command_buffer);
 
-  if (vk.supports_timestamps && vk.query_pool) {
+  if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
     vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                         vk.query_pool, 1);
   }
@@ -2439,7 +3104,7 @@ static bool vk_draw_frame(GpuState& gpu) {
   vkQueuePresentKHR(vk.queue, &present);
 
   double gpu_ms = 0.0;
-  if (vk.supports_timestamps && vk.query_pool) {
+  if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
     uint64_t timestamps[2] = {};
     if (vkGetQueryPoolResults(vk.device,
                               vk.query_pool,
@@ -2890,15 +3555,29 @@ static void gpu_refresh_size_and_rotation() {
   const int counter_rotation = env_int("DRAW_ENGINE_COUNTER_ROTATION", 1);
   int target_w = aw_w;
   int target_h = aw_h;
-  if (manual_mode == 0 && use_display_size != 0 && got_display && display_logical_w > 0 &&
-      display_logical_h > 0) {
+  const bool has_render_size = (g_engine.render_width > 0 && g_engine.render_height > 0);
+  const bool has_render_scale =
+      (g_engine.render_scale > 0.0f && g_engine.render_scale < 0.999f);
+  if (has_render_size) {
+    target_w = g_engine.render_width;
+    target_h = g_engine.render_height;
+  } else if (has_render_scale && got_display && display_logical_w > 0 && display_logical_h > 0) {
+    target_w = static_cast<int>(display_logical_w * g_engine.render_scale + 0.5f);
+    target_h = static_cast<int>(display_logical_h * g_engine.render_scale + 0.5f);
+  } else if (manual_mode == 0 && use_display_size != 0 && got_display && display_logical_w > 0 &&
+             display_logical_h > 0) {
     target_w = display_logical_w;
     target_h = display_logical_h;
   }
-  if (target_w > 0 && target_h > 0 && resize_on_rotation != 0) {
+  if (target_w < 1 || target_h < 1) {
+    target_w = aw_w;
+    target_h = aw_h;
+  }
+  const bool want_resize = has_render_size || has_render_scale || (resize_on_rotation != 0);
+  if (target_w > 0 && target_h > 0 && want_resize) {
     if (g_gpu.physical_width != target_w || g_gpu.physical_height != target_h) {
       bool resized = false;
-      if (manual_mode == 0 && g_engine.cpu_ctx) {
+      if (g_engine.cpu_ctx && (manual_mode == 0 || has_render_size || has_render_scale)) {
         if (midraw_resize(g_engine.cpu_ctx, target_w, target_h) == 0) {
           g_gpu.physical_width = target_w;
           g_gpu.physical_height = target_h;
@@ -2989,6 +3668,16 @@ static void gpu_refresh_size_and_rotation() {
     g_gpu.logical_width = g_gpu.physical_width;
     g_gpu.logical_height = g_gpu.physical_height;
   }
+  if (g_gpu.logical_width > 0 && g_gpu.logical_height > 0 &&
+      g_gpu.physical_width > 0 && g_gpu.physical_height > 0) {
+    g_gpu.scale_x = static_cast<float>(g_gpu.physical_width) /
+                    static_cast<float>(g_gpu.logical_width);
+    g_gpu.scale_y = static_cast<float>(g_gpu.physical_height) /
+                    static_cast<float>(g_gpu.logical_height);
+  } else {
+    g_gpu.scale_x = 1.0f;
+    g_gpu.scale_y = 1.0f;
+  }
   static int last_disp_w = 0;
   static int last_disp_h = 0;
   static int last_disp_rot = -1;
@@ -3076,13 +3765,17 @@ static int recreate_engine_surface() {
   const BackendType backend = g_engine.backend;
   const int rotation = g_engine.rotation;
   const bool rotation_forced = g_engine.rotation_forced;
+  const bool hybrid = g_engine.hybrid;
 
   midraw_shutdown(g_engine.cpu_ctx);
   g_engine.cpu_ctx = nullptr;
+  if (g_engine.overlay_ctx) {
+    midraw_shutdown(g_engine.overlay_ctx);
+    g_engine.overlay_ctx = nullptr;
+  }
   gpu_shutdown(g_gpu);
 
   MidrawConfig cfg{};
-  cfg.surface_name = g_engine.surface_name;
   cfg.rotation = rotation;
   cfg.width = 0;
   cfg.height = 0;
@@ -3090,9 +3783,29 @@ static int recreate_engine_surface() {
   cfg.font_size = env_int("MIDRAW_FONT_SIZE", 0);
   cfg.atlas_size = env_int("MIDRAW_ATLAS_SIZE", 512);
 
+  const char* gpu_surface = g_engine.surface_name;
+  char gpu_name[256];
+  char cpu_name[256];
+  if (hybrid) {
+    snprintf(gpu_name, sizeof(gpu_name), "%s_gpu", g_engine.surface_name);
+    gpu_surface = gpu_name;
+  }
+  cfg.surface_name = gpu_surface;
   if (midraw_init(&g_engine.cpu_ctx, &cfg) != 0) {
     fprintf(stderr, "draw_engine: recreate midraw_init failed\n");
     return -1;
+  }
+  if (hybrid) {
+    snprintf(cpu_name, sizeof(cpu_name), "%s_cpu", g_engine.surface_name);
+    cfg.surface_name = cpu_name;
+    if (midraw_init(&g_engine.overlay_ctx, &cfg) != 0) {
+      fprintf(stderr, "draw_engine: recreate overlay midraw_init failed\n");
+      g_engine.overlay_ctx = nullptr;
+      g_engine.hybrid = false;
+    } else {
+      midraw_set_layer(g_engine.cpu_ctx, INT_MAX - 1);
+      midraw_set_layer(g_engine.overlay_ctx, INT_MAX);
+    }
   }
   g_engine.rotation_forced = rotation_forced;
   g_engine.rotation = rotation;
@@ -3140,6 +3853,19 @@ static int recreate_engine_surface() {
   } else {
     g_engine.backend = BACKEND_CPU;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    maybe_apply_default_gpu_fps();
+  }
+  if (g_engine.backend == BACKEND_CPU && g_engine.overlay_ctx) {
+    midraw_shutdown(g_engine.overlay_ctx);
+    g_engine.overlay_ctx = nullptr;
+    g_engine.hybrid = false;
+  }
+  if (g_engine.auto_quality != 0) {
+    apply_quality_level(g_engine.quality_level);
+  } else {
+    apply_render_target();
+  }
   return 0;
 }
 
@@ -3179,6 +3905,14 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
   gpu.physical_width = width;
   gpu.physical_height = height;
   gpu.rotation = rotation;
+  gpu.scale_x = 1.0f;
+  gpu.scale_y = 1.0f;
+  gpu.circle_segments = 0;
+  gpu.circle_lut.clear();
+  gpu.text_cache.clear();
+  gpu.text_cache_bytes = 0;
+  gpu.text_cache_limit = 0;
+  gpu.text_cache_max_entries = 0;
 
   if (rotation == 90 || rotation == 270) {
     gpu.physical_width = height;
@@ -3187,6 +3921,7 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
 
   init_white_image(gpu);
   init_gpu_font(gpu);
+  gpu_text_cache_init(gpu);
 
   bool ok = false;
   if (backend == BACKEND_VULKAN) {
@@ -3250,37 +3985,318 @@ static void gpu_shutdown(GpuState& gpu) {
     free(gpu.white_image.rgba);
     gpu.white_image.rgba = nullptr;
   }
+  gpu.text_cache.clear();
+  gpu.text_cache_bytes = 0;
+  gpu.text_cache_limit = 0;
+  gpu.text_cache_max_entries = 0;
+  gpu.circle_lut.clear();
+  gpu.circle_segments = 0;
   memset(&gpu, 0, sizeof(gpu));
 }
 
 int init_draw_engine(int mode) {
   memset(&g_engine, 0, sizeof(g_engine));
+  if (mode < DRAW_ENGINE_MODE_AUTO || mode > DRAW_ENGINE_MODE_HYBRID) {
+    mode = DRAW_ENGINE_MODE_AUTO;
+  }
   g_engine.mode = mode;
   g_engine.backend = BACKEND_CPU;
+  g_engine.render_scale_manual = env_present("DRAW_ENGINE_RENDER_SCALE");
+  g_engine.render_scale =
+      g_engine.render_scale_manual ? env_float("DRAW_ENGINE_RENDER_SCALE", 1.0f) : 1.0f;
+  if (g_engine.render_scale < 0.25f) {
+    g_engine.render_scale = 0.25f;
+  } else if (g_engine.render_scale > 1.0f) {
+    g_engine.render_scale = 1.0f;
+  }
+  g_engine.render_size_manual =
+      env_present("DRAW_ENGINE_RENDER_WIDTH") || env_present("DRAW_ENGINE_RENDER_HEIGHT");
+  g_engine.render_width = g_engine.render_size_manual ? env_int("DRAW_ENGINE_RENDER_WIDTH", 0) : 0;
+  g_engine.render_height =
+      g_engine.render_size_manual ? env_int("DRAW_ENGINE_RENDER_HEIGHT", 0) : 0;
+  g_engine.circle_segments_manual = env_present("DRAW_ENGINE_CIRCLE_SEGMENTS");
+  g_engine.circle_segments =
+      g_engine.circle_segments_manual ? env_int("DRAW_ENGINE_CIRCLE_SEGMENTS", 64) : 64;
+  if (g_engine.circle_segments < 8) {
+    g_engine.circle_segments = 8;
+  }
+  const bool fps_env_present = env_present("DRAW_ENGINE_FPS");
+  int fps_env = env_int("DRAW_ENGINE_FPS", 0);
+  if (fps_env > 1000) {
+    fps_env = 1000;
+  }
+  if (fps_env_present && fps_env > 0) {
+    g_engine.target_fps = fps_env;
+    g_engine.fps_manual = true;
+  } else {
+    g_engine.target_fps = 0;
+    g_engine.fps_manual = false;
+  }
+  g_engine.auto_fps = 0.0f;
+  g_engine.avg_draw_ns = 0.0;
+  g_engine.frame_start_ns = 0;
+  init_hybrid_policy();
+  g_engine.auto_quality = env_int("DRAW_ENGINE_AUTO_QUALITY", 0);
+  g_engine.quality_min = env_int("DRAW_ENGINE_QUALITY_MIN", 0);
+  g_engine.quality_max = env_int("DRAW_ENGINE_QUALITY_MAX", 3);
+  if (g_engine.quality_min < 0) {
+    g_engine.quality_min = 0;
+  }
+  if (g_engine.quality_max > 3) {
+    g_engine.quality_max = 3;
+  }
+  if (g_engine.quality_max < g_engine.quality_min) {
+    g_engine.quality_max = g_engine.quality_min;
+  }
+  g_engine.quality_level = env_int("DRAW_ENGINE_QUALITY_LEVEL", g_engine.quality_max);
+  if (g_engine.quality_level < g_engine.quality_min) {
+    g_engine.quality_level = g_engine.quality_min;
+  }
+  if (g_engine.quality_level > g_engine.quality_max) {
+    g_engine.quality_level = g_engine.quality_max;
+  }
+  g_engine.last_quality_ns = 0;
 
-  if (mode == 1) {
-    if (DRAW_ENGINE_HAS_VULKAN && has_library("libvulkan.so")) {
-      g_engine.backend = BACKEND_VULKAN;
-    } else if (DRAW_ENGINE_HAS_GLES &&
-               (has_library("libGLESv3.so") || has_library("libGLESv2.so"))) {
-      g_engine.backend = BACKEND_GLES;
+  if (mode == DRAW_ENGINE_MODE_CPU) {
+    g_engine.backend = BACKEND_CPU;
+  } else {
+    const BackendType chosen = choose_best_backend();
+    if (mode == DRAW_ENGINE_MODE_GPU) {
+      if (chosen == BACKEND_CPU) {
+        return DRAW_ENGINE_ENOBACKEND;
+      }
+      g_engine.backend = chosen;
+    } else if (mode == DRAW_ENGINE_MODE_HYBRID) {
+      if (chosen != BACKEND_CPU) {
+        g_engine.backend = chosen;
+        g_engine.hybrid = true;
+      } else {
+        g_engine.backend = BACKEND_CPU;
+        g_engine.hybrid = false;
+      }
     } else {
-      g_engine.backend = BACKEND_CPU;
+      g_engine.backend = chosen;
     }
   }
 
   g_engine.initialized = true;
-  return 0;
+  return DRAW_ENGINE_OK;
+}
+
+int init_engine_mode(int mode) {
+  return init_draw_engine(mode);
+}
+
+void draw_engine_set_fps(int fps) {
+  if (fps <= 0) {
+    g_engine.target_fps = 0;
+    g_engine.fps_manual = false;
+    if (g_engine.backend != BACKEND_CPU && !g_engine.hybrid) {
+      maybe_apply_default_gpu_fps();
+    }
+    return;
+  }
+  if (fps > 1000) {
+    fps = 1000;
+  }
+  g_engine.target_fps = fps;
+  g_engine.fps_manual = true;
+}
+
+void draw_engine_set_hybrid_cpu_mask(uint32_t mask) {
+  g_engine.hybrid_cpu_mask = mask;
+}
+
+void draw_engine_set_sensitive(int enable) {
+  g_engine.sensitive = (enable != 0);
+}
+
+bool get_mode_is_need_set_fps(void) {
+  if (!g_engine.initialized) {
+    return false;
+  }
+  if (g_engine.backend == BACKEND_CPU || g_engine.hybrid) {
+    return false;
+  }
+  return true;
+}
+
+int draw_engine_set_option(int option, int value) {
+  switch (option) {
+    case DRAW_ENGINE_OPT_RENDER_SCALE_X1000: {
+      if (value <= 0) {
+        g_engine.render_scale = 1.0f;
+        g_engine.render_scale_manual = false;
+        g_engine.render_width = 0;
+        g_engine.render_height = 0;
+        g_engine.render_size_manual = false;
+        if (g_engine.cpu_ctx) {
+          apply_render_target();
+        }
+        return DRAW_ENGINE_OK;
+      }
+      const float scale = static_cast<float>(value) / 1000.0f;
+      return draw_set_render_scale(scale);
+    }
+    case DRAW_ENGINE_OPT_RENDER_WIDTH: {
+      g_engine.render_width = value;
+      g_engine.render_size_manual = (value > 0 || g_engine.render_height > 0);
+      if (g_engine.render_width > 0 && g_engine.render_height > 0) {
+        draw_set_render_size(g_engine.render_width, g_engine.render_height);
+      } else if (g_engine.cpu_ctx) {
+        apply_render_target();
+      }
+      return DRAW_ENGINE_OK;
+    }
+    case DRAW_ENGINE_OPT_RENDER_HEIGHT: {
+      g_engine.render_height = value;
+      g_engine.render_size_manual = (value > 0 || g_engine.render_width > 0);
+      if (g_engine.render_width > 0 && g_engine.render_height > 0) {
+        draw_set_render_size(g_engine.render_width, g_engine.render_height);
+      } else if (g_engine.cpu_ctx) {
+        apply_render_target();
+      }
+      return DRAW_ENGINE_OK;
+    }
+    case DRAW_ENGINE_OPT_TARGET_FPS:
+      draw_engine_set_fps(value);
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_HYBRID_CPU_MASK:
+      draw_engine_set_hybrid_cpu_mask(static_cast<uint32_t>(value));
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_HYBRID_SENSITIVE_ONLY:
+      g_engine.hybrid_sensitive_only = (value != 0);
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_SENSITIVE:
+      draw_engine_set_sensitive(value);
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_CIRCLE_SEGMENTS:
+      if (value <= 0) {
+        g_engine.circle_segments_manual = false;
+        g_engine.circle_segments = 64;
+      } else {
+        if (value < 8) {
+          value = 8;
+        }
+        g_engine.circle_segments = value;
+        g_engine.circle_segments_manual = true;
+      }
+      g_gpu.circle_segments = 0;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_AUTO_QUALITY:
+      g_engine.auto_quality = value != 0 ? 1 : 0;
+      if (g_engine.auto_quality != 0) {
+        apply_quality_level(g_engine.quality_level);
+      }
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_QUALITY_LEVEL:
+      if (value < g_engine.quality_min) {
+        value = g_engine.quality_min;
+      }
+      if (value > g_engine.quality_max) {
+        value = g_engine.quality_max;
+      }
+      g_engine.quality_level = value;
+      apply_quality_level(g_engine.quality_level);
+      return DRAW_ENGINE_OK;
+    default:
+      break;
+  }
+  return DRAW_ENGINE_EINVAL;
+}
+
+int draw_engine_get_option(int option, int* out_value) {
+  if (!out_value) {
+    return DRAW_ENGINE_EINVAL;
+  }
+  switch (option) {
+    case DRAW_ENGINE_OPT_RENDER_SCALE_X1000:
+      *out_value = static_cast<int>(g_engine.render_scale * 1000.0f + 0.5f);
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_RENDER_WIDTH:
+      *out_value = g_engine.render_width;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_RENDER_HEIGHT:
+      *out_value = g_engine.render_height;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_TARGET_FPS:
+      *out_value = g_engine.target_fps;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_HYBRID_CPU_MASK:
+      *out_value = static_cast<int>(g_engine.hybrid_cpu_mask);
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_HYBRID_SENSITIVE_ONLY:
+      *out_value = g_engine.hybrid_sensitive_only ? 1 : 0;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_SENSITIVE:
+      *out_value = g_engine.sensitive ? 1 : 0;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_CIRCLE_SEGMENTS:
+      *out_value = g_engine.circle_segments;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_AUTO_QUALITY:
+      *out_value = g_engine.auto_quality;
+      return DRAW_ENGINE_OK;
+    case DRAW_ENGINE_OPT_QUALITY_LEVEL:
+      *out_value = g_engine.quality_level;
+      return DRAW_ENGINE_OK;
+    default:
+      break;
+  }
+  return DRAW_ENGINE_EINVAL;
+}
+
+int draw_engine_get_capabilities(DrawEngineCaps* out_caps) {
+  if (!out_caps) {
+    return DRAW_ENGINE_EINVAL;
+  }
+  memset(out_caps, 0, sizeof(*out_caps));
+  out_caps->api_version = DRAW_ENGINE_API_VERSION;
+  out_caps->has_vulkan = (DRAW_ENGINE_HAS_VULKAN && has_library("libvulkan.so")) ? 1 : 0;
+  out_caps->has_gles = (DRAW_ENGINE_HAS_GLES &&
+                        (has_library("libGLESv3.so") || has_library("libGLESv2.so")))
+                           ? 1
+                           : 0;
+  out_caps->backend = g_engine.backend;
+  out_caps->mode = g_engine.mode;
+  out_caps->hybrid = g_engine.hybrid ? 1 : 0;
+  out_caps->render_scale_x1000 =
+      static_cast<int>(g_engine.render_scale * 1000.0f + 0.5f);
+  out_caps->render_width = g_engine.render_width;
+  out_caps->render_height = g_engine.render_height;
+  out_caps->circle_segments = g_engine.circle_segments;
+  out_caps->supports_wide_lines = 0;
+  out_caps->supports_anisotropy = 0;
+  out_caps->max_anisotropy = 0.0f;
+  out_caps->max_msaa = 1;
+  if (g_engine.backend == BACKEND_VULKAN && g_gpu.vk.ready) {
+    out_caps->supports_wide_lines = g_gpu.vk.supports_wide_lines ? 1 : 0;
+    out_caps->supports_anisotropy = g_gpu.vk.supports_anisotropy ? 1 : 0;
+    out_caps->max_anisotropy = g_gpu.vk.max_anisotropy;
+    out_caps->max_msaa = sample_count_to_int(g_gpu.vk.msaa_samples);
+  } else if (g_engine.backend == BACKEND_GLES && g_gpu.gl.ready) {
+    out_caps->supports_anisotropy = g_gpu.gl.supports_anisotropy ? 1 : 0;
+    out_caps->max_anisotropy = g_gpu.gl.max_anisotropy;
+    out_caps->max_msaa = (g_gpu.gl.samples > 0) ? g_gpu.gl.samples : 1;
+  }
+  return DRAW_ENGINE_OK;
 }
 
 int init_draw_windows(const char* name, int randomize_name) {
   if (!g_engine.initialized) {
-    init_draw_engine(0);
+    const int init_result = init_draw_engine(DRAW_ENGINE_MODE_AUTO);
+    if (init_result != DRAW_ENGINE_OK) {
+      return init_result;
+    }
   }
 
   if (g_engine.cpu_ctx) {
     midraw_shutdown(g_engine.cpu_ctx);
     g_engine.cpu_ctx = nullptr;
+  }
+  if (g_engine.overlay_ctx) {
+    midraw_shutdown(g_engine.overlay_ctx);
+    g_engine.overlay_ctx = nullptr;
   }
   if (g_engine.surface_name) {
     free(g_engine.surface_name);
@@ -3291,7 +4307,7 @@ int init_draw_windows(const char* name, int randomize_name) {
   const size_t len = strlen(base);
   g_engine.surface_name = static_cast<char*>(calloc(len + 1, 1));
   if (!g_engine.surface_name) {
-    return -1;
+    return DRAW_ENGINE_EFAILED;
   }
   memcpy(g_engine.surface_name, base, len);
   if (randomize_name) {
@@ -3308,7 +4324,6 @@ int init_draw_windows(const char* name, int randomize_name) {
   }
 
   MidrawConfig cfg{};
-  cfg.surface_name = g_engine.surface_name;
   cfg.rotation = g_engine.rotation;
   cfg.width = 0;
   cfg.height = 0;
@@ -3316,10 +4331,45 @@ int init_draw_windows(const char* name, int randomize_name) {
   cfg.font_size = env_int("MIDRAW_FONT_SIZE", 0);
   cfg.atlas_size = env_int("MIDRAW_ATLAS_SIZE", 512);
 
+  const bool want_gpu = (g_engine.backend != BACKEND_CPU);
+  if (!want_gpu) {
+    cfg.surface_name = g_engine.surface_name;
+    if (midraw_init(&g_engine.cpu_ctx, &cfg) != 0) {
+      fprintf(stderr, "draw_engine: midraw_init failed\n");
+      return DRAW_ENGINE_EFAILED;
+    }
+    gpu_shutdown(g_gpu);
+    apply_render_target();
+    return DRAW_ENGINE_OK;
+  }
+
+  const char* gpu_surface = g_engine.surface_name;
+  char gpu_name[256];
+  char cpu_name[256];
+  if (g_engine.hybrid) {
+    snprintf(gpu_name, sizeof(gpu_name), "%s_gpu", g_engine.surface_name);
+    gpu_surface = gpu_name;
+  }
+
+  cfg.surface_name = gpu_surface;
   if (midraw_init(&g_engine.cpu_ctx, &cfg) != 0) {
     fprintf(stderr, "draw_engine: midraw_init failed\n");
-    return -1;
+    return DRAW_ENGINE_EFAILED;
   }
+
+  if (g_engine.hybrid) {
+    snprintf(cpu_name, sizeof(cpu_name), "%s_cpu", g_engine.surface_name);
+    cfg.surface_name = cpu_name;
+    if (midraw_init(&g_engine.overlay_ctx, &cfg) != 0) {
+      fprintf(stderr, "draw_engine: overlay midraw_init failed\n");
+      g_engine.overlay_ctx = nullptr;
+      g_engine.hybrid = false;
+    } else {
+      midraw_set_layer(g_engine.cpu_ctx, INT_MAX - 1);
+      midraw_set_layer(g_engine.overlay_ctx, INT_MAX);
+    }
+  }
+
   if (g_engine.backend != BACKEND_CPU) {
     ANativeWindow* window =
         reinterpret_cast<ANativeWindow*>(midraw_get_native_window(g_engine.cpu_ctx));
@@ -3359,16 +4409,43 @@ int init_draw_windows(const char* name, int randomize_name) {
               g_gpu.physical_height,
               g_engine.rotation);
     }
-  } else {
-    gpu_shutdown(g_gpu);
   }
-  return 0;
+
+  if (g_engine.backend != BACKEND_CPU) {
+    maybe_apply_default_gpu_fps();
+  }
+
+  if (g_engine.backend == BACKEND_CPU) {
+    g_engine.hybrid = false;
+    gpu_shutdown(g_gpu);
+    if (g_engine.overlay_ctx) {
+      midraw_shutdown(g_engine.overlay_ctx);
+      g_engine.overlay_ctx = nullptr;
+    }
+    if (g_engine.mode == DRAW_ENGINE_MODE_GPU) {
+      if (g_engine.cpu_ctx) {
+        midraw_shutdown(g_engine.cpu_ctx);
+        g_engine.cpu_ctx = nullptr;
+      }
+      return DRAW_ENGINE_ENOBACKEND;
+    }
+  }
+  if (g_engine.auto_quality != 0) {
+    apply_quality_level(g_engine.quality_level);
+  } else {
+    apply_render_target();
+  }
+  return DRAW_ENGINE_OK;
 }
 
 void shutdown_draw_engine(void) {
   if (g_engine.cpu_ctx) {
     midraw_shutdown(g_engine.cpu_ctx);
     g_engine.cpu_ctx = nullptr;
+  }
+  if (g_engine.overlay_ctx) {
+    midraw_shutdown(g_engine.overlay_ctx);
+    g_engine.overlay_ctx = nullptr;
   }
   gpu_shutdown(g_gpu);
   if (g_engine.surface_name) {
@@ -3380,22 +4457,29 @@ void shutdown_draw_engine(void) {
 
 int draw_begin_frame(void) {
   if (!g_engine.cpu_ctx) {
-    return -1;
+    return DRAW_ENGINE_ENOTINIT;
   }
   if (g_engine.in_frame) {
-    return 0;
+    return DRAW_ENGINE_OK;
   }
   maybe_recreate_on_rotation();
   if (g_engine.backend == BACKEND_CPU) {
-    if (midraw_lock(g_engine.cpu_ctx) != 0) {
-      return -1;
+    MidrawContext* ctx = active_cpu_ctx();
+    if (!ctx || midraw_lock(ctx) != 0) {
+      return DRAW_ENGINE_EFAILED;
     }
   } else {
     gpu_refresh_size_and_rotation();
     gpu_reset_frame(g_gpu);
+    if (g_engine.hybrid && g_engine.overlay_ctx) {
+      if (midraw_lock(g_engine.overlay_ctx) != 0) {
+        return DRAW_ENGINE_EFAILED;
+      }
+    }
   }
+  g_engine.frame_start_ns = now_ns();
   g_engine.in_frame = true;
-  return 0;
+  return DRAW_ENGINE_OK;
 }
 
 void draw_end_frame(void) {
@@ -3403,11 +4487,37 @@ void draw_end_frame(void) {
     return;
   }
   if (g_engine.backend == BACKEND_CPU) {
-    midraw_unlock_post(g_engine.cpu_ctx);
+    MidrawContext* ctx = active_cpu_ctx();
+    if (ctx) {
+      midraw_unlock_post(ctx);
+    }
   } else if (g_engine.backend == BACKEND_VULKAN) {
     vk_draw_frame(g_gpu);
   } else if (g_engine.backend == BACKEND_GLES) {
     gl_draw_frame(g_gpu);
+  }
+  if (g_engine.backend != BACKEND_CPU && g_engine.hybrid && g_engine.overlay_ctx) {
+    midraw_unlock_post(g_engine.overlay_ctx);
+  }
+  if (g_engine.frame_start_ns != 0) {
+    const uint64_t end_ns = now_ns();
+    const uint64_t draw_ns =
+        (end_ns > g_engine.frame_start_ns) ? (end_ns - g_engine.frame_start_ns) : 0;
+    const bool cpu_like = (g_engine.backend == BACKEND_CPU) || g_engine.hybrid;
+    if (!cpu_like) {
+      maybe_adjust_quality(draw_ns);
+    }
+    float target_fps = 0.0f;
+    if (cpu_like) {
+      target_fps = update_auto_fps(draw_ns);
+    } else if (g_engine.target_fps > 0) {
+      target_fps = static_cast<float>(g_engine.target_fps);
+    }
+    const uint64_t target_ns = fps_to_frame_ns(target_fps);
+    if (target_ns > 0 && draw_ns < target_ns) {
+      const uint64_t sleep_ns = target_ns - draw_ns;
+      usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+    }
   }
   g_engine.in_frame = false;
 }
@@ -3419,7 +4529,8 @@ int draw_screen_width(void) {
   if (g_engine.backend != BACKEND_CPU) {
     return g_gpu.logical_width;
   }
-  return midraw_logical_width(g_engine.cpu_ctx);
+  MidrawContext* ctx = active_cpu_ctx();
+  return ctx ? midraw_logical_width(ctx) : 0;
 }
 
 int draw_screen_height(void) {
@@ -3429,7 +4540,58 @@ int draw_screen_height(void) {
   if (g_engine.backend != BACKEND_CPU) {
     return g_gpu.logical_height;
   }
-  return midraw_logical_height(g_engine.cpu_ctx);
+  MidrawContext* ctx = active_cpu_ctx();
+  return ctx ? midraw_logical_height(ctx) : 0;
+}
+
+int draw_set_render_scale(float scale) {
+  if (scale <= 0.0f) {
+    scale = 1.0f;
+  }
+  if (scale < 0.25f) {
+    scale = 0.25f;
+  } else if (scale > 1.0f) {
+    scale = 1.0f;
+  }
+  g_engine.render_scale = scale;
+  g_engine.render_scale_manual = true;
+  g_engine.render_width = 0;
+  g_engine.render_height = 0;
+  g_engine.render_size_manual = false;
+  if (g_engine.cpu_ctx) {
+    apply_render_target();
+    if (g_engine.backend != BACKEND_CPU) {
+      gpu_refresh_size_and_rotation();
+    }
+  }
+  return 0;
+}
+
+int draw_set_render_size(int width, int height) {
+  if (width <= 0 || height <= 0) {
+    g_engine.render_width = 0;
+    g_engine.render_height = 0;
+    g_engine.render_size_manual = false;
+    g_engine.render_scale_manual = false;
+    if (g_engine.cpu_ctx) {
+      apply_render_target();
+      if (g_engine.backend != BACKEND_CPU) {
+        gpu_refresh_size_and_rotation();
+      }
+    }
+    return 0;
+  }
+  g_engine.render_width = width;
+  g_engine.render_height = height;
+  g_engine.render_scale = 1.0f;
+  g_engine.render_size_manual = true;
+  if (g_engine.cpu_ctx) {
+    apply_render_target();
+    if (g_engine.backend != BACKEND_CPU) {
+      gpu_refresh_size_and_rotation();
+    }
+  }
+  return 0;
 }
 
 void draw_text(const char* text, int x0, int y0, int x1, int y1, uint32_t color) {
@@ -3441,13 +4603,29 @@ void draw_text(const char* text, int x0, int y0, int x1, int y1, uint32_t color)
     return;
   }
   if (g_engine.backend != BACKEND_CPU) {
+    if (hybrid_use_cpu(GpuCmdType::Text)) {
+      MidrawContext* ctx = active_cpu_ctx();
+      if (!ctx) {
+        return;
+      }
+      if (x1 > x0 && y1 > y0) {
+        midraw_draw_text_rect(ctx, text, x0, y0, x1, y1, color);
+      } else {
+        midraw_draw_text(ctx, text, x0, y0, color);
+      }
+      return;
+    }
     gpu_push_text(g_gpu, text, x0, y0, x1, y1, color);
     return;
   }
+  MidrawContext* ctx = active_cpu_ctx();
+  if (!ctx) {
+    return;
+  }
   if (x1 > x0 && y1 > y0) {
-    midraw_draw_text_rect(g_engine.cpu_ctx, text, x0, y0, x1, y1, color);
+    midraw_draw_text_rect(ctx, text, x0, y0, x1, y1, color);
   } else {
-    midraw_draw_text(g_engine.cpu_ctx, text, x0, y0, color);
+    midraw_draw_text(ctx, text, x0, y0, color);
   }
 }
 
@@ -3460,10 +4638,22 @@ void draw_rect(int x, int y, int w, int h, int filled, uint32_t color) {
     return;
   }
   if (g_engine.backend != BACKEND_CPU) {
+    if (hybrid_use_cpu(GpuCmdType::Rect)) {
+      MidrawContext* ctx = active_cpu_ctx();
+      if (!ctx) {
+        return;
+      }
+      midraw_draw_rect(ctx, x, y, w, h, filled, color);
+      return;
+    }
     gpu_push_rect(g_gpu, x, y, w, h, color, filled != 0);
     return;
   }
-  midraw_draw_rect(g_engine.cpu_ctx, x, y, w, h, filled, color);
+  MidrawContext* ctx = active_cpu_ctx();
+  if (!ctx) {
+    return;
+  }
+  midraw_draw_rect(ctx, x, y, w, h, filled, color);
 }
 
 void draw_circle(int cx, int cy, int radius, uint32_t color) {
@@ -3475,10 +4665,22 @@ void draw_circle(int cx, int cy, int radius, uint32_t color) {
     return;
   }
   if (g_engine.backend != BACKEND_CPU) {
+    if (hybrid_use_cpu(GpuCmdType::Circle)) {
+      MidrawContext* ctx = active_cpu_ctx();
+      if (!ctx) {
+        return;
+      }
+      midraw_draw_circle(ctx, cx, cy, radius, color);
+      return;
+    }
     gpu_push_circle(g_gpu, cx, cy, radius, color);
     return;
   }
-  midraw_draw_circle(g_engine.cpu_ctx, cx, cy, radius, color);
+  MidrawContext* ctx = active_cpu_ctx();
+  if (!ctx) {
+    return;
+  }
+  midraw_draw_circle(ctx, cx, cy, radius, color);
 }
 
 void draw_line(int x1, int y1, int x2, int y2, uint32_t color) {
@@ -3490,10 +4692,22 @@ void draw_line(int x1, int y1, int x2, int y2, uint32_t color) {
     return;
   }
   if (g_engine.backend != BACKEND_CPU) {
+    if (hybrid_use_cpu(GpuCmdType::Line)) {
+      MidrawContext* ctx = active_cpu_ctx();
+      if (!ctx) {
+        return;
+      }
+      midraw_draw_line(ctx, x1, y1, x2, y2, color);
+      return;
+    }
     gpu_push_line(g_gpu, x1, y1, x2, y2, color);
     return;
   }
-  midraw_draw_line(g_engine.cpu_ctx, x1, y1, x2, y2, color);
+  MidrawContext* ctx = active_cpu_ctx();
+  if (!ctx) {
+    return;
+  }
+  midraw_draw_line(ctx, x1, y1, x2, y2, color);
 }
 
 DrawImage* draw_load_image_from_memory(const unsigned char* data, int size) {
@@ -3566,12 +4780,24 @@ void draw_image(const DrawImage* image, int x, int y) {
     return;
   }
   if (g_engine.backend != BACKEND_CPU) {
+    if (hybrid_use_cpu(GpuCmdType::Image)) {
+      MidrawContext* ctx = active_cpu_ctx();
+      if (!ctx) {
+        return;
+      }
+      midraw_draw_image(ctx, image->pixels, image->width, image->height, x, y);
+      return;
+    }
     DrawImage* mutable_image = const_cast<DrawImage*>(image);
     gpu_prepare_texture(g_gpu, mutable_image);
     gpu_push_image(g_gpu, image, x, y);
     return;
   }
-  midraw_draw_image(g_engine.cpu_ctx, image->pixels, image->width, image->height, x, y);
+  MidrawContext* ctx = active_cpu_ctx();
+  if (!ctx) {
+    return;
+  }
+  midraw_draw_image(ctx, image->pixels, image->width, image->height, x, y);
 }
 
 extern "C" void draw_engine_demo_scene(uint64_t frame) {

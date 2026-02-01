@@ -12,6 +12,15 @@
 extern "C" {
 #endif
 
+#define MIDRAW_API_VERSION 1
+
+enum {
+  MIDRAW_OK = 0,
+  MIDRAW_EINVAL = -1,
+  MIDRAW_ENOTINIT = -2,
+  MIDRAW_EFAILED = -3
+};
+
 typedef struct MidrawContext MidrawContext;
 
 typedef struct MidrawConfig {
@@ -34,6 +43,7 @@ MIDRAW_API int midraw_logical_width(const MidrawContext* ctx);
 MIDRAW_API int midraw_logical_height(const MidrawContext* ctx);
 MIDRAW_API int midraw_resize(MidrawContext* ctx, int width, int height);
 MIDRAW_API void* midraw_get_native_window(MidrawContext* ctx);
+MIDRAW_API int midraw_set_layer(MidrawContext* ctx, int32_t layer);
 MIDRAW_API int midraw_display_rotation(MidrawContext* ctx,
                                        int* out_rotation,
                                        int* out_width,
