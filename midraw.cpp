@@ -94,6 +94,7 @@ struct MidrawContext {
   bool defer_lock = true;
   bool recording = false;
   bool lock_size = false;
+  bool ahb_only = false;
   DrawCommand command_buffer[kCommandCapacity]{};
   size_t command_head = 0;
   size_t command_count = 0;
@@ -2461,6 +2462,7 @@ static void configure_fastpath(MidrawContext& ctx) {
   ctx.render.direct_graphic = nullptr;
   ctx.render.direct_prime_attempted = false;
   ctx.render.ahb_surface = nullptr;
+  ctx.ahb_only = env_int("MIDRAW_AHB_ONLY", 1) != 0;
 
   if (env_int("MIDRAW_FASTPATH", 1) == 0) {
     return;
@@ -2470,6 +2472,7 @@ static void configure_fastpath(MidrawContext& ctx) {
   const bool allow_direct =
       force_direct || env_truthy("MIDRAW_USE_DIRECT") || env_truthy("MIDRAW_ALLOW_DIRECT");
   const bool force_ahb = env_truthy("MIDRAW_USE_AHB");
+  const bool require_ahb = ctx.ahb_only || force_ahb;
   const int sdk = read_sdk_version();
 
   int target_w = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
@@ -2498,12 +2501,15 @@ static void configure_fastpath(MidrawContext& ctx) {
             reinterpret_cast<void*>(ctx.symbols.GraphicBuffer_unlock));
   }
 
-  if (force_ahb) {
+  if (require_ahb) {
     if (can_use_ahb(ctx) && setup_ahb_buffer(ctx, target_w, target_h)) {
-      fprintf(stderr, "midraw: using AHB path (forced)\n");
+      fprintf(stderr, "midraw: using AHB path (%s)\n", ctx.ahb_only ? "AHB-only" : "forced");
       return;
     }
     fprintf(stderr, "midraw: AHB path unavailable\n");
+    if (ctx.ahb_only) {
+      return;
+    }
   }
 
   if (sdk >= 34) {
@@ -2609,6 +2615,17 @@ static bool lock_surface_direct_buffer(MidrawContext& ctx) {
 }
 
 static bool lock_buffer(MidrawContext& ctx) {
+  if (ctx.ahb_only && !ctx.render.use_ahb) {
+    if (lock_ahb_buffer(ctx)) {
+      return true;
+    }
+    static bool warned = false;
+    if (!warned) {
+      fprintf(stderr, "midraw: AHB-only enabled, AHB lock failed\n");
+      warned = true;
+    }
+    return false;
+  }
   if (ctx.render.use_ahb) {
     if (lock_ahb_buffer(ctx)) {
       return true;
