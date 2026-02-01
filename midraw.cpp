@@ -385,6 +385,18 @@ static void* load_symbol_candidates(void* handle,
   return nullptr;
 }
 
+static void* load_symbol_candidates_dual(void* primary,
+                                         void* fallback,
+                                         const char* logical_name,
+                                         const char* const* candidates,
+                                         size_t count) {
+  void* sym = load_symbol_candidates(primary, logical_name, candidates, count);
+  if (!sym && fallback && fallback != primary) {
+    sym = load_symbol_candidates(fallback, logical_name, candidates, count);
+  }
+  return sym;
+}
+
 static void* load_symbol_any(const char* name, void* lib1, void* lib2, void* lib3) {
   if (!name || !name[0]) {
     return nullptr;
@@ -439,48 +451,60 @@ static bool init_symbols(AndroidSymbols* symbols) {
   }
 
   symbols->ASurfaceControl_create = reinterpret_cast<PFN_ASurfaceControl_create>(
-      load_symbol_candidates(symbols->libgui, "ASurfaceControl_create",
-                             kCandidates_ASurfaceControl_create,
-                             sizeof(kCandidates_ASurfaceControl_create) /
-                                 sizeof(kCandidates_ASurfaceControl_create[0])));
+      load_symbol_candidates_dual(symbols->libandroid, symbols->libgui, "ASurfaceControl_create",
+                                  kCandidates_ASurfaceControl_create,
+                                  sizeof(kCandidates_ASurfaceControl_create) /
+                                      sizeof(kCandidates_ASurfaceControl_create[0])));
   static const char* kCandidates_ASurfaceControl_createFromWindow[] = {
       "ASurfaceControl_createFromWindow"};
   symbols->ASurfaceControl_createFromWindow =
       reinterpret_cast<PFN_ASurfaceControl_createFromWindow>(
-          load_symbol_candidates(symbols->libgui, "ASurfaceControl_createFromWindow",
-                                 kCandidates_ASurfaceControl_createFromWindow,
-                                 sizeof(kCandidates_ASurfaceControl_createFromWindow) /
-                                     sizeof(kCandidates_ASurfaceControl_createFromWindow[0])));
+          load_symbol_candidates_dual(symbols->libandroid,
+                                      symbols->libgui,
+                                      "ASurfaceControl_createFromWindow",
+                                      kCandidates_ASurfaceControl_createFromWindow,
+                                      sizeof(kCandidates_ASurfaceControl_createFromWindow) /
+                                          sizeof(kCandidates_ASurfaceControl_createFromWindow[0])));
   symbols->ASurfaceControl_release = reinterpret_cast<PFN_ASurfaceControl_release>(
-      load_symbol_candidates(symbols->libgui, "ASurfaceControl_release",
-                             kCandidates_ASurfaceControl_release,
-                             sizeof(kCandidates_ASurfaceControl_release) /
-                                 sizeof(kCandidates_ASurfaceControl_release[0])));
+      load_symbol_candidates_dual(symbols->libandroid, symbols->libgui, "ASurfaceControl_release",
+                                  kCandidates_ASurfaceControl_release,
+                                  sizeof(kCandidates_ASurfaceControl_release) /
+                                      sizeof(kCandidates_ASurfaceControl_release[0])));
   symbols->ASurfaceTransaction_create = reinterpret_cast<PFN_ASurfaceTransaction_create>(
-      load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_create",
-                             kCandidates_ASurfaceTransaction_create,
-                             sizeof(kCandidates_ASurfaceTransaction_create) /
-                                 sizeof(kCandidates_ASurfaceTransaction_create[0])));
+      load_symbol_candidates_dual(symbols->libandroid,
+                                  symbols->libgui,
+                                  "ASurfaceTransaction_create",
+                                  kCandidates_ASurfaceTransaction_create,
+                                  sizeof(kCandidates_ASurfaceTransaction_create) /
+                                      sizeof(kCandidates_ASurfaceTransaction_create[0])));
   symbols->ASurfaceTransaction_release = reinterpret_cast<PFN_ASurfaceTransaction_release>(
-      load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_release",
-                             kCandidates_ASurfaceTransaction_release,
-                             sizeof(kCandidates_ASurfaceTransaction_release) /
-                                 sizeof(kCandidates_ASurfaceTransaction_release[0])));
+      load_symbol_candidates_dual(symbols->libandroid,
+                                  symbols->libgui,
+                                  "ASurfaceTransaction_release",
+                                  kCandidates_ASurfaceTransaction_release,
+                                  sizeof(kCandidates_ASurfaceTransaction_release) /
+                                      sizeof(kCandidates_ASurfaceTransaction_release[0])));
   symbols->ASurfaceTransaction_setBufferSize =
-      reinterpret_cast<PFN_ASurfaceTransaction_setBufferSize>(load_symbol_candidates(
-          symbols->libgui, "ASurfaceTransaction_setBufferSize",
+      reinterpret_cast<PFN_ASurfaceTransaction_setBufferSize>(load_symbol_candidates_dual(
+          symbols->libandroid,
+          symbols->libgui,
+          "ASurfaceTransaction_setBufferSize",
           kCandidates_ASurfaceTransaction_setBufferSize,
           sizeof(kCandidates_ASurfaceTransaction_setBufferSize) /
               sizeof(kCandidates_ASurfaceTransaction_setBufferSize[0])));
   symbols->ASurfaceTransaction_setVisibility =
-      reinterpret_cast<PFN_ASurfaceTransaction_setVisibility>(load_symbol_candidates(
-          symbols->libgui, "ASurfaceTransaction_setVisibility",
+      reinterpret_cast<PFN_ASurfaceTransaction_setVisibility>(load_symbol_candidates_dual(
+          symbols->libandroid,
+          symbols->libgui,
+          "ASurfaceTransaction_setVisibility",
           kCandidates_ASurfaceTransaction_setVisibility,
           sizeof(kCandidates_ASurfaceTransaction_setVisibility) /
               sizeof(kCandidates_ASurfaceTransaction_setVisibility[0])));
   symbols->ASurfaceTransaction_setLayer =
-      reinterpret_cast<PFN_ASurfaceTransaction_setLayer>(load_symbol_candidates(
-          symbols->libgui, "ASurfaceTransaction_setLayer",
+      reinterpret_cast<PFN_ASurfaceTransaction_setLayer>(load_symbol_candidates_dual(
+          symbols->libandroid,
+          symbols->libgui,
+          "ASurfaceTransaction_setLayer",
           kCandidates_ASurfaceTransaction_setLayer,
           sizeof(kCandidates_ASurfaceTransaction_setLayer) /
               sizeof(kCandidates_ASurfaceTransaction_setLayer[0])));
@@ -488,29 +512,37 @@ static bool init_symbols(AndroidSymbols* symbols) {
       "ASurfaceTransaction_setZOrder"};
   symbols->ASurfaceTransaction_setZOrder =
       reinterpret_cast<PFN_ASurfaceTransaction_setZOrder>(
-          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setZOrder",
-                                 kCandidates_ASurfaceTransaction_setZOrder,
-                                 sizeof(kCandidates_ASurfaceTransaction_setZOrder) /
-                                     sizeof(kCandidates_ASurfaceTransaction_setZOrder[0])));
+          load_symbol_candidates_dual(symbols->libandroid,
+                                      symbols->libgui,
+                                      "ASurfaceTransaction_setZOrder",
+                                      kCandidates_ASurfaceTransaction_setZOrder,
+                                      sizeof(kCandidates_ASurfaceTransaction_setZOrder) /
+                                          sizeof(kCandidates_ASurfaceTransaction_setZOrder[0])));
   symbols->ASurfaceTransaction_apply = reinterpret_cast<PFN_ASurfaceTransaction_apply>(
-      load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_apply",
-                             kCandidates_ASurfaceTransaction_apply,
-                             sizeof(kCandidates_ASurfaceTransaction_apply) /
-                                 sizeof(kCandidates_ASurfaceTransaction_apply[0])));
+      load_symbol_candidates_dual(symbols->libandroid,
+                                  symbols->libgui,
+                                  "ASurfaceTransaction_apply",
+                                  kCandidates_ASurfaceTransaction_apply,
+                                  sizeof(kCandidates_ASurfaceTransaction_apply) /
+                                      sizeof(kCandidates_ASurfaceTransaction_apply[0])));
   static const char* kCandidates_ASurfaceTransaction_setBuffer[] = {
       "ASurfaceTransaction_setBuffer"};
   symbols->ASurfaceTransaction_setBuffer =
       reinterpret_cast<PFN_ASurfaceTransaction_setBuffer>(
-          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setBuffer",
-                                 kCandidates_ASurfaceTransaction_setBuffer,
-                                 sizeof(kCandidates_ASurfaceTransaction_setBuffer) /
-                                     sizeof(kCandidates_ASurfaceTransaction_setBuffer[0])));
+          load_symbol_candidates_dual(symbols->libandroid,
+                                      symbols->libgui,
+                                      "ASurfaceTransaction_setBuffer",
+                                      kCandidates_ASurfaceTransaction_setBuffer,
+                                      sizeof(kCandidates_ASurfaceTransaction_setBuffer) /
+                                          sizeof(kCandidates_ASurfaceTransaction_setBuffer[0])));
   static const char* kCandidates_ASurfaceTransaction_setBufferTransparency[] = {
       "ASurfaceTransaction_setBufferTransparency"};
   symbols->ASurfaceTransaction_setBufferTransparency =
       reinterpret_cast<PFN_ASurfaceTransaction_setBufferTransparency>(
-          load_symbol_candidates(
-              symbols->libgui, "ASurfaceTransaction_setBufferTransparency",
+          load_symbol_candidates_dual(
+              symbols->libandroid,
+              symbols->libgui,
+              "ASurfaceTransaction_setBufferTransparency",
               kCandidates_ASurfaceTransaction_setBufferTransparency,
               sizeof(kCandidates_ASurfaceTransaction_setBufferTransparency) /
                   sizeof(kCandidates_ASurfaceTransaction_setBufferTransparency[0])));
@@ -518,10 +550,12 @@ static bool init_symbols(AndroidSymbols* symbols) {
       "ASurfaceTransaction_setGeometry"};
   symbols->ASurfaceTransaction_setGeometry =
       reinterpret_cast<PFN_ASurfaceTransaction_setGeometry>(
-          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setGeometry",
-                                 kCandidates_ASurfaceTransaction_setGeometry,
-                                 sizeof(kCandidates_ASurfaceTransaction_setGeometry) /
-                                     sizeof(kCandidates_ASurfaceTransaction_setGeometry[0])));
+          load_symbol_candidates_dual(symbols->libandroid,
+                                      symbols->libgui,
+                                      "ASurfaceTransaction_setGeometry",
+                                      kCandidates_ASurfaceTransaction_setGeometry,
+                                      sizeof(kCandidates_ASurfaceTransaction_setGeometry) /
+                                          sizeof(kCandidates_ASurfaceTransaction_setGeometry[0])));
 
   symbols->ANativeWindow_fromSurfaceControl =
       reinterpret_cast<PFN_ANativeWindow_fromSurfaceControl>(load_symbol_candidates(
