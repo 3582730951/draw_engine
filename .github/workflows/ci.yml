@@ -14,6 +14,7 @@ jobs:
       ANDROID_ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
       ANDROID_APIS: "29 30 31 32 33 34 35 36"
       SKIP_THIRD_PARTY: "1"
+      SKIP_SYMBOLS: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -69,11 +70,13 @@ jobs:
           echo "THIRD_PARTY_INSTALL=${THIRD_PARTY_INSTALL}" >> $GITHUB_ENV
 
       - name: Extract system libs
+        if: ${{ env.SKIP_SYMBOLS != '1' }}
         run: |
           chmod +x "${GITHUB_WORKSPACE}/tools/extract_system_libs.sh"
           "${GITHUB_WORKSPACE}/tools/extract_system_libs.sh"
 
       - name: Generate symbol candidates
+        if: ${{ env.SKIP_SYMBOLS != '1' }}
         run: |
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           python3 "${GITHUB_WORKSPACE}/tools/gen_symbol_candidates.py" \
@@ -84,6 +87,7 @@ jobs:
             --out "${GITHUB_WORKSPACE}/generated/android_symbol_candidates.h"
 
       - name: Generate mangled symbol map
+        if: ${{ env.SKIP_SYMBOLS != '1' }}
         run: |
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
           python3 "${GITHUB_WORKSPACE}/tools/gen_symbols.py" \
