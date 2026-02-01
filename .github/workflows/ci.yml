@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ANDROID_SDK_ROOT: ${{ github.workspace }}/.android_sdk
+      ANDROID_ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
       ANDROID_APIS: "29 30 31 32 33 34 35 36"
     steps:
       - name: Checkout
@@ -47,16 +48,20 @@ jobs:
           set -e
           THIRD_PARTY_INSTALL="${GITHUB_WORKSPACE}/core/third_party_install"
           mkdir -p "${THIRD_PARTY_INSTALL}"
-          for dir in "${GITHUB_WORKSPACE}/core/third_party/"*; do
-            if [[ -f "${dir}/CMakeLists.txt" ]]; then
-              name=$(basename "${dir}")
-              cmake -S "${dir}" -B "${dir}/build" \
-                -DCMAKE_INSTALL_PREFIX="${THIRD_PARTY_INSTALL}/${name}" \
-                -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-                -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
-                -DCMAKE_BUILD_TYPE=Release
-              cmake --build "${dir}/build" --target install
-            fi
+          for ABI in ${ANDROID_ABIS}; do
+            for dir in "${GITHUB_WORKSPACE}/core/third_party/"*; do
+              if [[ -f "${dir}/CMakeLists.txt" ]]; then
+                name=$(basename "${dir}")
+                BUILD_DIR="${dir}/build_${ABI}"
+                INSTALL_DIR="${THIRD_PARTY_INSTALL}/${ABI}/${name}"
+                cmake -S "${dir}" -B "${BUILD_DIR}" \
+                  -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
+                  -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+                  -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-21 \
+                  -DCMAKE_BUILD_TYPE=Release
+                cmake --build "${BUILD_DIR}" --target install
+              fi
+            done
           done
           echo "THIRD_PARTY_INSTALL=${THIRD_PARTY_INSTALL}" >> $GITHUB_ENV
 
@@ -86,27 +91,37 @@ jobs:
 
       - name: Build midraw (static/shared) and benchmark
         run: |
-          PREFIX_PATH=""
-          if [[ -d "${THIRD_PARTY_INSTALL:-}" ]]; then
-            for dir in "${THIRD_PARTY_INSTALL}/"*; do
-              if [[ -d "${dir}" ]]; then
-                PREFIX_PATH="${PREFIX_PATH};${dir}"
-              fi
-            done
-          fi
-          cmake -S "${GITHUB_WORKSPACE}/core" -B "${GITHUB_WORKSPACE}/core/build" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${PREFIX_PATH}"
-          cmake --build "${GITHUB_WORKSPACE}/core/build"
+          for ABI in ${ANDROID_ABIS}; do
+            PREFIX_PATH=""
+            if [[ -d "${THIRD_PARTY_INSTALL:-}" ]]; then
+              for dir in "${THIRD_PARTY_INSTALL}/${ABI}/"*; do
+                if [[ -d "${dir}" ]]; then
+                  PREFIX_PATH="${PREFIX_PATH};${dir}"
+                fi
+              done
+            fi
+            BUILD_DIR="${GITHUB_WORKSPACE}/core/build_${ABI}"
+            cmake -S "${GITHUB_WORKSPACE}/core" -B "${BUILD_DIR}" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-28 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DMIDRAW_BUILD_SHARED=ON \
+              -DMIDRAW_BUILD_STATIC=ON \
+              -DMIDRAW_BUILD_BENCHMARK=ON \
+              -DMIDRAW_BUILD_OVERLAY=ON \
+              -DMIDRAW_BUILD_DEMO=ON \
+              -DCMAKE_PREFIX_PATH="${PREFIX_PATH}"
+            cmake --build "${BUILD_DIR}"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: midraw-build
           path: |
-            core/build/*.so
-            core/build/*.a
-            core/build/benchmark
+            core/build_*/libmidraw.so
+            core/build_*/libmidraw.a
+            core/build_*/benchmark
+            core/build_*/overlay_engine
+            core/build_*/draw_demo
             core/generated/android_symbol_candidates.h

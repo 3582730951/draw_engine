@@ -12,6 +12,7 @@ jobs:
     env:
       ANDROID_SDK_ROOT: ${{ github.workspace }}/.android_sdk
       ANDROID_LIB_DUMP_REPO: https://github.com/example/android-lib-dump
+      ANDROID_ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,29 +59,38 @@ jobs:
 
       - name: Build (CMake + NDK)
         run: |
-          cmake -S "${GITHUB_WORKSPACE}" -B "${GITHUB_WORKSPACE}/build" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DMIDRAW_BUILD_SHARED=ON \
-            -DMIDRAW_BUILD_STATIC=ON \
-            -DMIDRAW_BUILD_BENCHMARK=ON \
-            -DMIDRAW_BUILD_OVERLAY=ON
-          cmake --build "${GITHUB_WORKSPACE}/build"
+          for ABI in ${ANDROID_ABIS}; do
+            BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}"
+            cmake -S "${GITHUB_WORKSPACE}" -B "${BUILD_DIR}" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-28 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DMIDRAW_BUILD_SHARED=ON \
+              -DMIDRAW_BUILD_STATIC=ON \
+              -DMIDRAW_BUILD_BENCHMARK=ON \
+              -DMIDRAW_BUILD_OVERLAY=ON \
+              -DMIDRAW_BUILD_DEMO=ON
+            cmake --build "${BUILD_DIR}"
+          done
 
       - name: Collect artifacts
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/dist"
-          find "${GITHUB_WORKSPACE}/build" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" \) -exec cp {} "${GITHUB_WORKSPACE}/dist" \;
+          for ABI in ${ANDROID_ABIS}; do
+            BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}"
+            OUT_DIR="${GITHUB_WORKSPACE}/dist/${ABI}"
+            mkdir -p "${OUT_DIR}"
+            find "${BUILD_DIR}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DIR}" \;
+          done
           cp "${GITHUB_WORKSPACE}/include/generated_symbols.h" "${GITHUB_WORKSPACE}/dist" || true
           echo "Collected files:"
-          ls -la "${GITHUB_WORKSPACE}/dist"
+          find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -print
           {
             echo "dist listing:";
-            ls -la "${GITHUB_WORKSPACE}/dist";
+            find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -print;
             echo;
             echo "file info:";
-            file "${GITHUB_WORKSPACE}/dist"/* || true;
+            find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -exec file {} \; || true;
           } | tee "${GITHUB_WORKSPACE}/dist/manifest.txt"
           cat "${GITHUB_WORKSPACE}/dist/manifest.txt" >> "${GITHUB_STEP_SUMMARY}" || true
 
@@ -94,11 +104,13 @@ jobs:
 
       - name: Verify artifacts
         run: |
-          for f in libmidraw.so libmidraw.a overlay_engine benchmark; do
-            if [[ ! -s "${GITHUB_WORKSPACE}/dist/${f}" ]]; then
-              echo "Missing or empty artifact: ${f}" >&2
-              exit 1
-            fi
+          for ABI in ${ANDROID_ABIS}; do
+            for f in libmidraw.so libmidraw.a overlay_engine benchmark draw_demo; do
+              if [[ ! -s "${GITHUB_WORKSPACE}/dist/${ABI}/${f}" ]]; then
+                echo "Missing or empty artifact: ${ABI}/${f}" >&2
+                exit 1
+              fi
+            done
           done
 
       - name: Upload artifacts

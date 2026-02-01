@@ -4,6 +4,7 @@
 
 #include <android/native_window.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
 
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "third_party/stb_truetype/stb_truetype.h"
+
 struct DrawImage {
   int width;
   int height;
@@ -61,9 +65,14 @@ struct DrawEngineState {
   MidrawContext* cpu_ctx;
   char* surface_name;
   int rotation;
+  bool rotation_forced;
   bool in_frame;
   bool initialized;
 };
+
+static void gpu_shutdown(struct GpuState& gpu);
+static bool gpu_init(struct GpuState& gpu, BackendType backend, ANativeWindow* window, int width,
+                     int height, int rotation);
 
 struct GpuVertex {
   float x;
@@ -102,6 +111,14 @@ struct GpuFontAtlas {
   float v0[96];
   float u1[96];
   float v1[96];
+  float xoff[96];
+  float yoff[96];
+  float xadvance[96];
+  float glyph_w[96];
+  float glyph_h[96];
+  float ascent;
+  float line_advance;
+  bool truetype;
   bool ready;
 };
 
@@ -137,13 +154,21 @@ struct VulkanContext {
   VkDeviceMemory vertex_memory;
   size_t vertex_capacity;
   void* vertex_map;
+  VkSampleCountFlagBits msaa_samples;
+  VkImage msaa_color_image;
+  VkDeviceMemory msaa_color_memory;
+  VkImageView msaa_color_view;
   VkImage depth_image;
   VkDeviceMemory depth_memory;
   VkImageView depth_view;
   VkFormat depth_format;
+  VkSurfaceTransformFlagBitsKHR pre_transform;
   float max_anisotropy;
   bool supports_anisotropy;
   bool supports_wide_lines;
+  bool supports_timestamps;
+  float timestamp_period;
+  VkQueryPool query_pool;
 };
 
 struct GlesContext {
@@ -161,6 +186,7 @@ struct GlesContext {
   int minor;
   bool supports_anisotropy;
   float max_anisotropy;
+  int samples;
 };
 
 struct GpuState {
@@ -181,6 +207,9 @@ struct GpuState {
   GpuFontAtlas font;
   DrawImage font_image;
   DrawImage white_image;
+  uint64_t frame_index;
+  uint64_t last_log_ns;
+  int log_interval;
 };
 
 static DrawEngineState g_engine{};
@@ -201,6 +230,37 @@ static bool has_library(const char* name) {
 static uint32_t lcg(uint32_t& state) {
   state = state * 1664525u + 1013904223u;
   return state;
+}
+
+static int sample_count_to_int(VkSampleCountFlagBits samples) {
+  switch (samples) {
+    case VK_SAMPLE_COUNT_2_BIT:
+      return 2;
+    case VK_SAMPLE_COUNT_4_BIT:
+      return 4;
+    case VK_SAMPLE_COUNT_8_BIT:
+      return 8;
+    case VK_SAMPLE_COUNT_16_BIT:
+      return 16;
+    default:
+      return 1;
+  }
+}
+
+static VkSampleCountFlagBits choose_sample_count(VkSampleCountFlags flags, int request) {
+  if (request >= 16 && (flags & VK_SAMPLE_COUNT_16_BIT)) {
+    return VK_SAMPLE_COUNT_16_BIT;
+  }
+  if (request >= 8 && (flags & VK_SAMPLE_COUNT_8_BIT)) {
+    return VK_SAMPLE_COUNT_8_BIT;
+  }
+  if (request >= 4 && (flags & VK_SAMPLE_COUNT_4_BIT)) {
+    return VK_SAMPLE_COUNT_4_BIT;
+  }
+  if (request >= 2 && (flags & VK_SAMPLE_COUNT_2_BIT)) {
+    return VK_SAMPLE_COUNT_2_BIT;
+  }
+  return VK_SAMPLE_COUNT_1_BIT;
 }
 
 static void shuffle_name(char* name) {
@@ -230,6 +290,86 @@ static int env_int(const char* name, int default_value) {
   return atoi(value);
 }
 
+static float env_float(const char* name, float default_value) {
+  const char* value = getenv(name);
+  if (!value || !value[0]) {
+    return default_value;
+  }
+  return static_cast<float>(atof(value));
+}
+
+static uint64_t now_ns() {
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(ts.tv_nsec);
+}
+
+static bool query_native_window_size(ANativeWindow* window, int* out_w, int* out_h) {
+  using PFN_GetWidth = int32_t (*)(ANativeWindow*);
+  using PFN_GetHeight = int32_t (*)(ANativeWindow*);
+  static void* libandroid = nullptr;
+  static PFN_GetWidth get_width = nullptr;
+  static PFN_GetHeight get_height = nullptr;
+  if (!libandroid) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      get_width = reinterpret_cast<PFN_GetWidth>(dlsym(libandroid, "ANativeWindow_getWidth"));
+      get_height = reinterpret_cast<PFN_GetHeight>(dlsym(libandroid, "ANativeWindow_getHeight"));
+    }
+  }
+  if (!window || !get_width || !get_height) {
+    return false;
+  }
+  const int w = get_width(window);
+  const int h = get_height(window);
+  if (w <= 0 || h <= 0) {
+    return false;
+  }
+  if (out_w) {
+    *out_w = w;
+  }
+  if (out_h) {
+    *out_h = h;
+  }
+  return true;
+}
+
+static bool set_native_window_geometry(ANativeWindow* window, int width, int height) {
+  using PFN_SetGeometry = int32_t (*)(ANativeWindow*, int32_t, int32_t, int32_t);
+  static void* libandroid = nullptr;
+  static PFN_SetGeometry set_geometry = nullptr;
+  if (!libandroid) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      set_geometry =
+          reinterpret_cast<PFN_SetGeometry>(dlsym(libandroid, "ANativeWindow_setBuffersGeometry"));
+    }
+  }
+  if (!window || !set_geometry) {
+    return false;
+  }
+  const int32_t kFormat = 1;  // WINDOW_FORMAT_RGBA_8888
+  return set_geometry(window, width, height, kFormat) == 0;
+}
+
+static bool set_native_window_transform(ANativeWindow* window, int32_t transform) {
+  using PFN_SetTransform = int32_t (*)(ANativeWindow*, int32_t);
+  static void* libandroid = nullptr;
+  static PFN_SetTransform set_transform = nullptr;
+  if (!libandroid) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      set_transform = reinterpret_cast<PFN_SetTransform>(
+          dlsym(libandroid, "ANativeWindow_setBuffersTransform"));
+    }
+  }
+  if (!window || !set_transform) {
+    return false;
+  }
+  return set_transform(window, transform) == 0;
+}
+
 static void warn_no_frame() {
   static bool warned = false;
   if (!warned) {
@@ -238,11 +378,11 @@ static void warn_no_frame() {
   }
 }
 
-static inline uint32_t color_to_rgba(uint32_t abgr) {
-  const uint8_t a = static_cast<uint8_t>((abgr >> 24) & 0xFF);
-  const uint8_t b = static_cast<uint8_t>((abgr >> 16) & 0xFF);
-  const uint8_t g = static_cast<uint8_t>((abgr >> 8) & 0xFF);
-  const uint8_t r = static_cast<uint8_t>(abgr & 0xFF);
+static inline uint32_t color_to_rgba(uint32_t argb) {
+  const uint8_t a = static_cast<uint8_t>((argb >> 24) & 0xFF);
+  const uint8_t r = static_cast<uint8_t>((argb >> 16) & 0xFF);
+  const uint8_t g = static_cast<uint8_t>((argb >> 8) & 0xFF);
+  const uint8_t b = static_cast<uint8_t>(argb & 0xFF);
   return (static_cast<uint32_t>(a) << 24) |
          (static_cast<uint32_t>(b) << 16) |
          (static_cast<uint32_t>(g) << 8) |
@@ -369,22 +509,147 @@ static const uint8_t* font_for_char(char c) {
   return kFont8x8Space;
 }
 
+static bool load_file_bytes(const char* path, std::vector<unsigned char>& out) {
+  if (!path || !path[0]) {
+    return false;
+  }
+  FILE* file = fopen(path, "rb");
+  if (!file) {
+    return false;
+  }
+  fseek(file, 0, SEEK_END);
+  long size = ftell(file);
+  if (size <= 0) {
+    fclose(file);
+    return false;
+  }
+  fseek(file, 0, SEEK_SET);
+  out.resize(static_cast<size_t>(size));
+  size_t read = fread(out.data(), 1, out.size(), file);
+  fclose(file);
+  return read == out.size();
+}
+
+static bool init_gpu_font_truetype(GpuState& gpu,
+                                   const char* path,
+                                   int pixel_height,
+                                   int atlas_w,
+                                   int atlas_h) {
+  std::vector<unsigned char> ttf;
+  if (!load_file_bytes(path, ttf)) {
+    return false;
+  }
+  const int offset = stbtt_GetFontOffsetForIndex(ttf.data(), 0);
+  if (offset < 0) {
+    return false;
+  }
+  stbtt_fontinfo font{};
+  if (!stbtt_InitFont(&font, ttf.data(), offset)) {
+    return false;
+  }
+  std::vector<stbtt_bakedchar> baked(96);
+  std::vector<unsigned char> bitmap(static_cast<size_t>(atlas_w * atlas_h));
+  const int ok = stbtt_BakeFontBitmap(ttf.data(),
+                                      offset,
+                                      static_cast<float>(pixel_height),
+                                      bitmap.data(),
+                                      atlas_w,
+                                      atlas_h,
+                                      32,
+                                      96,
+                                      baked.data());
+  if (ok <= 0) {
+    return false;
+  }
+
+  int ascent = 0;
+  int descent = 0;
+  int line_gap = 0;
+  stbtt_GetFontVMetrics(&font, &ascent, &descent, &line_gap);
+  const float scale = stbtt_ScaleForPixelHeight(&font, static_cast<float>(pixel_height));
+  gpu.font.ascent = ascent * scale;
+  gpu.font.line_advance = (ascent - descent + line_gap) * scale;
+  gpu.font.truetype = true;
+
+  unsigned char* rgba = static_cast<unsigned char*>(malloc(atlas_w * atlas_h * 4));
+  if (!rgba) {
+    return false;
+  }
+  for (int i = 0; i < atlas_w * atlas_h; ++i) {
+    const unsigned char a = bitmap[static_cast<size_t>(i)];
+    rgba[i * 4 + 0] = 255;
+    rgba[i * 4 + 1] = 255;
+    rgba[i * 4 + 2] = 255;
+    rgba[i * 4 + 3] = a;
+  }
+
+  for (int i = 0; i < 96; ++i) {
+    const stbtt_bakedchar& g = baked[i];
+    gpu.font.u0[i] = static_cast<float>(g.x0) / static_cast<float>(atlas_w);
+    gpu.font.v0[i] = static_cast<float>(g.y0) / static_cast<float>(atlas_h);
+    gpu.font.u1[i] = static_cast<float>(g.x1) / static_cast<float>(atlas_w);
+    gpu.font.v1[i] = static_cast<float>(g.y1) / static_cast<float>(atlas_h);
+    gpu.font.xoff[i] = g.xoff;
+    gpu.font.yoff[i] = g.yoff;
+    gpu.font.xadvance[i] = g.xadvance;
+    gpu.font.glyph_w[i] = static_cast<float>(g.x1 - g.x0);
+    gpu.font.glyph_h[i] = static_cast<float>(g.y1 - g.y0);
+  }
+
+  gpu.font.width = atlas_w;
+  gpu.font.height = atlas_h;
+  gpu.font.ready = true;
+
+  gpu.font_image.width = atlas_w;
+  gpu.font_image.height = atlas_h;
+  gpu.font_image.rgba = rgba;
+  gpu.font_image.pixels = nullptr;
+  fprintf(stderr, "GPU font: %s size=%d atlas=%dx%d\n", path, pixel_height, atlas_w, atlas_h);
+  return true;
+}
+
 static void init_gpu_font(GpuState& gpu) {
   if (gpu.font.ready) {
     return;
   }
+  const char* env_path = getenv("DRAW_ENGINE_FONT_PATH");
+  if (!env_path || !env_path[0]) {
+    env_path = getenv("MIDRAW_FONT_PATH");
+  }
+  const int pixel_height = env_int("DRAW_ENGINE_FONT_SIZE", 24);
+  const int atlas_w = env_int("DRAW_ENGINE_FONT_ATLAS", 1024);
+  const int atlas_h = env_int("DRAW_ENGINE_FONT_ATLAS", 1024);
+  if (env_path && env_path[0]) {
+    if (init_gpu_font_truetype(gpu, env_path, pixel_height, atlas_w, atlas_h)) {
+      return;
+    }
+  }
+  const char* fallback_paths[] = {
+      "/system/fonts/Roboto-Regular.ttf",
+      "/system/fonts/RobotoStatic-Regular.ttf",
+      "/system/fonts/NotoSansCJK-Regular.ttc",
+      "/system/fonts/NotoSans-Regular.ttf",
+      nullptr,
+  };
+  for (int i = 0; fallback_paths[i]; ++i) {
+    if (init_gpu_font_truetype(gpu, fallback_paths[i], pixel_height, atlas_w, atlas_h)) {
+      return;
+    }
+  }
+  fprintf(stderr, "GPU font: fallback 8x8\n");
+
   const int glyph_w = 8;
   const int glyph_h = 8;
   const int cols = 16;
   const int rows = 6;
-  const int atlas_w = cols * glyph_w;
-  const int atlas_h = rows * glyph_h;
+  const int font_w = cols * glyph_w;
+  const int font_h = rows * glyph_h;
 
-  unsigned char* rgba = static_cast<unsigned char*>(malloc(atlas_w * atlas_h * 4));
+  unsigned char* rgba = static_cast<unsigned char*>(malloc(font_w * font_h * 4));
   if (!rgba) {
     return;
   }
-  memset(rgba, 0, atlas_w * atlas_h * 4);
+  memset(rgba, 0, font_w * font_h * 4);
 
   const int first_char = 32;
   for (int i = 0; i < 96; ++i) {
@@ -402,25 +667,33 @@ static void init_gpu_font(GpuState& gpu) {
         }
         const int px = x0 + x;
         const int py = y0 + y;
-        unsigned char* dst = rgba + (py * atlas_w + px) * 4;
+        unsigned char* dst = rgba + (py * font_w + px) * 4;
         dst[0] = 255;
         dst[1] = 255;
         dst[2] = 255;
         dst[3] = 255;
       }
     }
-    gpu.font.u0[i] = static_cast<float>(x0) / static_cast<float>(atlas_w);
-    gpu.font.v0[i] = static_cast<float>(y0) / static_cast<float>(atlas_h);
-    gpu.font.u1[i] = static_cast<float>(x0 + glyph_w) / static_cast<float>(atlas_w);
-    gpu.font.v1[i] = static_cast<float>(y0 + glyph_h) / static_cast<float>(atlas_h);
+    gpu.font.u0[i] = static_cast<float>(x0) / static_cast<float>(font_w);
+    gpu.font.v0[i] = static_cast<float>(y0) / static_cast<float>(font_h);
+    gpu.font.u1[i] = static_cast<float>(x0 + glyph_w) / static_cast<float>(font_w);
+    gpu.font.v1[i] = static_cast<float>(y0 + glyph_h) / static_cast<float>(font_h);
+    gpu.font.xoff[i] = 0.0f;
+    gpu.font.yoff[i] = 0.0f;
+    gpu.font.xadvance[i] = static_cast<float>(glyph_w);
+    gpu.font.glyph_w[i] = static_cast<float>(glyph_w);
+    gpu.font.glyph_h[i] = static_cast<float>(glyph_h);
   }
 
-  gpu.font.width = atlas_w;
-  gpu.font.height = atlas_h;
+  gpu.font.width = font_w;
+  gpu.font.height = font_h;
+  gpu.font.ascent = static_cast<float>(glyph_h);
+  gpu.font.line_advance = static_cast<float>(glyph_h);
+  gpu.font.truetype = false;
   gpu.font.ready = true;
 
-  gpu.font_image.width = atlas_w;
-  gpu.font_image.height = atlas_h;
+  gpu.font_image.width = font_w;
+  gpu.font_image.height = font_h;
   gpu.font_image.rgba = rgba;
   gpu.font_image.pixels = nullptr;
 }
@@ -438,6 +711,17 @@ static void gpu_add_batch(GpuState& gpu,
                           const DrawImage* texture,
                           bool line,
                           bool use_3d) {
+  if (!gpu.batches.empty()) {
+    GpuBatch& last = gpu.batches.back();
+    if (last.line == line &&
+        last.use_3d == use_3d &&
+        last.use_texture == (texture != nullptr) &&
+        last.texture == texture &&
+        (last.first + last.count) == first) {
+      last.count += count;
+      return;
+    }
+  }
   GpuBatch batch{};
   batch.first = first;
   batch.count = count;
@@ -455,7 +739,7 @@ static inline void map_logical_to_physical(const GpuState& gpu,
                                            float* out_y) {
   switch (gpu.rotation) {
     case 90:
-      *out_x = static_cast<float>(gpu.physical_height - 1) - y;
+      *out_x = static_cast<float>(gpu.physical_width - 1) - y;
       *out_y = x;
       break;
     case 180:
@@ -464,7 +748,7 @@ static inline void map_logical_to_physical(const GpuState& gpu,
       break;
     case 270:
       *out_x = y;
-      *out_y = static_cast<float>(gpu.physical_width - 1) - x;
+      *out_y = static_cast<float>(gpu.physical_height - 1) - x;
       break;
     default:
       *out_x = x;
@@ -545,6 +829,37 @@ static void gpu_push_line(GpuState& gpu,
                           int x2,
                           int y2,
                           uint32_t color) {
+  static int cached_aa = -1;
+  if (cached_aa < 0) {
+    cached_aa = env_int("DRAW_ENGINE_LINE_AA", 1);
+  }
+  const float thickness = env_float("DRAW_ENGINE_LINE_WIDTH", 1.5f);
+  if (cached_aa != 0 && thickness > 1.0f) {
+    const float fx1 = static_cast<float>(x1);
+    const float fy1 = static_cast<float>(y1);
+    const float fx2 = static_cast<float>(x2);
+    const float fy2 = static_cast<float>(y2);
+    const float dx = fx2 - fx1;
+    const float dy = fy2 - fy1;
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (len <= 0.0001f) {
+      return;
+    }
+    const float inv = 1.0f / len;
+    const float nx = -dy * inv * (thickness * 0.5f);
+    const float ny = dx * inv * (thickness * 0.5f);
+
+    const int first = static_cast<int>(gpu.vertices.size());
+    gpu_push_vertex(gpu, fx1 - nx, fy1 - ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, fx1 + nx, fy1 + ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, fx2 + nx, fy2 + ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, fx1 - nx, fy1 - ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, fx2 + nx, fy2 + ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_push_vertex(gpu, fx2 - nx, fy2 - ny, 0.0f, 0.0f, 0.0f, color, true);
+    gpu_add_batch(gpu, first, 6, &gpu.white_image, false, false);
+    return;
+  }
+
   const int first = static_cast<int>(gpu.vertices.size());
   gpu_push_vertex(gpu, static_cast<float>(x1), static_cast<float>(y1), 0.0f, 0.0f, 0.0f,
                   color, true);
@@ -573,6 +888,20 @@ static void gpu_push_circle(GpuState& gpu, int cx, int cy, int radius, uint32_t 
   gpu_add_batch(gpu, first, segments * 2, &gpu.white_image, true, false);
 }
 
+static void gpu_push_line3d(GpuState& gpu,
+                            float x1,
+                            float y1,
+                            float z1,
+                            float x2,
+                            float y2,
+                            float z2,
+                            uint32_t color) {
+  const int first = static_cast<int>(gpu.vertices.size());
+  gpu_push_vertex(gpu, x1, y1, z1, 0.0f, 0.0f, color, false);
+  gpu_push_vertex(gpu, x2, y2, z2, 0.0f, 0.0f, color, false);
+  gpu_add_batch(gpu, first, 2, &gpu.white_image, true, true);
+}
+
 static void gpu_push_text(GpuState& gpu,
                           const char* text,
                           int x0,
@@ -588,23 +917,23 @@ static void gpu_push_text(GpuState& gpu,
   const int clip_x1 = (x1 > x0) ? x1 : 0;
   const int clip_y1 = (y1 > y0) ? y1 : 0;
 
-  int cursor_x = x0;
-  int cursor_y = y0;
+  float cursor_x = static_cast<float>(x0);
+  float cursor_y = static_cast<float>(y0);
+  float baseline = cursor_y + gpu.font.ascent;
   const int first_char = 32;
   const int last_char = 127;
-  const int glyph_w = 8;
-  const int glyph_h = 8;
   const int first = static_cast<int>(gpu.vertices.size());
 
   while (*text) {
     char c = *text++;
     if (c == '\n') {
-      cursor_x = x0;
-      cursor_y += glyph_h;
+      cursor_x = static_cast<float>(x0);
+      cursor_y += gpu.font.line_advance;
+      baseline = cursor_y + gpu.font.ascent;
       continue;
     }
     if (c < first_char || c > last_char) {
-      cursor_x += glyph_w;
+      cursor_x += gpu.font.xadvance[0];
       continue;
     }
     int idx = c - first_char;
@@ -613,30 +942,33 @@ static void gpu_push_text(GpuState& gpu,
     const float u1 = gpu.font.u1[idx];
     const float v1 = gpu.font.v1[idx];
 
-    const int gx0 = cursor_x;
-    const int gy0 = cursor_y;
-    const int gx1 = cursor_x + glyph_w;
-    const int gy1 = cursor_y + glyph_h;
+    const float gw = gpu.font.glyph_w[idx];
+    const float gh = gpu.font.glyph_h[idx];
+    if (gw <= 0.0f || gh <= 0.0f) {
+      cursor_x += gpu.font.xadvance[idx];
+      continue;
+    }
+    const float gx0 = cursor_x + gpu.font.xoff[idx];
+    const float gy0 = baseline + gpu.font.yoff[idx];
+    const float gx1 = gx0 + gw;
+    const float gy1 = gy0 + gh;
     if (clip_x1 > clip_x0 && clip_y1 > clip_y0) {
-      if (gx1 <= clip_x0 || gx0 >= clip_x1 || gy1 <= clip_y0 || gy0 >= clip_y1) {
-        cursor_x += glyph_w;
+      if (gx1 <= static_cast<float>(clip_x0) ||
+          gx0 >= static_cast<float>(clip_x1) ||
+          gy1 <= static_cast<float>(clip_y0) ||
+          gy0 >= static_cast<float>(clip_y1)) {
+        cursor_x += gpu.font.xadvance[idx];
         continue;
       }
     }
 
-    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
-                    color, true);
-    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy0), 0.0f, u1, v0,
-                    color, true);
-    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
-                    color, true);
-    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy0), 0.0f, u0, v0,
-                    color, true);
-    gpu_push_vertex(gpu, static_cast<float>(gx1), static_cast<float>(gy1), 0.0f, u1, v1,
-                    color, true);
-    gpu_push_vertex(gpu, static_cast<float>(gx0), static_cast<float>(gy1), 0.0f, u0, v1,
-                    color, true);
-    cursor_x += glyph_w;
+    gpu_push_vertex(gpu, gx0, gy0, 0.0f, u0, v0, color, true);
+    gpu_push_vertex(gpu, gx1, gy0, 0.0f, u1, v0, color, true);
+    gpu_push_vertex(gpu, gx1, gy1, 0.0f, u1, v1, color, true);
+    gpu_push_vertex(gpu, gx0, gy0, 0.0f, u0, v0, color, true);
+    gpu_push_vertex(gpu, gx1, gy1, 0.0f, u1, v1, color, true);
+    gpu_push_vertex(gpu, gx0, gy1, 0.0f, u0, v1, color, true);
+    cursor_x += gpu.font.xadvance[idx];
   }
 
   const int count = static_cast<int>(gpu.vertices.size()) - first;
@@ -790,7 +1122,10 @@ static bool vk_create_image(VulkanContext& vk,
   return true;
 }
 
-static bool vk_create_depth_image(VulkanContext& vk, int width, int height) {
+static bool vk_create_depth_image(VulkanContext& vk,
+                                  int width,
+                                  int height,
+                                  VkSampleCountFlagBits samples) {
   vk.depth_format = vk_find_depth_format(vk.physical);
   VkImageCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -804,7 +1139,7 @@ static bool vk_create_depth_image(VulkanContext& vk, int width, int height) {
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.samples = samples;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   if (vkCreateImage(vk.device, &info, nullptr, &vk.depth_image) != VK_SUCCESS) {
@@ -839,6 +1174,250 @@ static bool vk_create_depth_image(VulkanContext& vk, int width, int height) {
   view.subresourceRange.layerCount = 1;
   if (vkCreateImageView(vk.device, &view, nullptr, &vk.depth_view) != VK_SUCCESS) {
     return false;
+  }
+  return true;
+}
+
+static bool vk_create_msaa_color_image(VulkanContext& vk, int width, int height) {
+  if (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) {
+    return true;
+  }
+  VkImageCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.extent.width = static_cast<uint32_t>(width);
+  info.extent.height = static_cast<uint32_t>(height);
+  info.extent.depth = 1;
+  info.mipLevels = 1;
+  info.arrayLayers = 1;
+  info.format = vk.swapchain_format;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  info.samples = vk.msaa_samples;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  if (vkCreateImage(vk.device, &info, nullptr, &vk.msaa_color_image) != VK_SUCCESS) {
+    return false;
+  }
+  VkMemoryRequirements mem_req{};
+  vkGetImageMemoryRequirements(vk.device, vk.msaa_color_image, &mem_req);
+  uint32_t type = vk_find_memory_type(vk.physical,
+                                      mem_req.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (type == UINT32_MAX) {
+    return false;
+  }
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.allocationSize = mem_req.size;
+  alloc.memoryTypeIndex = type;
+  if (vkAllocateMemory(vk.device, &alloc, nullptr, &vk.msaa_color_memory) != VK_SUCCESS) {
+    return false;
+  }
+  vkBindImageMemory(vk.device, vk.msaa_color_image, vk.msaa_color_memory, 0);
+
+  VkImageViewCreateInfo view{};
+  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view.image = vk.msaa_color_image;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = vk.swapchain_format;
+  view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  view.subresourceRange.baseMipLevel = 0;
+  view.subresourceRange.levelCount = 1;
+  view.subresourceRange.baseArrayLayer = 0;
+  view.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(vk.device, &view, nullptr, &vk.msaa_color_view) != VK_SUCCESS) {
+    return false;
+  }
+  return true;
+}
+
+static void vk_destroy_swapchain(VulkanContext& vk) {
+  for (auto fb : vk.framebuffers) {
+    vkDestroyFramebuffer(vk.device, fb, nullptr);
+  }
+  vk.framebuffers.clear();
+  for (auto view : vk.image_views) {
+    vkDestroyImageView(vk.device, view, nullptr);
+  }
+  vk.image_views.clear();
+  if (vk.msaa_color_view) {
+    vkDestroyImageView(vk.device, vk.msaa_color_view, nullptr);
+    vk.msaa_color_view = VK_NULL_HANDLE;
+  }
+  if (vk.msaa_color_image) {
+    vkDestroyImage(vk.device, vk.msaa_color_image, nullptr);
+    vk.msaa_color_image = VK_NULL_HANDLE;
+  }
+  if (vk.msaa_color_memory) {
+    vkFreeMemory(vk.device, vk.msaa_color_memory, nullptr);
+    vk.msaa_color_memory = VK_NULL_HANDLE;
+  }
+  if (vk.depth_view) {
+    vkDestroyImageView(vk.device, vk.depth_view, nullptr);
+    vk.depth_view = VK_NULL_HANDLE;
+  }
+  if (vk.depth_image) {
+    vkDestroyImage(vk.device, vk.depth_image, nullptr);
+    vk.depth_image = VK_NULL_HANDLE;
+  }
+  if (vk.depth_memory) {
+    vkFreeMemory(vk.device, vk.depth_memory, nullptr);
+    vk.depth_memory = VK_NULL_HANDLE;
+  }
+  if (vk.swapchain) {
+    vkDestroySwapchainKHR(vk.device, vk.swapchain, nullptr);
+    vk.swapchain = VK_NULL_HANDLE;
+  }
+  vk.images.clear();
+}
+
+static bool vk_create_swapchain_resources(VulkanContext& vk, int width, int height) {
+  VkSurfaceCapabilitiesKHR caps{};
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.physical, vk.surface, &caps);
+  uint32_t fmt_count = 0;
+  vkGetPhysicalDeviceSurfaceFormatsKHR(vk.physical, vk.surface, &fmt_count, nullptr);
+  std::vector<VkSurfaceFormatKHR> formats(fmt_count);
+  vkGetPhysicalDeviceSurfaceFormatsKHR(vk.physical, vk.surface, &fmt_count, formats.data());
+  VkSurfaceFormatKHR chosen = formats[0];
+  for (const auto& fmt : formats) {
+    if (fmt.format == vk.swapchain_format) {
+      chosen = fmt;
+      break;
+    }
+    if (fmt.format == VK_FORMAT_R8G8B8A8_UNORM ||
+        fmt.format == VK_FORMAT_B8G8R8A8_UNORM) {
+      chosen = fmt;
+    }
+  }
+  vk.swapchain_format = chosen.format;
+
+  uint32_t present_count = 0;
+  vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count, nullptr);
+  std::vector<VkPresentModeKHR> present_modes(present_count);
+  vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count,
+                                            present_modes.data());
+  VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+  for (auto mode : present_modes) {
+    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+      present_mode = mode;
+      break;
+    }
+  }
+
+  VkExtent2D extent{};
+  if (caps.currentExtent.width != UINT32_MAX) {
+    extent = caps.currentExtent;
+    const int force_extent = env_int("DRAW_ENGINE_VK_FORCE_EXTENT", 1);
+    if (force_extent != 0 && width > 0 && height > 0 &&
+        (extent.width != static_cast<uint32_t>(width) ||
+         extent.height != static_cast<uint32_t>(height))) {
+      extent.width = static_cast<uint32_t>(width);
+      extent.height = static_cast<uint32_t>(height);
+    }
+  } else {
+    extent.width = static_cast<uint32_t>(width);
+    extent.height = static_cast<uint32_t>(height);
+  }
+  vk.extent = extent;
+
+  uint32_t image_count = caps.minImageCount + 1;
+  if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
+    image_count = caps.maxImageCount;
+  }
+
+  VkCompositeAlphaFlagBitsKHR composite = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+  if (!(caps.supportedCompositeAlpha & composite)) {
+    composite = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+  }
+  if (!(caps.supportedCompositeAlpha & composite)) {
+    composite = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+  }
+
+  VkSwapchainCreateInfoKHR sw{};
+  sw.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+  sw.surface = vk.surface;
+  sw.minImageCount = image_count;
+  sw.imageFormat = vk.swapchain_format;
+  sw.imageColorSpace = chosen.colorSpace;
+  sw.imageExtent = extent;
+  sw.imageArrayLayers = 1;
+  sw.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  sw.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkSurfaceTransformFlagBitsKHR pre_transform = caps.currentTransform;
+  if (env_int("DRAW_ENGINE_VK_PREFER_IDENTITY", 0) != 0 &&
+      (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)) {
+    pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  }
+  sw.preTransform = pre_transform;
+  vk.pre_transform = pre_transform;
+  sw.compositeAlpha = composite;
+  sw.presentMode = present_mode;
+  sw.clipped = VK_TRUE;
+  if (vkCreateSwapchainKHR(vk.device, &sw, nullptr, &vk.swapchain) != VK_SUCCESS) {
+    return false;
+  }
+
+  uint32_t img_count = 0;
+  vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &img_count, nullptr);
+  vk.images.resize(img_count);
+  vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &img_count, vk.images.data());
+
+  vk.image_views.resize(vk.images.size());
+  for (size_t i = 0; i < vk.images.size(); ++i) {
+    VkImageViewCreateInfo view{};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = vk.images[i];
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = vk.swapchain_format;
+    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view.subresourceRange.baseMipLevel = 0;
+    view.subresourceRange.levelCount = 1;
+    view.subresourceRange.baseArrayLayer = 0;
+    view.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(vk.device, &view, nullptr, &vk.image_views[i]) != VK_SUCCESS) {
+      return false;
+    }
+  }
+
+  if (!vk_create_depth_image(vk,
+                             static_cast<int>(extent.width),
+                             static_cast<int>(extent.height),
+                             vk.msaa_samples)) {
+    return false;
+  }
+  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+    if (!vk_create_msaa_color_image(vk,
+                                    static_cast<int>(extent.width),
+                                    static_cast<int>(extent.height))) {
+      return false;
+    }
+  }
+
+  vk.framebuffers.resize(vk.image_views.size());
+  for (size_t i = 0; i < vk.image_views.size(); ++i) {
+    VkImageView attachments[3];
+    uint32_t attachment_count = 0;
+    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+      attachments[attachment_count++] = vk.msaa_color_view;
+      attachments[attachment_count++] = vk.image_views[i];
+      attachments[attachment_count++] = vk.depth_view;
+    } else {
+      attachments[attachment_count++] = vk.image_views[i];
+      attachments[attachment_count++] = vk.depth_view;
+    }
+    VkFramebufferCreateInfo fb{};
+    fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb.renderPass = vk.render_pass;
+    fb.attachmentCount = attachment_count;
+    fb.pAttachments = attachments;
+    fb.width = extent.width;
+    fb.height = extent.height;
+    fb.layers = 1;
+    if (vkCreateFramebuffer(vk.device, &fb, nullptr, &vk.framebuffers[i]) != VK_SUCCESS) {
+      return false;
+    }
   }
   return true;
 }
@@ -1089,12 +1668,19 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   vkGetPhysicalDeviceFeatures(vk.physical, &supported);
   vk.supports_anisotropy = supported.samplerAnisotropy == VK_TRUE;
   vk.supports_wide_lines = supported.wideLines == VK_TRUE;
+  vk.supports_timestamps = props.limits.timestampComputeAndGraphics == VK_TRUE;
+  vk.timestamp_period = props.limits.timestampPeriod;
   vk.max_anisotropy = vk.supports_anisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
+  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 4);
+  VkSampleCountFlags counts =
+      props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
+  vk.msaa_samples = choose_sample_count(counts, msaa_req);
   fprintf(stderr, "Vulkan device: %s api=%u.%u.%u\n",
           props.deviceName,
           VK_VERSION_MAJOR(props.apiVersion),
           VK_VERSION_MINOR(props.apiVersion),
           VK_VERSION_PATCH(props.apiVersion));
+  fprintf(stderr, "Vulkan MSAA: %dx\n", sample_count_to_int(vk.msaa_samples));
 
   float priority = 1.0f;
   VkDeviceQueueCreateInfo qinfo{};
@@ -1157,11 +1743,40 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   VkExtent2D extent{};
   if (caps.currentExtent.width != UINT32_MAX) {
     extent = caps.currentExtent;
+    const int force_extent = env_int("DRAW_ENGINE_VK_FORCE_EXTENT", 1);
+    if (force_extent != 0 && width > 0 && height > 0 &&
+        (extent.width != static_cast<uint32_t>(width) ||
+         extent.height != static_cast<uint32_t>(height))) {
+      extent.width = static_cast<uint32_t>(width);
+      extent.height = static_cast<uint32_t>(height);
+    }
   } else {
     extent.width = static_cast<uint32_t>(width);
     extent.height = static_cast<uint32_t>(height);
   }
+  VkSurfaceTransformFlagBitsKHR pre_transform = caps.currentTransform;
+  if (env_int("DRAW_ENGINE_VK_PREFER_IDENTITY", 0) != 0 &&
+      (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)) {
+    pre_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  }
   vk.extent = extent;
+  vk.pre_transform = pre_transform;
+  fprintf(stderr,
+          "Vulkan swapchain extent: caps=%ux%u desired=%dx%d final=%ux%u\n",
+          caps.currentExtent.width,
+          caps.currentExtent.height,
+          width,
+          height,
+          extent.width,
+          extent.height);
+  fprintf(stderr,
+          "Vulkan swapchain extent: caps=%ux%u desired=%dx%d final=%ux%u\n",
+          caps.currentExtent.width,
+          caps.currentExtent.height,
+          width,
+          height,
+          extent.width,
+          extent.height);
 
   uint32_t image_count = caps.minImageCount + 1;
   if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
@@ -1186,7 +1801,7 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   sw.imageArrayLayers = 1;
   sw.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   sw.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  sw.preTransform = caps.currentTransform;
+  sw.preTransform = pre_transform;
   sw.compositeAlpha = composite;
   sw.presentMode = present_mode;
   sw.clipped = VK_TRUE;
@@ -1215,24 +1830,49 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     vkCreateImageView(vk.device, &view, nullptr, &vk.image_views[i]);
   }
 
-  if (!vk_create_depth_image(vk, static_cast<int>(extent.width), static_cast<int>(extent.height))) {
+  if (!vk_create_depth_image(vk,
+                             static_cast<int>(extent.width),
+                             static_cast<int>(extent.height),
+                             vk.msaa_samples)) {
     fprintf(stderr, "vk depth image failed\n");
     return false;
+  }
+  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+    if (!vk_create_msaa_color_image(vk,
+                                    static_cast<int>(extent.width),
+                                    static_cast<int>(extent.height))) {
+      fprintf(stderr, "vk msaa color image failed\n");
+      return false;
+    }
   }
 
   VkAttachmentDescription color{};
   color.format = vk.swapchain_format;
-  color.samples = VK_SAMPLE_COUNT_1_BIT;
+  color.samples = vk.msaa_samples;
   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  color.storeOp = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT)
+                      ? VK_ATTACHMENT_STORE_OP_STORE
+                      : VK_ATTACHMENT_STORE_OP_DONT_CARE;
   color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  color.finalLayout = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT)
+                          ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkAttachmentDescription resolve{};
+  resolve.format = vk.swapchain_format;
+  resolve.samples = VK_SAMPLE_COUNT_1_BIT;
+  resolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  resolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  resolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  resolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  resolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  resolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
   VkAttachmentDescription depth{};
   depth.format = vk.depth_format;
-  depth.samples = VK_SAMPLE_COUNT_1_BIT;
+  depth.samples = vk.msaa_samples;
   depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1244,20 +1884,34 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   color_ref.attachment = 0;
   color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+  VkAttachmentReference resolve_ref{};
+  resolve_ref.attachment = 1;
+  resolve_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
   VkAttachmentReference depth_ref{};
-  depth_ref.attachment = 1;
+  depth_ref.attachment = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 1 : 2;
   depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   VkSubpassDescription subpass{};
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.colorAttachmentCount = 1;
   subpass.pColorAttachments = &color_ref;
+  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+    subpass.pResolveAttachments = &resolve_ref;
+  }
   subpass.pDepthStencilAttachment = &depth_ref;
 
-  VkAttachmentDescription attachments[2] = {color, depth};
+  VkAttachmentDescription attachments[3];
+  uint32_t attachment_count = 0;
+  attachments[attachment_count++] = color;
+  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+    attachments[attachment_count++] = resolve;
+  }
+  attachments[attachment_count++] = depth;
+
   VkRenderPassCreateInfo rp{};
   rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  rp.attachmentCount = 2;
+  rp.attachmentCount = attachment_count;
   rp.pAttachments = attachments;
   rp.subpassCount = 1;
   rp.pSubpasses = &subpass;
@@ -1367,7 +2021,9 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
 
   VkPipelineMultisampleStateCreateInfo ms{};
   ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  ms.rasterizationSamples = vk.msaa_samples;
+  ms.sampleShadingEnable = (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) ? VK_TRUE : VK_FALSE;
+  ms.minSampleShading = 1.0f;
 
   VkPipelineColorBlendAttachmentState blend{};
   blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -1443,11 +2099,20 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
 
   vk.framebuffers.resize(vk.image_views.size());
   for (size_t i = 0; i < vk.image_views.size(); ++i) {
-    VkImageView attachments[] = {vk.image_views[i], vk.depth_view};
+    VkImageView attachments[3];
+    uint32_t attachment_count = 0;
+    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+      attachments[attachment_count++] = vk.msaa_color_view;
+      attachments[attachment_count++] = vk.image_views[i];
+      attachments[attachment_count++] = vk.depth_view;
+    } else {
+      attachments[attachment_count++] = vk.image_views[i];
+      attachments[attachment_count++] = vk.depth_view;
+    }
     VkFramebufferCreateInfo fb{};
     fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fb.renderPass = vk.render_pass;
-    fb.attachmentCount = 2;
+    fb.attachmentCount = attachment_count;
     fb.pAttachments = attachments;
     fb.width = extent.width;
     fb.height = extent.height;
@@ -1476,6 +2141,17 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
   vkCreateFence(vk.device, &fence, nullptr, &vk.in_flight);
+
+  if (vk.supports_timestamps) {
+    VkQueryPoolCreateInfo qp{};
+    qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qp.queryCount = 2;
+    if (vkCreateQueryPool(vk.device, &qp, nullptr, &vk.query_pool) != VK_SUCCESS) {
+      vk.query_pool = VK_NULL_HANDLE;
+      vk.supports_timestamps = false;
+    }
+  }
 
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1550,6 +2226,9 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.command_pool) {
     vkDestroyCommandPool(vk.device, vk.command_pool, nullptr);
   }
+  if (vk.query_pool) {
+    vkDestroyQueryPool(vk.device, vk.query_pool, nullptr);
+  }
   if (vk.pipeline_tri_2d) {
     vkDestroyPipeline(vk.device, vk.pipeline_tri_2d, nullptr);
   }
@@ -1573,6 +2252,15 @@ static void vk_cleanup(VulkanContext& vk) {
   }
   for (auto view : vk.image_views) {
     vkDestroyImageView(vk.device, view, nullptr);
+  }
+  if (vk.msaa_color_view) {
+    vkDestroyImageView(vk.device, vk.msaa_color_view, nullptr);
+  }
+  if (vk.msaa_color_image) {
+    vkDestroyImage(vk.device, vk.msaa_color_image, nullptr);
+  }
+  if (vk.msaa_color_memory) {
+    vkFreeMemory(vk.device, vk.msaa_color_memory, nullptr);
   }
   if (vk.depth_view) {
     vkDestroyImageView(vk.device, vk.depth_view, nullptr);
@@ -1627,13 +2315,28 @@ static bool vk_draw_frame(GpuState& gpu) {
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(vk.command_buffer, &begin);
 
-  VkClearValue clear[2]{};
+  if (vk.supports_timestamps && vk.query_pool) {
+    vkCmdResetQueryPool(vk.command_buffer, vk.query_pool, 0, 2);
+    vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        vk.query_pool, 0);
+  }
+
+  VkClearValue clear[3]{};
   clear[0].color.float32[0] = 0.0f;
   clear[0].color.float32[1] = 0.0f;
   clear[0].color.float32[2] = 0.0f;
   clear[0].color.float32[3] = 0.0f;
-  clear[1].depthStencil.depth = 1.0f;
-  clear[1].depthStencil.stencil = 0;
+  if (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) {
+    clear[1].depthStencil.depth = 1.0f;
+    clear[1].depthStencil.stencil = 0;
+  } else {
+    clear[1].color.float32[0] = 0.0f;
+    clear[1].color.float32[1] = 0.0f;
+    clear[1].color.float32[2] = 0.0f;
+    clear[1].color.float32[3] = 0.0f;
+    clear[2].depthStencil.depth = 1.0f;
+    clear[2].depthStencil.stencil = 0;
+  }
 
   VkRenderPassBeginInfo rp{};
   rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1641,7 +2344,7 @@ static bool vk_draw_frame(GpuState& gpu) {
   rp.framebuffer = vk.framebuffers[image_index];
   rp.renderArea.offset = {0, 0};
   rp.renderArea.extent = vk.extent;
-  rp.clearValueCount = 2;
+  rp.clearValueCount = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 2 : 3;
   rp.pClearValues = clear;
   vkCmdBeginRenderPass(vk.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -1707,6 +2410,11 @@ static bool vk_draw_frame(GpuState& gpu) {
   }
 
   vkCmdEndRenderPass(vk.command_buffer);
+
+  if (vk.supports_timestamps && vk.query_pool) {
+    vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        vk.query_pool, 1);
+  }
   vkEndCommandBuffer(vk.command_buffer);
 
   VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1729,6 +2437,35 @@ static bool vk_draw_frame(GpuState& gpu) {
   present.pSwapchains = &vk.swapchain;
   present.pImageIndices = &image_index;
   vkQueuePresentKHR(vk.queue, &present);
+
+  double gpu_ms = 0.0;
+  if (vk.supports_timestamps && vk.query_pool) {
+    uint64_t timestamps[2] = {};
+    if (vkGetQueryPoolResults(vk.device,
+                              vk.query_pool,
+                              0,
+                              2,
+                              sizeof(timestamps),
+                              timestamps,
+                              sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+      if (timestamps[1] > timestamps[0]) {
+        gpu_ms = (timestamps[1] - timestamps[0]) * vk.timestamp_period / 1e6;
+      }
+    }
+  }
+  const uint64_t now = now_ns();
+  if (gpu.log_interval <= 0) {
+    gpu.log_interval = env_int("DRAW_ENGINE_LOG_INTERVAL", 120);
+  }
+  if (gpu.last_log_ns == 0) {
+    gpu.last_log_ns = now;
+  }
+  if (gpu.log_interval > 0 && (gpu.frame_index % static_cast<uint64_t>(gpu.log_interval)) == 0) {
+    fprintf(stderr, "GPU frame: %.3f ms (Vulkan)\n", gpu_ms);
+    gpu.last_log_ns = now;
+  }
+  gpu.frame_index++;
   return true;
 }
 
@@ -1775,6 +2512,19 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
     return false;
   }
 
+  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 4);
+  const EGLint config_attrs_msaa[] = {
+      EGL_RED_SIZE, 8,
+      EGL_GREEN_SIZE, 8,
+      EGL_BLUE_SIZE, 8,
+      EGL_ALPHA_SIZE, 8,
+      EGL_DEPTH_SIZE, 16,
+      EGL_SAMPLE_BUFFERS, 1,
+      EGL_SAMPLES, msaa_req,
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+      EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+      EGL_NONE
+  };
   const EGLint config_attrs[] = {
       EGL_RED_SIZE, 8,
       EGL_GREEN_SIZE, 8,
@@ -1786,9 +2536,17 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
       EGL_NONE
   };
   EGLint num_configs = 0;
-  if (!eglChooseConfig(gl.display, config_attrs, &gl.config, 1, &num_configs) ||
-      num_configs == 0) {
-    return false;
+  if (msaa_req > 1) {
+    if (eglChooseConfig(gl.display, config_attrs_msaa, &gl.config, 1, &num_configs) &&
+        num_configs > 0) {
+      gl.samples = msaa_req;
+    }
+  }
+  if (num_configs == 0) {
+    if (!eglChooseConfig(gl.display, config_attrs, &gl.config, 1, &num_configs) ||
+        num_configs == 0) {
+      return false;
+    }
   }
 
   EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
@@ -1895,6 +2653,15 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glEnable(GL_DEPTH_TEST);
   glDepthFunc(GL_LEQUAL);
+  if (gl.samples > 1) {
+#ifdef GL_MULTISAMPLE
+    glEnable(GL_MULTISAMPLE);
+#endif
+#ifdef GL_SAMPLE_ALPHA_TO_COVERAGE
+    glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+#endif
+    fprintf(stderr, "GLES MSAA: %dx\n", gl.samples);
+  }
 
   gl.ready = true;
   return true;
@@ -1948,6 +2715,7 @@ static bool gl_draw_frame(GpuState& gpu) {
   if (gpu.vertices.empty()) {
     return true;
   }
+  const uint64_t start = now_ns();
   glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
   glBufferSubData(GL_ARRAY_BUFFER, 0, gpu.vertices.size() * sizeof(GpuVertex),
                   gpu.vertices.data());
@@ -1982,7 +2750,19 @@ static bool gl_draw_frame(GpuState& gpu) {
     GLenum mode = batch.line ? GL_LINES : GL_TRIANGLES;
     glDrawArrays(mode, batch.first, batch.count);
   }
+  const int finish = env_int("DRAW_ENGINE_GL_FINISH", 0);
+  if (finish != 0) {
+    glFinish();
+  }
   eglSwapBuffers(gl.display, gl.surface);
+  const uint64_t end = now_ns();
+  if (gpu.log_interval <= 0) {
+    gpu.log_interval = env_int("DRAW_ENGINE_LOG_INTERVAL", 120);
+  }
+  if (gpu.log_interval > 0 && (gpu.frame_index % static_cast<uint64_t>(gpu.log_interval)) == 0) {
+    fprintf(stderr, "GPU frame: %.3f ms (GLES)\n", (end - start) / 1000000.0);
+  }
+  gpu.frame_index++;
   return true;
 }
 
@@ -2069,6 +2849,326 @@ static bool gpu_prepare_texture(GpuState& gpu, DrawImage* image) {
   return false;
 }
 
+static void gpu_refresh_size_and_rotation() {
+  if (g_engine.backend == BACKEND_CPU || !g_gpu.window) {
+    return;
+  }
+  static int last_w = 0;
+  static int last_h = 0;
+  static int last_rot = -1;
+  int display_rot = 0;
+  int display_w = 0;
+  int display_h = 0;
+  const bool got_display =
+      (midraw_display_rotation(g_engine.cpu_ctx, &display_rot, &display_w, &display_h) == 0);
+  int display_logical_w = display_w;
+  int display_logical_h = display_h;
+  if (display_w > 0 && display_h > 0) {
+    const int long_side = (display_w > display_h) ? display_w : display_h;
+    const int short_side = (display_w > display_h) ? display_h : display_w;
+    const bool rot_landscape = (display_rot == 90 || display_rot == 270);
+    const bool size_landscape = display_w >= display_h;
+    if (rot_landscape != size_landscape) {
+      display_logical_w = long_side;
+      display_logical_h = short_side;
+    } else {
+      display_logical_w = display_w;
+      display_logical_h = display_h;
+    }
+  }
+
+  int aw_w = 0;
+  int aw_h = 0;
+  if (!query_native_window_size(g_gpu.window, &aw_w, &aw_h)) {
+    aw_w = 0;
+    aw_h = 0;
+  }
+
+  const int manual_mode = env_int("DRAW_ENGINE_MANUAL_ROTATION", 0);
+  const int use_display_size = env_int("DRAW_ENGINE_USE_DISPLAY_SIZE", 0);
+  const int resize_on_rotation = env_int("DRAW_ENGINE_RESIZE_ON_ROTATION", 0);
+  const int counter_rotation = env_int("DRAW_ENGINE_COUNTER_ROTATION", 1);
+  int target_w = aw_w;
+  int target_h = aw_h;
+  if (manual_mode == 0 && use_display_size != 0 && got_display && display_logical_w > 0 &&
+      display_logical_h > 0) {
+    target_w = display_logical_w;
+    target_h = display_logical_h;
+  }
+  if (target_w > 0 && target_h > 0 && resize_on_rotation != 0) {
+    if (g_gpu.physical_width != target_w || g_gpu.physical_height != target_h) {
+      bool resized = false;
+      if (manual_mode == 0 && g_engine.cpu_ctx) {
+        if (midraw_resize(g_engine.cpu_ctx, target_w, target_h) == 0) {
+          g_gpu.physical_width = target_w;
+          g_gpu.physical_height = target_h;
+          resized = true;
+        }
+      }
+      if (!resized && aw_w > 0 && aw_h > 0) {
+        g_gpu.physical_width = aw_w;
+        g_gpu.physical_height = aw_h;
+      }
+    }
+  } else if (aw_w > 0 && aw_h > 0) {
+    g_gpu.physical_width = aw_w;
+    g_gpu.physical_height = aw_h;
+  }
+  if (!g_engine.rotation_forced && env_int("DRAW_ENGINE_AUTO_ROTATE", 1) != 0) {
+    if (manual_mode != 0) {
+      if (got_display) {
+        g_engine.rotation = display_rot;
+        g_gpu.rotation = display_rot;
+      } else if (aw_w > 0 && aw_h > 0) {
+        const int guess = (aw_w > aw_h) ? 90 : 0;
+        g_engine.rotation = guess;
+        g_gpu.rotation = guess;
+      }
+    } else if (counter_rotation != 0 && got_display) {
+      bool window_matches_display = false;
+      if (aw_w > 0 && aw_h > 0 && display_logical_w > 0 && display_logical_h > 0) {
+        window_matches_display =
+            (aw_w == display_logical_w && aw_h == display_logical_h);
+      }
+      if (window_matches_display) {
+        g_engine.rotation = 0;
+        g_gpu.rotation = 0;
+      } else {
+        int rot = 0;
+        if (display_rot == 90) {
+          rot = 270;
+        } else if (display_rot == 270) {
+          rot = 90;
+        } else if (display_rot == 180) {
+          rot = 180;
+        }
+        g_engine.rotation = rot;
+        g_gpu.rotation = rot;
+      }
+    } else {
+      g_engine.rotation = 0;
+      g_gpu.rotation = 0;
+    }
+  }
+
+  const int set_transform = env_int("DRAW_ENGINE_SET_BUFFER_TRANSFORM", 1);
+  if (set_transform != 0 && manual_mode == 0 && got_display &&
+      g_engine.backend != BACKEND_VULKAN) {
+    bool window_matches_display = false;
+    if (aw_w > 0 && aw_h > 0 && display_logical_w > 0 && display_logical_h > 0) {
+      window_matches_display =
+          (aw_w == display_logical_w && aw_h == display_logical_h);
+    }
+    int desired_transform = 0;
+    if (!window_matches_display) {
+      if (display_rot == 90) {
+        desired_transform = 4;
+      } else if (display_rot == 270) {
+        desired_transform = 7;
+      } else if (display_rot == 180) {
+        desired_transform = 3;
+      }
+    }
+    static int last_transform = INT_MIN;
+    if (desired_transform != last_transform) {
+      if (set_native_window_transform(g_gpu.window,
+                                      static_cast<int32_t>(desired_transform))) {
+        fprintf(stderr, "GPU set buffers transform=%d\n", desired_transform);
+      }
+      last_transform = desired_transform;
+    }
+  }
+
+  if (got_display && display_logical_w > 0 && display_logical_h > 0) {
+    g_gpu.logical_width = display_logical_w;
+    g_gpu.logical_height = display_logical_h;
+  } else if (g_gpu.rotation == 90 || g_gpu.rotation == 270) {
+    g_gpu.logical_width = g_gpu.physical_height;
+    g_gpu.logical_height = g_gpu.physical_width;
+  } else {
+    g_gpu.logical_width = g_gpu.physical_width;
+    g_gpu.logical_height = g_gpu.physical_height;
+  }
+  static int last_disp_w = 0;
+  static int last_disp_h = 0;
+  static int last_disp_rot = -1;
+  static int last_aw_w = 0;
+  static int last_aw_h = 0;
+  if (got_display &&
+      (display_w != last_disp_w || display_h != last_disp_h || display_rot != last_disp_rot)) {
+    fprintf(stderr,
+            "GPU display info: rot=%d raw=%dx%d logical=%dx%d\n",
+            display_rot,
+            display_w,
+            display_h,
+            display_logical_w,
+            display_logical_h);
+    last_disp_w = display_w;
+    last_disp_h = display_h;
+    last_disp_rot = display_rot;
+  }
+  if (aw_w != last_aw_w || aw_h != last_aw_h) {
+    fprintf(stderr, "GPU window size: %dx%d\n", aw_w, aw_h);
+    last_aw_w = aw_w;
+    last_aw_h = aw_h;
+  }
+  static int last_display_logical_w = 0;
+  static int last_display_logical_h = 0;
+  static int last_display_logical_rot = INT_MIN;
+  if (got_display && display_logical_w > 0 && display_logical_h > 0 &&
+      (display_logical_w != last_display_logical_w ||
+       display_logical_h != last_display_logical_h ||
+       g_gpu.rotation != last_display_logical_rot)) {
+    fprintf(stderr, "GPU display logical: %dx%d mapped_rot=%d\n",
+            display_logical_w, display_logical_h, g_gpu.rotation);
+    last_display_logical_w = display_logical_w;
+    last_display_logical_h = display_logical_h;
+    last_display_logical_rot = g_gpu.rotation;
+  }
+  if (g_engine.backend == BACKEND_VULKAN) {
+    static VkSurfaceTransformFlagBitsKHR last_vk_transform =
+        VK_SURFACE_TRANSFORM_FLAG_BITS_MAX_ENUM_KHR;
+    if (g_gpu.vk.pre_transform != last_vk_transform) {
+      fprintf(stderr, "GPU Vulkan preTransform=0x%x\n",
+              static_cast<unsigned int>(g_gpu.vk.pre_transform));
+      last_vk_transform = g_gpu.vk.pre_transform;
+    }
+  }
+  if (g_gpu.physical_width != last_w || g_gpu.physical_height != last_h ||
+      g_gpu.rotation != last_rot) {
+    fprintf(stderr, "GPU rotate update: rot=%d phys=%dx%d logical=%dx%d\n",
+            g_gpu.rotation,
+            g_gpu.physical_width,
+            g_gpu.physical_height,
+            g_gpu.logical_width,
+            g_gpu.logical_height);
+#if DRAW_ENGINE_HAS_VULKAN
+    if (g_engine.backend == BACKEND_VULKAN && g_gpu.vk.ready &&
+        (g_gpu.vk.extent.width != static_cast<uint32_t>(g_gpu.physical_width) ||
+         g_gpu.vk.extent.height != static_cast<uint32_t>(g_gpu.physical_height))) {
+      vkDeviceWaitIdle(g_gpu.vk.device);
+      vk_destroy_swapchain(g_gpu.vk);
+      if (vk_create_swapchain_resources(g_gpu.vk,
+                                        g_gpu.physical_width,
+                                        g_gpu.physical_height)) {
+        g_gpu.physical_width = static_cast<int>(g_gpu.vk.extent.width);
+        g_gpu.physical_height = static_cast<int>(g_gpu.vk.extent.height);
+        if (g_gpu.rotation == 90 || g_gpu.rotation == 270) {
+          g_gpu.logical_width = g_gpu.physical_height;
+          g_gpu.logical_height = g_gpu.physical_width;
+        } else {
+          g_gpu.logical_width = g_gpu.physical_width;
+          g_gpu.logical_height = g_gpu.physical_height;
+        }
+      }
+    }
+#endif
+    last_w = g_gpu.physical_width;
+    last_h = g_gpu.physical_height;
+    last_rot = g_gpu.rotation;
+  }
+}
+
+static int recreate_engine_surface() {
+  if (!g_engine.cpu_ctx) {
+    return -1;
+  }
+  const BackendType backend = g_engine.backend;
+  const int rotation = g_engine.rotation;
+  const bool rotation_forced = g_engine.rotation_forced;
+
+  midraw_shutdown(g_engine.cpu_ctx);
+  g_engine.cpu_ctx = nullptr;
+  gpu_shutdown(g_gpu);
+
+  MidrawConfig cfg{};
+  cfg.surface_name = g_engine.surface_name;
+  cfg.rotation = rotation;
+  cfg.width = 0;
+  cfg.height = 0;
+  cfg.font_path = getenv("MIDRAW_FONT_PATH");
+  cfg.font_size = env_int("MIDRAW_FONT_SIZE", 0);
+  cfg.atlas_size = env_int("MIDRAW_ATLAS_SIZE", 512);
+
+  if (midraw_init(&g_engine.cpu_ctx, &cfg) != 0) {
+    fprintf(stderr, "draw_engine: recreate midraw_init failed\n");
+    return -1;
+  }
+  g_engine.rotation_forced = rotation_forced;
+  g_engine.rotation = rotation;
+
+  if (backend != BACKEND_CPU) {
+    ANativeWindow* window =
+        reinterpret_cast<ANativeWindow*>(midraw_get_native_window(g_engine.cpu_ctx));
+    const int w = midraw_logical_width(g_engine.cpu_ctx);
+    const int h = midraw_logical_height(g_engine.cpu_ctx);
+    if (!window || !gpu_init(g_gpu, backend, window, w, h, g_engine.rotation)) {
+      const bool can_try_gles =
+          (backend == BACKEND_VULKAN) && DRAW_ENGINE_HAS_GLES &&
+          (has_library("libGLESv3.so") || has_library("libGLESv2.so"));
+      fprintf(stderr, "draw_engine: recreate GPU init failed (%s)\n",
+              backend == BACKEND_VULKAN ? "Vulkan" : "GLES");
+      gpu_shutdown(g_gpu);
+      if (can_try_gles) {
+        if (gpu_init(g_gpu, BACKEND_GLES, window, w, h, g_engine.rotation)) {
+          g_engine.backend = BACKEND_GLES;
+          fprintf(stderr,
+                  "draw_engine: recreate fallback to GLES logical=%dx%d physical=%dx%d rot=%d\n",
+                  g_gpu.logical_width,
+                  g_gpu.logical_height,
+                  g_gpu.physical_width,
+                  g_gpu.physical_height,
+                  g_engine.rotation);
+        } else {
+          fprintf(stderr, "draw_engine: recreate GLES init failed, fallback CPU\n");
+          gpu_shutdown(g_gpu);
+          g_engine.backend = BACKEND_CPU;
+        }
+      } else {
+        fprintf(stderr, "draw_engine: recreate fallback CPU\n");
+        g_engine.backend = BACKEND_CPU;
+      }
+    } else {
+      g_engine.backend = backend;
+      fprintf(stderr, "draw_engine: GPU surface logical=%dx%d physical=%dx%d rot=%d\n",
+              g_gpu.logical_width,
+              g_gpu.logical_height,
+              g_gpu.physical_width,
+              g_gpu.physical_height,
+              g_engine.rotation);
+    }
+  } else {
+    g_engine.backend = BACKEND_CPU;
+  }
+  return 0;
+}
+
+static void maybe_recreate_on_rotation() {
+  if (!g_engine.cpu_ctx || g_engine.backend == BACKEND_CPU) {
+    return;
+  }
+  if (env_int("DRAW_ENGINE_RECREATE_ON_ROTATION", 1) == 0) {
+    return;
+  }
+  static int last_display_rot = INT_MIN;
+  int display_rot = 0;
+  int display_w = 0;
+  int display_h = 0;
+  if (midraw_display_rotation(g_engine.cpu_ctx, &display_rot, &display_w, &display_h) != 0) {
+    return;
+  }
+  if (last_display_rot == INT_MIN) {
+    last_display_rot = display_rot;
+    return;
+  }
+  if (display_rot != last_display_rot) {
+    fprintf(stderr, "draw_engine: rotation changed %d -> %d, recreating surface\n",
+            last_display_rot, display_rot);
+    last_display_rot = display_rot;
+    recreate_engine_surface();
+  }
+}
+
 static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, int width,
                      int height, int rotation) {
   memset(&gpu, 0, sizeof(gpu));
@@ -2092,10 +3192,38 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
   if (backend == BACKEND_VULKAN) {
     if (DRAW_ENGINE_HAS_VULKAN) {
       ok = vk_init_context(gpu.vk, window, gpu.physical_width, gpu.physical_height);
+      if (ok) {
+        gpu.physical_width = static_cast<int>(gpu.vk.extent.width);
+        gpu.physical_height = static_cast<int>(gpu.vk.extent.height);
+        if (rotation == 90 || rotation == 270) {
+          gpu.logical_width = gpu.physical_height;
+          gpu.logical_height = gpu.physical_width;
+        } else {
+          gpu.logical_width = gpu.physical_width;
+          gpu.logical_height = gpu.physical_height;
+        }
+      }
     }
   } else if (backend == BACKEND_GLES) {
     if (DRAW_ENGINE_HAS_GLES) {
       ok = gl_init_context(gpu.gl, window);
+      if (ok) {
+        EGLint w = 0;
+        EGLint h = 0;
+        if (eglQuerySurface(gpu.gl.display, gpu.gl.surface, EGL_WIDTH, &w) &&
+            eglQuerySurface(gpu.gl.display, gpu.gl.surface, EGL_HEIGHT, &h) &&
+            w > 0 && h > 0) {
+          gpu.physical_width = static_cast<int>(w);
+          gpu.physical_height = static_cast<int>(h);
+          if (rotation == 90 || rotation == 270) {
+            gpu.logical_width = gpu.physical_height;
+            gpu.logical_height = gpu.physical_width;
+          } else {
+            gpu.logical_width = gpu.physical_width;
+            gpu.logical_height = gpu.physical_height;
+          }
+        }
+      }
     }
   }
   if (!ok) {
@@ -2170,7 +3298,14 @@ int init_draw_windows(const char* name, int randomize_name) {
     shuffle_name(g_engine.surface_name);
   }
 
-  g_engine.rotation = env_int("MIDRAW_ROTATION", 0);
+  const char* rot_env = getenv("MIDRAW_ROTATION");
+  if (rot_env && rot_env[0]) {
+    g_engine.rotation = atoi(rot_env);
+    g_engine.rotation_forced = true;
+  } else {
+    g_engine.rotation = 0;
+    g_engine.rotation_forced = false;
+  }
 
   MidrawConfig cfg{};
   cfg.surface_name = g_engine.surface_name;
@@ -2191,9 +3326,38 @@ int init_draw_windows(const char* name, int randomize_name) {
     const int w = midraw_logical_width(g_engine.cpu_ctx);
     const int h = midraw_logical_height(g_engine.cpu_ctx);
     if (!window || !gpu_init(g_gpu, g_engine.backend, window, w, h, g_engine.rotation)) {
-      fprintf(stderr, "draw_engine: GPU init failed, fallback CPU\n");
+      const bool can_try_gles =
+          (g_engine.backend == BACKEND_VULKAN) && DRAW_ENGINE_HAS_GLES &&
+          (has_library("libGLESv3.so") || has_library("libGLESv2.so"));
+      fprintf(stderr, "draw_engine: GPU init failed (%s)\n",
+              g_engine.backend == BACKEND_VULKAN ? "Vulkan" : "GLES");
       gpu_shutdown(g_gpu);
-      g_engine.backend = BACKEND_CPU;
+      if (can_try_gles) {
+        if (gpu_init(g_gpu, BACKEND_GLES, window, w, h, g_engine.rotation)) {
+          g_engine.backend = BACKEND_GLES;
+          fprintf(stderr,
+                  "draw_engine: fallback to GLES logical=%dx%d physical=%dx%d rot=%d\n",
+                  g_gpu.logical_width,
+                  g_gpu.logical_height,
+                  g_gpu.physical_width,
+                  g_gpu.physical_height,
+                  g_engine.rotation);
+        } else {
+          fprintf(stderr, "draw_engine: GLES init failed, fallback CPU\n");
+          gpu_shutdown(g_gpu);
+          g_engine.backend = BACKEND_CPU;
+        }
+      } else {
+        fprintf(stderr, "draw_engine: fallback CPU\n");
+        g_engine.backend = BACKEND_CPU;
+      }
+    } else {
+      fprintf(stderr, "draw_engine: GPU surface logical=%dx%d physical=%dx%d rot=%d\n",
+              g_gpu.logical_width,
+              g_gpu.logical_height,
+              g_gpu.physical_width,
+              g_gpu.physical_height,
+              g_engine.rotation);
     }
   } else {
     gpu_shutdown(g_gpu);
@@ -2221,11 +3385,13 @@ int draw_begin_frame(void) {
   if (g_engine.in_frame) {
     return 0;
   }
+  maybe_recreate_on_rotation();
   if (g_engine.backend == BACKEND_CPU) {
     if (midraw_lock(g_engine.cpu_ctx) != 0) {
       return -1;
     }
   } else {
+    gpu_refresh_size_and_rotation();
     gpu_reset_frame(g_gpu);
   }
   g_engine.in_frame = true;
@@ -2250,12 +3416,18 @@ int draw_screen_width(void) {
   if (!g_engine.cpu_ctx) {
     return 0;
   }
+  if (g_engine.backend != BACKEND_CPU) {
+    return g_gpu.logical_width;
+  }
   return midraw_logical_width(g_engine.cpu_ctx);
 }
 
 int draw_screen_height(void) {
   if (!g_engine.cpu_ctx) {
     return 0;
+  }
+  if (g_engine.backend != BACKEND_CPU) {
+    return g_gpu.logical_height;
   }
   return midraw_logical_height(g_engine.cpu_ctx);
 }
@@ -2421,6 +3593,9 @@ extern "C" void draw_engine_demo_scene(uint64_t frame) {
       {0.6f, 0.4f, -2.5f},
       {0.0f, -0.6f, -2.5f},
   };
+  const float ground_y = -0.9f;
+  const float grid_half = 1.5f;
+  const int grid_steps = 10;
 
   float vx[3], vy[3], vz[3];
   for (int i = 0; i < 3; ++i) {
@@ -2436,13 +3611,18 @@ extern "C" void draw_engine_demo_scene(uint64_t frame) {
     gpu_push_triangle3d(g_gpu, vx[0], vy[0], vz[0], vx[1], vy[1], vz[1],
                         vx[2], vy[2], vz[2], 0xFF0000FF);
 
-    const float ground_y = -0.9f;
     const float z0 = -2.0f;
     const float z1 = -4.0f;
     gpu_push_triangle3d(g_gpu, -1.5f, ground_y, z0, 1.5f, ground_y, z0,
                         1.5f, ground_y, z1, 0xFF00FF00);
     gpu_push_triangle3d(g_gpu, -1.5f, ground_y, z0, 1.5f, ground_y, z1,
                         -1.5f, ground_y, z1, 0xFF00FF00);
+
+    for (int i = 0; i <= grid_steps; ++i) {
+      const float t = -grid_half + (2.0f * grid_half * i) / grid_steps;
+      gpu_push_line3d(g_gpu, -grid_half, ground_y, t, grid_half, ground_y, t, 0xFF404040);
+      gpu_push_line3d(g_gpu, t, ground_y, -grid_half, t, ground_y, grid_half, 0xFF404040);
+    }
 
     const float cube_size = 0.5f;
     const float cx = 0.0f;
@@ -2502,6 +3682,17 @@ extern "C" void draw_engine_demo_scene(uint64_t frame) {
   draw_line(sx[0], sy[0], sx[1], sy[1], 0xFF0000FF);
   draw_line(sx[1], sy[1], sx[2], sy[2], 0xFF0000FF);
   draw_line(sx[2], sy[2], sx[0], sy[0], 0xFF0000FF);
+
+  for (int i = 0; i <= grid_steps; ++i) {
+    const float t = -grid_half + (2.0f * grid_half * i) / grid_steps;
+    int ax = 0, ay = 0, bx = 0, by = 0;
+    project(-grid_half, ground_y, t, &ax, &ay);
+    project(grid_half, ground_y, t, &bx, &by);
+    draw_line(ax, ay, bx, by, 0xFF404040);
+    project(t, ground_y, -grid_half, &ax, &ay);
+    project(t, ground_y, grid_half, &bx, &by);
+    draw_line(ax, ay, bx, by, 0xFF404040);
+  }
 
   const float cube_size = 0.5f;
   const float cx = 0.0f;

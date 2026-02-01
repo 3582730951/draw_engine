@@ -3,13 +3,19 @@
 
 #include <android/native_window.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <math.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <sys/system_properties.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#include "utils/NativeSurfaceUtils.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -24,6 +30,21 @@
 #if defined(MIDRAW_USE_FONT8X8)
 #include "font8x8_basic.h"
 #endif
+
+#ifndef GRALLOC_USAGE_SW_WRITE_OFTEN
+#define GRALLOC_USAGE_SW_WRITE_OFTEN 0x00000030u
+#endif
+
+static constexpr int8_t kBufferTransparencyTranslucent = 1;
+
+struct ANativeWindowBuffer {
+  int32_t width;
+  int32_t height;
+  int32_t stride;
+  int32_t format;
+  int32_t usage;
+  void* reserved[2];
+};
 
 struct GlyphInfo {
   int x0 = 0;
@@ -72,6 +93,7 @@ struct MidrawContext {
   FontAtlas atlas;
   bool defer_lock = true;
   bool recording = false;
+  bool lock_size = false;
   DrawCommand command_buffer[kCommandCapacity]{};
   size_t command_head = 0;
   size_t command_count = 0;
@@ -192,6 +214,35 @@ static bool load_file(const char* path, uint8_t** out_data, size_t* out_size) {
   *out_data = data;
   *out_size = static_cast<size_t>(size);
   return true;
+}
+
+static int env_int(const char* name, int default_value) {
+  const char* value = getenv(name);
+  if (!value || !value[0]) {
+    return default_value;
+  }
+  return atoi(value);
+}
+
+static bool env_truthy(const char* name) {
+  const char* value = getenv(name);
+  if (!value || !value[0]) {
+    return false;
+  }
+  return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
+static int read_sdk_version() {
+  const char* override = getenv("MIDRAW_SDK");
+  if (override && override[0]) {
+    return atoi(override);
+  }
+  char value[PROP_VALUE_MAX] = {};
+  int len = __system_property_get("ro.build.version.sdk", value);
+  if (len > 0) {
+    return atoi(value);
+  }
+  return 0;
 }
 
 static const char* pick_default_font_path() {
@@ -331,6 +382,34 @@ static void* load_symbol_candidates(void* handle,
   return nullptr;
 }
 
+static void* load_symbol_any(const char* name, void* lib1, void* lib2, void* lib3) {
+  if (!name || !name[0]) {
+    return nullptr;
+  }
+  if (lib1) {
+    dlerror();
+    void* sym = dlsym(lib1, name);
+    if (!dlerror() && sym) {
+      return sym;
+    }
+  }
+  if (lib2) {
+    dlerror();
+    void* sym = dlsym(lib2, name);
+    if (!dlerror() && sym) {
+      return sym;
+    }
+  }
+  if (lib3) {
+    dlerror();
+    void* sym = dlsym(lib3, name);
+    if (!dlerror() && sym) {
+      return sym;
+    }
+  }
+  return nullptr;
+}
+
 static bool init_symbols(AndroidSymbols* symbols) {
   memset(symbols, 0, sizeof(*symbols));
 
@@ -346,11 +425,29 @@ static bool init_symbols(AndroidSymbols* symbols) {
     return false;
   }
 
+  symbols->libui = dlopen("libui.so", RTLD_NOW);
+  if (!symbols->libui) {
+    fprintf(stderr, "dlopen libui.so failed: %s\n", dlerror());
+  }
+
+  symbols->libnativewindow = dlopen("libnativewindow.so", RTLD_NOW);
+  if (!symbols->libnativewindow) {
+    fprintf(stderr, "dlopen libnativewindow.so failed: %s\n", dlerror());
+  }
+
   symbols->ASurfaceControl_create = reinterpret_cast<PFN_ASurfaceControl_create>(
       load_symbol_candidates(symbols->libgui, "ASurfaceControl_create",
                              kCandidates_ASurfaceControl_create,
                              sizeof(kCandidates_ASurfaceControl_create) /
                                  sizeof(kCandidates_ASurfaceControl_create[0])));
+  static const char* kCandidates_ASurfaceControl_createFromWindow[] = {
+      "ASurfaceControl_createFromWindow"};
+  symbols->ASurfaceControl_createFromWindow =
+      reinterpret_cast<PFN_ASurfaceControl_createFromWindow>(
+          load_symbol_candidates(symbols->libgui, "ASurfaceControl_createFromWindow",
+                                 kCandidates_ASurfaceControl_createFromWindow,
+                                 sizeof(kCandidates_ASurfaceControl_createFromWindow) /
+                                     sizeof(kCandidates_ASurfaceControl_createFromWindow[0])));
   symbols->ASurfaceControl_release = reinterpret_cast<PFN_ASurfaceControl_release>(
       load_symbol_candidates(symbols->libgui, "ASurfaceControl_release",
                              kCandidates_ASurfaceControl_release,
@@ -384,11 +481,44 @@ static bool init_symbols(AndroidSymbols* symbols) {
           kCandidates_ASurfaceTransaction_setLayer,
           sizeof(kCandidates_ASurfaceTransaction_setLayer) /
               sizeof(kCandidates_ASurfaceTransaction_setLayer[0])));
+  static const char* kCandidates_ASurfaceTransaction_setZOrder[] = {
+      "ASurfaceTransaction_setZOrder"};
+  symbols->ASurfaceTransaction_setZOrder =
+      reinterpret_cast<PFN_ASurfaceTransaction_setZOrder>(
+          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setZOrder",
+                                 kCandidates_ASurfaceTransaction_setZOrder,
+                                 sizeof(kCandidates_ASurfaceTransaction_setZOrder) /
+                                     sizeof(kCandidates_ASurfaceTransaction_setZOrder[0])));
   symbols->ASurfaceTransaction_apply = reinterpret_cast<PFN_ASurfaceTransaction_apply>(
       load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_apply",
                              kCandidates_ASurfaceTransaction_apply,
                              sizeof(kCandidates_ASurfaceTransaction_apply) /
                                  sizeof(kCandidates_ASurfaceTransaction_apply[0])));
+  static const char* kCandidates_ASurfaceTransaction_setBuffer[] = {
+      "ASurfaceTransaction_setBuffer"};
+  symbols->ASurfaceTransaction_setBuffer =
+      reinterpret_cast<PFN_ASurfaceTransaction_setBuffer>(
+          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setBuffer",
+                                 kCandidates_ASurfaceTransaction_setBuffer,
+                                 sizeof(kCandidates_ASurfaceTransaction_setBuffer) /
+                                     sizeof(kCandidates_ASurfaceTransaction_setBuffer[0])));
+  static const char* kCandidates_ASurfaceTransaction_setBufferTransparency[] = {
+      "ASurfaceTransaction_setBufferTransparency"};
+  symbols->ASurfaceTransaction_setBufferTransparency =
+      reinterpret_cast<PFN_ASurfaceTransaction_setBufferTransparency>(
+          load_symbol_candidates(
+              symbols->libgui, "ASurfaceTransaction_setBufferTransparency",
+              kCandidates_ASurfaceTransaction_setBufferTransparency,
+              sizeof(kCandidates_ASurfaceTransaction_setBufferTransparency) /
+                  sizeof(kCandidates_ASurfaceTransaction_setBufferTransparency[0])));
+  static const char* kCandidates_ASurfaceTransaction_setGeometry[] = {
+      "ASurfaceTransaction_setGeometry"};
+  symbols->ASurfaceTransaction_setGeometry =
+      reinterpret_cast<PFN_ASurfaceTransaction_setGeometry>(
+          load_symbol_candidates(symbols->libgui, "ASurfaceTransaction_setGeometry",
+                                 kCandidates_ASurfaceTransaction_setGeometry,
+                                 sizeof(kCandidates_ASurfaceTransaction_setGeometry) /
+                                     sizeof(kCandidates_ASurfaceTransaction_setGeometry[0])));
 
   symbols->ANativeWindow_fromSurfaceControl =
       reinterpret_cast<PFN_ANativeWindow_fromSurfaceControl>(load_symbol_candidates(
@@ -423,6 +553,84 @@ static bool init_symbols(AndroidSymbols* symbols) {
                              kCandidates_ANativeWindow_getHeight,
                              sizeof(kCandidates_ANativeWindow_getHeight) /
                                  sizeof(kCandidates_ANativeWindow_getHeight[0])));
+  static const char* kCandidates_ANativeWindow_setBuffersGeometry[] = {
+      "ANativeWindow_setBuffersGeometry"};
+  symbols->ANativeWindow_setBuffersGeometry =
+      reinterpret_cast<PFN_ANativeWindow_setBuffersGeometry>(
+          load_symbol_candidates(symbols->libandroid, "ANativeWindow_setBuffersGeometry",
+                                 kCandidates_ANativeWindow_setBuffersGeometry,
+                                 sizeof(kCandidates_ANativeWindow_setBuffersGeometry) /
+                                     sizeof(kCandidates_ANativeWindow_setBuffersGeometry[0])));
+
+  symbols->AHardwareBuffer_allocate = reinterpret_cast<PFN_AHardwareBuffer_allocate>(
+      load_symbol_any("AHardwareBuffer_allocate",
+                      symbols->libandroid,
+                      symbols->libnativewindow,
+                      symbols->libgui));
+  symbols->AHardwareBuffer_describe = reinterpret_cast<PFN_AHardwareBuffer_describe>(
+      load_symbol_any("AHardwareBuffer_describe",
+                      symbols->libandroid,
+                      symbols->libnativewindow,
+                      symbols->libgui));
+  symbols->AHardwareBuffer_release = reinterpret_cast<PFN_AHardwareBuffer_release>(
+      load_symbol_any("AHardwareBuffer_release",
+                      symbols->libandroid,
+                      symbols->libnativewindow,
+                      symbols->libgui));
+  symbols->AHardwareBuffer_lock = reinterpret_cast<PFN_AHardwareBuffer_lock>(
+      load_symbol_any("AHardwareBuffer_lock",
+                      symbols->libandroid,
+                      symbols->libnativewindow,
+                      symbols->libgui));
+  symbols->AHardwareBuffer_unlock = reinterpret_cast<PFN_AHardwareBuffer_unlock>(
+      load_symbol_any("AHardwareBuffer_unlock",
+                      symbols->libandroid,
+                      symbols->libnativewindow,
+                      symbols->libgui));
+
+  static const char* kSurfaceDequeueNames[] = {
+      "_ZN7android7Surface13dequeueBufferEPP19ANativeWindowBufferPi",
+  };
+  static const char* kSurfaceQueue4Names[] = {
+      "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE",
+  };
+  static const char* kSurfaceQueue3Names[] = {
+      "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferi",
+  };
+  static const char* kSurfaceCancelNames[] = {
+      "_ZN7android7Surface12cancelBufferEP19ANativeWindowBufferi",
+  };
+  static const char* kGraphicBufferFromNames[] = {
+      "_ZN7android13GraphicBuffer4fromEP19ANativeWindowBuffer",
+  };
+  static const char* kGraphicBufferLockNames[] = {
+      "_ZN7android13GraphicBuffer4lockEjPPvPiS3_",
+  };
+  static const char* kGraphicBufferUnlockNames[] = {
+      "_ZN7android13GraphicBuffer6unlockEv",
+  };
+  symbols->Surface_dequeueBuffer = reinterpret_cast<PFN_Surface_dequeueBuffer>(
+      load_symbol_candidates(symbols->libgui, nullptr, kSurfaceDequeueNames,
+                             sizeof(kSurfaceDequeueNames) / sizeof(kSurfaceDequeueNames[0])));
+  symbols->Surface_queueBuffer4 = reinterpret_cast<PFN_Surface_queueBuffer4>(
+      load_symbol_candidates(symbols->libgui, nullptr, kSurfaceQueue4Names,
+                             sizeof(kSurfaceQueue4Names) / sizeof(kSurfaceQueue4Names[0])));
+  symbols->Surface_queueBuffer3 = reinterpret_cast<PFN_Surface_queueBuffer3>(
+      load_symbol_candidates(symbols->libgui, nullptr, kSurfaceQueue3Names,
+                             sizeof(kSurfaceQueue3Names) / sizeof(kSurfaceQueue3Names[0])));
+  symbols->Surface_cancelBuffer = reinterpret_cast<PFN_Surface_cancelBuffer>(
+      load_symbol_candidates(symbols->libgui, nullptr, kSurfaceCancelNames,
+                             sizeof(kSurfaceCancelNames) / sizeof(kSurfaceCancelNames[0])));
+  symbols->GraphicBuffer_from = reinterpret_cast<PFN_GraphicBuffer_from>(
+      load_symbol_candidates(symbols->libui, nullptr, kGraphicBufferFromNames,
+                             sizeof(kGraphicBufferFromNames) / sizeof(kGraphicBufferFromNames[0])));
+  symbols->GraphicBuffer_lock = reinterpret_cast<PFN_GraphicBuffer_lock>(
+      load_symbol_candidates(symbols->libui, nullptr, kGraphicBufferLockNames,
+                             sizeof(kGraphicBufferLockNames) / sizeof(kGraphicBufferLockNames[0])));
+  symbols->GraphicBuffer_unlock = reinterpret_cast<PFN_GraphicBuffer_unlock>(
+      load_symbol_candidates(symbols->libui, nullptr, kGraphicBufferUnlockNames,
+                             sizeof(kGraphicBufferUnlockNames) /
+                                 sizeof(kGraphicBufferUnlockNames[0])));
 
   const bool ok = symbols->ANativeWindow_lock && symbols->ANativeWindow_unlockAndPost &&
                   symbols->ANativeWindow_release;
@@ -446,7 +654,7 @@ static inline int logical_height(const RenderContext& ctx) {
 static inline void map_coords(const RenderContext& ctx, int x, int y, int* out_x, int* out_y) {
   switch (ctx.rotation) {
     case 90:
-      *out_x = ctx.height - 1 - y;
+      *out_x = ctx.width - 1 - y;
       *out_y = x;
       break;
     case 180:
@@ -455,7 +663,7 @@ static inline void map_coords(const RenderContext& ctx, int x, int y, int* out_x
       break;
     case 270:
       *out_x = y;
-      *out_y = ctx.width - 1 - x;
+      *out_y = ctx.height - 1 - x;
       break;
     default:
       *out_x = x;
@@ -540,7 +748,7 @@ static inline bool logical_to_physical_rect(const RenderContext& ctx,
   int ph = h;
   switch (ctx.rotation) {
     case 90:
-      px = ctx.height - (y + h);
+      px = ctx.width - (y + h);
       py = x;
       pw = h;
       ph = w;
@@ -553,7 +761,7 @@ static inline bool logical_to_physical_rect(const RenderContext& ctx,
       break;
     case 270:
       px = y;
-      py = ctx.width - (x + w);
+      py = ctx.height - (x + w);
       pw = h;
       ph = w;
       break;
@@ -664,6 +872,15 @@ static inline uint32_t blend_pixel(uint32_t dst, const ColorComponents& src, uin
 }
 
 static inline void update_dimensions(MidrawContext& ctx) {
+  if (ctx.lock_size) {
+    if (ctx.requested_width > 0) {
+      ctx.render.width = ctx.requested_width;
+    }
+    if (ctx.requested_height > 0) {
+      ctx.render.height = ctx.requested_height;
+    }
+    return;
+  }
   if (!ctx.render.window || !ctx.symbols.ANativeWindow_getWidth ||
       !ctx.symbols.ANativeWindow_getHeight) {
     if (ctx.requested_width > 0) {
@@ -687,6 +904,102 @@ static inline void update_dimensions(MidrawContext& ctx) {
   }
   if (ctx.render.height <= 0 && ctx.requested_height > 0) {
     ctx.render.height = ctx.requested_height;
+  }
+}
+
+static void refresh_display_state(MidrawContext& ctx) {
+  const int auto_rotate = env_int("MIDRAW_AUTO_ROTATE", 1);
+  const int resize_on_rotation = env_int("MIDRAW_RESIZE_ON_ROTATION", 1);
+  if (ctx.lock_size) {
+    update_dimensions(ctx);
+  }
+  if (auto_rotate == 0 && resize_on_rotation == 0) {
+    return;
+  }
+  int display_rot = 0;
+  int display_w = 0;
+  int display_h = 0;
+  if (midraw_query_display_rotation(ctx.symbols, &display_rot, &display_w, &display_h) != 0) {
+    return;
+  }
+  if (display_rot < 0) {
+    display_rot %= 360;
+    if (display_rot < 0) {
+      display_rot += 360;
+    }
+  }
+
+  int display_logical_w = display_w;
+  int display_logical_h = display_h;
+  if (display_w > 0 && display_h > 0) {
+    const int long_side = (display_w > display_h) ? display_w : display_h;
+    const int short_side = (display_w > display_h) ? display_h : display_w;
+    const bool rot_landscape = (display_rot == 90 || display_rot == 270);
+    const bool size_landscape = display_w >= display_h;
+    if (rot_landscape != size_landscape) {
+      display_logical_w = long_side;
+      display_logical_h = short_side;
+    } else {
+      display_logical_w = display_w;
+      display_logical_h = display_h;
+    }
+  }
+
+  int window_w = ctx.render.width;
+  int window_h = ctx.render.height;
+  if (ctx.render.window && ctx.symbols.ANativeWindow_getWidth &&
+      ctx.symbols.ANativeWindow_getHeight) {
+    const int w = ctx.symbols.ANativeWindow_getWidth(ctx.render.window);
+    const int h = ctx.symbols.ANativeWindow_getHeight(ctx.render.window);
+    if (w > 0) {
+      window_w = w;
+    }
+    if (h > 0) {
+      window_h = h;
+    }
+  }
+  const bool window_matches_display =
+      (window_w > 0 && window_h > 0 && display_logical_w > 0 && display_logical_h > 0 &&
+       window_w == display_logical_w && window_h == display_logical_h);
+
+  if (auto_rotate != 0) {
+    const int counter_rotation = env_int("MIDRAW_COUNTER_ROTATION", 1);
+    int desired_rot = ctx.render.rotation;
+    if (counter_rotation != 0) {
+      if (window_matches_display) {
+        desired_rot = 0;
+      } else if (display_rot == 90) {
+        desired_rot = 270;
+      } else if (display_rot == 270) {
+        desired_rot = 90;
+      } else if (display_rot == 180) {
+        desired_rot = 180;
+      } else {
+        desired_rot = 0;
+      }
+    } else {
+      desired_rot = display_rot;
+    }
+    ctx.render.rotation = desired_rot;
+  }
+
+  if (resize_on_rotation != 0) {
+    if (ctx.lock_size) {
+      return;
+    }
+    const int use_display_size = env_int("MIDRAW_USE_DISPLAY_SIZE", 1);
+    if (use_display_size != 0 && display_logical_w > 0 && display_logical_h > 0) {
+      if (window_w != display_logical_w || window_h != display_logical_h) {
+        if (midraw_resize_window(ctx.symbols, ctx.render, display_logical_w,
+                                 display_logical_h) == 0) {
+          ctx.render.width = display_logical_w;
+          ctx.render.height = display_logical_h;
+          if (ctx.render.use_ahb) {
+            setup_ahb_buffer(ctx, display_logical_w, display_logical_h);
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1843,7 +2156,272 @@ static void draw_image(RenderContext& ctx,
   }
 }
 
+static void wait_for_fence(int fence_fd) {
+  if (fence_fd < 0) {
+    return;
+  }
+  pollfd pfd{};
+  pfd.fd = fence_fd;
+  pfd.events = POLLIN;
+  for (;;) {
+    int res = poll(&pfd, 1, -1);
+    if (res > 0 || (res < 0 && errno != EINTR)) {
+      break;
+    }
+  }
+  close(fence_fd);
+}
+
+static void release_ahb_buffer(MidrawContext& ctx) {
+  if (ctx.render.ahb_buffer && ctx.symbols.AHardwareBuffer_release) {
+    ctx.symbols.AHardwareBuffer_release(ctx.render.ahb_buffer);
+  }
+  ctx.render.ahb_buffer = nullptr;
+  ctx.render.ahb_desc = {};
+}
+
+static void apply_surface_tx(MidrawContext& ctx, ASurfaceControl* surface, int width, int height) {
+  if (!surface || !ctx.symbols.ASurfaceTransaction_create || !ctx.symbols.ASurfaceTransaction_apply) {
+    return;
+  }
+  ASurfaceTransaction* tx = ctx.symbols.ASurfaceTransaction_create();
+  if (!tx) {
+    return;
+  }
+  if (ctx.symbols.ASurfaceTransaction_setVisibility) {
+    ctx.symbols.ASurfaceTransaction_setVisibility(tx, surface, 1);
+  }
+  if (ctx.symbols.ASurfaceTransaction_setLayer) {
+    ctx.symbols.ASurfaceTransaction_setLayer(tx, surface, INT_MAX);
+  } else if (ctx.symbols.ASurfaceTransaction_setZOrder) {
+    ctx.symbols.ASurfaceTransaction_setZOrder(tx, surface, INT_MAX);
+  }
+  if (ctx.symbols.ASurfaceTransaction_setBufferTransparency) {
+    ctx.symbols.ASurfaceTransaction_setBufferTransparency(tx, surface,
+                                                          kBufferTransparencyTranslucent);
+  }
+  if (ctx.symbols.ASurfaceTransaction_setBufferSize && width > 0 && height > 0) {
+    ctx.symbols.ASurfaceTransaction_setBufferSize(tx, surface, width, height);
+  } else if (ctx.symbols.ASurfaceTransaction_setGeometry && width > 0 && height > 0) {
+    const ARect src{0, 0, width, height};
+    const ARect dst{0, 0, width, height};
+    ctx.symbols.ASurfaceTransaction_setGeometry(tx, surface, src, dst, 0);
+  }
+  ctx.symbols.ASurfaceTransaction_apply(tx);
+  if (ctx.symbols.ASurfaceTransaction_release) {
+    ctx.symbols.ASurfaceTransaction_release(tx);
+  }
+}
+
+static bool ensure_ahb_surface(MidrawContext& ctx, int width, int height) {
+  if (ctx.render.ahb_surface) {
+    return true;
+  }
+  if (ctx.render.surface) {
+    ctx.render.ahb_surface = ctx.render.surface;
+    apply_surface_tx(ctx, ctx.render.ahb_surface, width, height);
+    return true;
+  }
+  if (!ctx.symbols.ASurfaceControl_createFromWindow || !ctx.render.window) {
+    return false;
+  }
+  ctx.render.ahb_surface =
+      ctx.symbols.ASurfaceControl_createFromWindow(ctx.render.window, "midraw_ahb");
+  if (!ctx.render.ahb_surface) {
+    return false;
+  }
+  apply_surface_tx(ctx, ctx.render.ahb_surface, width, height);
+  return true;
+}
+
+static bool setup_ahb_buffer(MidrawContext& ctx, int width, int height) {
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  if (!ctx.symbols.AHardwareBuffer_allocate || !ctx.symbols.AHardwareBuffer_describe ||
+      !ctx.symbols.AHardwareBuffer_lock || !ctx.symbols.AHardwareBuffer_unlock ||
+      !ctx.symbols.AHardwareBuffer_release) {
+    return false;
+  }
+  if (!ensure_ahb_surface(ctx, width, height)) {
+    return false;
+  }
+  release_ahb_buffer(ctx);
+  memset(&ctx.render.ahb_desc, 0, sizeof(ctx.render.ahb_desc));
+  ctx.render.ahb_desc.width = static_cast<uint32_t>(width);
+  ctx.render.ahb_desc.height = static_cast<uint32_t>(height);
+  ctx.render.ahb_desc.layers = 1;
+  ctx.render.ahb_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+  ctx.render.ahb_desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                              AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                              AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+  if (ctx.symbols.AHardwareBuffer_allocate(&ctx.render.ahb_desc, &ctx.render.ahb_buffer) != 0 ||
+      !ctx.render.ahb_buffer) {
+    fprintf(stderr, "AHardwareBuffer_allocate failed\n");
+    ctx.render.ahb_buffer = nullptr;
+    return false;
+  }
+  ctx.symbols.AHardwareBuffer_describe(ctx.render.ahb_buffer, &ctx.render.ahb_desc);
+  ctx.render.use_ahb = true;
+  ctx.render.use_surface_direct = false;
+  return true;
+}
+
+static bool can_use_ahb(const MidrawContext& ctx) {
+  if (!ctx.render.surface && !ctx.render.ahb_surface &&
+      !(ctx.render.window && ctx.symbols.ASurfaceControl_createFromWindow)) {
+    return false;
+  }
+  return ctx.symbols.ASurfaceTransaction_create && ctx.symbols.ASurfaceTransaction_setBuffer &&
+         ctx.symbols.ASurfaceTransaction_apply && ctx.symbols.ASurfaceTransaction_release &&
+         ctx.symbols.AHardwareBuffer_allocate && ctx.symbols.AHardwareBuffer_lock &&
+         ctx.symbols.AHardwareBuffer_unlock && ctx.symbols.AHardwareBuffer_release &&
+         ctx.symbols.AHardwareBuffer_describe;
+}
+
+static bool can_use_surface_direct(const MidrawContext& ctx) {
+  return ctx.render.surface_native && ctx.symbols.Surface_dequeueBuffer &&
+         (ctx.symbols.Surface_queueBuffer4 || ctx.symbols.Surface_queueBuffer3) &&
+         ctx.symbols.GraphicBuffer_from && ctx.symbols.GraphicBuffer_lock &&
+         ctx.symbols.GraphicBuffer_unlock;
+}
+
+static void configure_fastpath(MidrawContext& ctx) {
+  ctx.render.use_ahb = false;
+  ctx.render.use_surface_direct = false;
+  ctx.render.direct_buffer = nullptr;
+  ctx.render.direct_graphic = nullptr;
+  ctx.render.ahb_surface = nullptr;
+
+  if (env_int("MIDRAW_FASTPATH", 1) == 0) {
+    return;
+  }
+
+  const bool force_direct = env_truthy("MIDRAW_USE_DIRECT") || env_truthy("MIDRAW_FORCE_DIRECT");
+  const bool force_ahb = env_truthy("MIDRAW_USE_AHB");
+  const int sdk = read_sdk_version();
+
+  int target_w = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
+  int target_h = ctx.render.height > 0 ? ctx.render.height : ctx.requested_height;
+  if (target_w <= 0) {
+    target_w = 1080;
+  }
+  if (target_h <= 0) {
+    target_h = 1920;
+  }
+
+  if (force_direct) {
+    if (can_use_surface_direct(ctx) && sdk >= 34) {
+      ctx.render.use_surface_direct = true;
+      fprintf(stderr, "midraw: using Surface direct buffer path (forced)\n");
+      return;
+    }
+    fprintf(stderr,
+            "midraw: Surface direct unavailable: dequeue=%p queue=%p from=%p lock=%p unlock=%p\n",
+            reinterpret_cast<void*>(ctx.symbols.Surface_dequeueBuffer),
+            reinterpret_cast<void*>(ctx.symbols.Surface_queueBuffer4
+                                        ? reinterpret_cast<void*>(ctx.symbols.Surface_queueBuffer4)
+                                        : reinterpret_cast<void*>(ctx.symbols.Surface_queueBuffer3)),
+            reinterpret_cast<void*>(ctx.symbols.GraphicBuffer_from),
+            reinterpret_cast<void*>(ctx.symbols.GraphicBuffer_lock),
+            reinterpret_cast<void*>(ctx.symbols.GraphicBuffer_unlock));
+  }
+
+  if (force_ahb) {
+    if (can_use_ahb(ctx) && setup_ahb_buffer(ctx, target_w, target_h)) {
+      fprintf(stderr, "midraw: using AHB path (forced)\n");
+      return;
+    }
+    fprintf(stderr, "midraw: AHB path unavailable\n");
+  }
+
+  if (sdk >= 34) {
+    if (can_use_ahb(ctx) && setup_ahb_buffer(ctx, target_w, target_h)) {
+      fprintf(stderr, "midraw: using AHB path (API %d)\n", sdk);
+      return;
+    }
+    if (can_use_surface_direct(ctx)) {
+      ctx.render.use_surface_direct = true;
+      fprintf(stderr, "midraw: using Surface direct buffer path (API %d)\n", sdk);
+      return;
+    }
+  }
+}
+
 static bool lock_buffer(MidrawContext& ctx) {
+  if (ctx.render.use_ahb) {
+    if (!ctx.render.ahb_buffer) {
+      const int width = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
+      const int height = ctx.render.height > 0 ? ctx.render.height : ctx.requested_height;
+      if (!setup_ahb_buffer(ctx, width, height)) {
+        return false;
+      }
+    }
+    void* out = nullptr;
+    ARect rect{0, 0, static_cast<int32_t>(ctx.render.ahb_desc.width),
+               static_cast<int32_t>(ctx.render.ahb_desc.height)};
+    const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                           AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+    if (ctx.symbols.AHardwareBuffer_lock(ctx.render.ahb_buffer, usage, -1, &rect, &out) != 0) {
+      return false;
+    }
+    ctx.render.width = static_cast<int>(ctx.render.ahb_desc.width);
+    ctx.render.height = static_cast<int>(ctx.render.ahb_desc.height);
+    ctx.render.stride = static_cast<int>(ctx.render.ahb_desc.stride);
+    if (ctx.render.stride == 0) {
+      ctx.render.stride = ctx.render.width;
+    }
+    ctx.render.pixels = reinterpret_cast<uint32_t*>(out);
+    return ctx.render.pixels != nullptr;
+  }
+
+  if (ctx.render.use_surface_direct) {
+    if (!can_use_surface_direct(ctx)) {
+      return false;
+    }
+    ctx.render.direct_buffer = nullptr;
+    ctx.render.direct_graphic = nullptr;
+    ANativeWindowBuffer* buffer = nullptr;
+    int fence_fd = -1;
+    int res = ctx.symbols.Surface_dequeueBuffer(ctx.render.surface_native, &buffer, &fence_fd);
+    if (res != 0 || !buffer) {
+      if (fence_fd >= 0) {
+        close(fence_fd);
+      }
+      return false;
+    }
+    wait_for_fence(fence_fd);
+    void* graphic = ctx.symbols.GraphicBuffer_from(buffer);
+    if (!graphic) {
+      if (ctx.symbols.Surface_cancelBuffer) {
+        ctx.symbols.Surface_cancelBuffer(ctx.render.surface_native, buffer, -1);
+      }
+      return false;
+    }
+    void* out = nullptr;
+    int out_bpp = 0;
+    int out_stride = 0;
+    if (ctx.symbols.GraphicBuffer_lock(graphic, GRALLOC_USAGE_SW_WRITE_OFTEN,
+                                       &out, &out_bpp, &out_stride) != 0 ||
+        !out) {
+      if (ctx.symbols.Surface_cancelBuffer) {
+        ctx.symbols.Surface_cancelBuffer(ctx.render.surface_native, buffer, -1);
+      }
+      return false;
+    }
+    ctx.render.direct_buffer = buffer;
+    ctx.render.direct_graphic = graphic;
+    ctx.render.width = buffer->width;
+    ctx.render.height = buffer->height;
+    int stride_pixels = buffer->stride;
+    if (out_stride > 0) {
+      stride_pixels = out_stride / 4;
+    }
+    ctx.render.stride = stride_pixels > 0 ? stride_pixels : buffer->stride;
+    ctx.render.pixels = reinterpret_cast<uint32_t*>(out);
+    return ctx.render.pixels != nullptr;
+  }
+
   if (!ctx.render.window) {
     return false;
   }
@@ -1866,6 +2444,68 @@ static bool lock_buffer(MidrawContext& ctx) {
   ctx.render.stride = ctx.render.buffer.stride;
   ctx.render.pixels = reinterpret_cast<uint32_t*>(ctx.render.buffer.bits);
   return ctx.render.pixels != nullptr;
+}
+
+static void unlock_post(MidrawContext& ctx) {
+  if (ctx.render.use_ahb) {
+    int fence = -1;
+    if (ctx.symbols.AHardwareBuffer_unlock && ctx.render.ahb_buffer) {
+      ctx.symbols.AHardwareBuffer_unlock(ctx.render.ahb_buffer, &fence);
+      if (fence >= 0) {
+        close(fence);
+      }
+    }
+    ASurfaceControl* target_surface = ctx.render.ahb_surface ? ctx.render.ahb_surface
+                                                             : ctx.render.surface;
+    if (target_surface && ctx.symbols.ASurfaceTransaction_create &&
+        ctx.symbols.ASurfaceTransaction_apply && ctx.symbols.ASurfaceTransaction_setBuffer) {
+      ASurfaceTransaction* tx = ctx.symbols.ASurfaceTransaction_create();
+      if (tx) {
+        ctx.symbols.ASurfaceTransaction_setBuffer(tx, target_surface, ctx.render.ahb_buffer, -1);
+        ctx.symbols.ASurfaceTransaction_apply(tx);
+        if (ctx.symbols.ASurfaceTransaction_release) {
+          ctx.symbols.ASurfaceTransaction_release(tx);
+        }
+      }
+    }
+    ctx.render.pixels = nullptr;
+    return;
+  }
+
+  if (ctx.render.use_surface_direct) {
+    if (ctx.render.direct_graphic && ctx.symbols.GraphicBuffer_unlock) {
+      ctx.symbols.GraphicBuffer_unlock(ctx.render.direct_graphic);
+    }
+    if (ctx.render.surface_native && ctx.render.direct_buffer &&
+        (ctx.symbols.Surface_queueBuffer4 || ctx.symbols.Surface_queueBuffer3)) {
+      int res = -1;
+      if (ctx.symbols.Surface_queueBuffer4) {
+        res = ctx.symbols.Surface_queueBuffer4(ctx.render.surface_native,
+                                               ctx.render.direct_buffer,
+                                               -1,
+                                               nullptr);
+      } else if (ctx.symbols.Surface_queueBuffer3) {
+        res = ctx.symbols.Surface_queueBuffer3(ctx.render.surface_native,
+                                               ctx.render.direct_buffer,
+                                               -1);
+      }
+      if (res != 0 && ctx.symbols.Surface_cancelBuffer) {
+        ctx.symbols.Surface_cancelBuffer(ctx.render.surface_native, ctx.render.direct_buffer, -1);
+      }
+    } else if (ctx.render.surface_native && ctx.render.direct_buffer &&
+               ctx.symbols.Surface_cancelBuffer) {
+      ctx.symbols.Surface_cancelBuffer(ctx.render.surface_native, ctx.render.direct_buffer, -1);
+    }
+    ctx.render.direct_buffer = nullptr;
+    ctx.render.direct_graphic = nullptr;
+    ctx.render.pixels = nullptr;
+    return;
+  }
+
+  if (ctx.render.window && ctx.symbols.ANativeWindow_unlockAndPost) {
+    ctx.symbols.ANativeWindow_unlockAndPost(ctx.render.window);
+  }
+  ctx.render.pixels = nullptr;
 }
 
 static void clear_rect_physical(RenderContext& ctx, int min_x, int min_y, int max_x, int max_y) {
@@ -2062,8 +2702,7 @@ static void unlock_and_post_deferred(MidrawContext& ctx) {
     reset_prev_dirty(ctx.render);
   }
   ctx.render.frame_index++;
-  ctx.symbols.ANativeWindow_unlockAndPost(ctx.render.window);
-  ctx.render.pixels = nullptr;
+  unlock_post(ctx);
 }
 
 static void unlock_and_post(MidrawContext& ctx) {
@@ -2105,9 +2744,8 @@ static void unlock_and_post(MidrawContext& ctx) {
     }
 
     ctx.render.frame_index++;
-    ctx.symbols.ANativeWindow_unlockAndPost(ctx.render.window);
+    unlock_post(ctx);
   }
-  ctx.render.pixels = nullptr;
 }
 
 int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
@@ -2136,6 +2774,12 @@ int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
   if (ctx->render.rotation < 0) {
     ctx->render.rotation += 360;
   }
+  const int lock_env = env_int("MIDRAW_LOCK_SIZE", -1);
+  if (lock_env >= 0) {
+    ctx->lock_size = (lock_env != 0);
+  } else {
+    ctx->lock_size = (ctx->requested_width > 0 && ctx->requested_height > 0);
+  }
 
   if (!midraw_create_window(ctx->symbols, ctx->render, ctx->requested_width,
                             ctx->requested_height, config)) {
@@ -2143,6 +2787,8 @@ int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config) {
     return -1;
   }
 
+  update_dimensions(*ctx);
+  configure_fastpath(*ctx);
   reset_dirty(ctx->render);
   reset_prev_dirty(ctx->render);
   reset_present(ctx->render);
@@ -2164,13 +2810,43 @@ void midraw_shutdown(MidrawContext* ctx) {
     return;
   }
   release_font_atlas(ctx->atlas);
-  if (ctx->render.window && ctx->symbols.ANativeWindow_release) {
-    ctx->symbols.ANativeWindow_release(ctx->render.window);
+  if (ctx->render.use_surface_direct && ctx->render.direct_buffer &&
+      ctx->symbols.Surface_cancelBuffer && ctx->render.surface_native) {
+    ctx->symbols.Surface_cancelBuffer(ctx->render.surface_native,
+                                      ctx->render.direct_buffer,
+                                      -1);
+  }
+  ctx->render.direct_buffer = nullptr;
+  ctx->render.direct_graphic = nullptr;
+  ctx->render.use_surface_direct = false;
+  release_ahb_buffer(*ctx);
+  ctx->render.use_ahb = false;
+  if (ctx->render.ahb_surface && ctx->render.ahb_surface != ctx->render.surface &&
+      ctx->symbols.ASurfaceControl_release) {
+    ctx->symbols.ASurfaceControl_release(ctx->render.ahb_surface);
+  }
+  ctx->render.ahb_surface = nullptr;
+  if (ctx->render.uses_osimgui && ctx->render.window) {
+    android::ANativeWindowCreator::Destroy(ctx->render.window);
     ctx->render.window = nullptr;
+  } else {
+    midraw_hide_surface_control(ctx->symbols, ctx->render);
+    if (ctx->render.window && ctx->symbols.ANativeWindow_release) {
+      ctx->symbols.ANativeWindow_release(ctx->render.window);
+      ctx->render.window = nullptr;
+    }
   }
   if (ctx->render.surface && ctx->symbols.ASurfaceControl_release) {
     ctx->symbols.ASurfaceControl_release(ctx->render.surface);
     ctx->render.surface = nullptr;
+  }
+  if (ctx->symbols.libui) {
+    dlclose(ctx->symbols.libui);
+    ctx->symbols.libui = nullptr;
+  }
+  if (ctx->symbols.libnativewindow) {
+    dlclose(ctx->symbols.libnativewindow);
+    ctx->symbols.libnativewindow = nullptr;
   }
   if (ctx->symbols.libgui) {
     dlclose(ctx->symbols.libgui);
@@ -2187,6 +2863,7 @@ int midraw_lock(MidrawContext* ctx) {
   if (!ctx) {
     return -1;
   }
+  refresh_display_state(*ctx);
   if (ctx->defer_lock) {
     ctx->recording = true;
     reset_recording_buffers(*ctx);
@@ -2236,11 +2913,44 @@ int midraw_logical_height(const MidrawContext* ctx) {
   return logical_height(ctx->render);
 }
 
+int midraw_resize(MidrawContext* ctx, int width, int height) {
+  if (!ctx) {
+    return -1;
+  }
+  if (width <= 0 || height <= 0) {
+    return -1;
+  }
+  ctx->requested_width = width;
+  ctx->requested_height = height;
+  if (width == ctx->render.width && height == ctx->render.height) {
+    return 0;
+  }
+  int result = midraw_resize_window(ctx->symbols, ctx->render, width, height);
+  if (result == 0) {
+    ctx->render.width = width;
+    ctx->render.height = height;
+    if (ctx->render.use_ahb) {
+      setup_ahb_buffer(*ctx, width, height);
+    }
+  }
+  return result;
+}
+
 void* midraw_get_native_window(MidrawContext* ctx) {
   if (!ctx) {
     return nullptr;
   }
   return reinterpret_cast<void*>(ctx->render.window);
+}
+
+int midraw_display_rotation(MidrawContext* ctx,
+                            int* out_rotation,
+                            int* out_width,
+                            int* out_height) {
+  if (!ctx) {
+    return -1;
+  }
+  return midraw_query_display_rotation(ctx->symbols, out_rotation, out_width, out_height);
 }
 
 void midraw_draw_pixel(MidrawContext* ctx, int x, int y, uint32_t color) {

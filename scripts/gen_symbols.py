@@ -181,7 +181,7 @@ def generate_header(out_path: str, versions: dict, nm_path: str):
             for logical, names in results.items():
                 arr_name = f"kNames_{sdk}_{logical}"
                 if names:
-                    items = ", ".join([f\"\\\"{n}\\\"\" for n in names])
+                    items = ", ".join([f"\"{n}\"" for n in names])
                     f.write(f"static const char* {arr_name}[] = {{{items}}};\n")
                 else:
                     f.write(f"static const char* {arr_name}[] = {{}};\n")
