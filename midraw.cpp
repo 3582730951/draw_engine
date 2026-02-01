@@ -245,6 +245,8 @@ static int read_sdk_version() {
   return 0;
 }
 
+static bool setup_ahb_buffer(MidrawContext& ctx, int width, int height);
+
 static const char* pick_default_font_path() {
   static const char* kPaths[] = {
       "/system/fonts/Roboto-Regular.ttf",
