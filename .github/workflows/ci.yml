@@ -47,10 +47,10 @@ jobs:
       - name: Init third-party (optional)
         run: |
           set -e
-          THIRD_PARTY_INSTALL="${GITHUB_WORKSPACE}/core/third_party_install"
+          THIRD_PARTY_INSTALL="${GITHUB_WORKSPACE}/third_party_install"
           mkdir -p "${THIRD_PARTY_INSTALL}"
           for ABI in ${ANDROID_ABIS}; do
-            for dir in "${GITHUB_WORKSPACE}/core/third_party/"*; do
+            for dir in "${GITHUB_WORKSPACE}/third_party/"*; do
               if [[ -f "${dir}/CMakeLists.txt" ]]; then
                 name=$(basename "${dir}")
                 BUILD_DIR="${dir}/build_${ABI}"
@@ -68,27 +68,27 @@ jobs:
 
       - name: Extract system libs
         run: |
-          chmod +x "${GITHUB_WORKSPACE}/core/tools/extract_system_libs.sh"
-          "${GITHUB_WORKSPACE}/core/tools/extract_system_libs.sh"
+          chmod +x "${GITHUB_WORKSPACE}/tools/extract_system_libs.sh"
+          "${GITHUB_WORKSPACE}/tools/extract_system_libs.sh"
 
       - name: Generate symbol candidates
         run: |
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          python3 "${GITHUB_WORKSPACE}/core/tools/gen_symbol_candidates.py" \
-            --syslib-root "${GITHUB_WORKSPACE}/core/generated/syslibs" \
+          python3 "${GITHUB_WORKSPACE}/tools/gen_symbol_candidates.py" \
+            --syslib-root "${GITHUB_WORKSPACE}/generated/syslibs" \
             --apis ${ANDROID_APIS} \
             --nm "${NM}" \
-            --required "${GITHUB_WORKSPACE}/core/tools/required_symbols.txt" \
-            --out "${GITHUB_WORKSPACE}/core/generated/android_symbol_candidates.h"
+            --required "${GITHUB_WORKSPACE}/tools/required_symbols.txt" \
+            --out "${GITHUB_WORKSPACE}/generated/android_symbol_candidates.h"
 
       - name: Generate mangled symbol map
         run: |
           NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          python3 "${GITHUB_WORKSPACE}/core/tools/gen_symbols.py" \
-            --root "${GITHUB_WORKSPACE}/core/generated/syslibs" \
-            --root "${GITHUB_WORKSPACE}/core/extra_syslibs" \
+          python3 "${GITHUB_WORKSPACE}/tools/gen_symbols.py" \
+            --root "${GITHUB_WORKSPACE}/generated/syslibs" \
+            --root "${GITHUB_WORKSPACE}/extra_syslibs" \
             --nm "${NM}" \
-            --out "${GITHUB_WORKSPACE}/core/generated/generated_symbols.h"
+            --out "${GITHUB_WORKSPACE}/generated/generated_symbols.h"
 
       - name: Build midraw (static/shared) and benchmark
         run: |
@@ -101,8 +101,8 @@ jobs:
                 fi
               done
             fi
-            BUILD_DIR="${GITHUB_WORKSPACE}/core/build_${ABI}"
-            cmake -S "${GITHUB_WORKSPACE}/core" -B "${BUILD_DIR}" -G Ninja \
+            BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}"
+            cmake -S "${GITHUB_WORKSPACE}" -B "${BUILD_DIR}" -G Ninja \
               -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-28 \
               -DCMAKE_BUILD_TYPE=Release \
@@ -120,9 +120,9 @@ jobs:
         with:
           name: midraw-build
           path: |
-            core/build_*/libmidraw.so
-            core/build_*/libmidraw.a
-            core/build_*/benchmark
-            core/build_*/overlay_engine
-            core/build_*/draw_demo
-            core/generated/android_symbol_candidates.h
+            build_*/libmidraw.so
+            build_*/libmidraw.a
+            build_*/benchmark
+            build_*/overlay_engine
+            build_*/draw_demo
+            generated/android_symbol_candidates.h
