@@ -2459,6 +2459,7 @@ static void configure_fastpath(MidrawContext& ctx) {
   ctx.render.use_surface_direct = false;
   ctx.render.direct_buffer = nullptr;
   ctx.render.direct_graphic = nullptr;
+  ctx.render.direct_prime_attempted = false;
   ctx.render.ahb_surface = nullptr;
 
   if (env_int("MIDRAW_FASTPATH", 1) == 0) {
@@ -2516,45 +2517,58 @@ static void configure_fastpath(MidrawContext& ctx) {
   }
 }
 
-static bool lock_buffer(MidrawContext& ctx) {
-  if (ctx.render.use_ahb) {
-    if (!ctx.render.ahb_buffer) {
-      const int width = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
-      const int height = ctx.render.height > 0 ? ctx.render.height : ctx.requested_height;
-      if (!setup_ahb_buffer(ctx, width, height)) {
-        return false;
-      }
-    }
-    void* out = nullptr;
-    ARect rect{0, 0, static_cast<int32_t>(ctx.render.ahb_desc.width),
-               static_cast<int32_t>(ctx.render.ahb_desc.height)};
-    const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
-                           AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
-    if (ctx.symbols.AHardwareBuffer_lock(ctx.render.ahb_buffer, usage, -1, &rect, &out) != 0) {
+static bool lock_ahb_buffer(MidrawContext& ctx) {
+  if (!ctx.render.ahb_buffer) {
+    const int width = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
+    const int height = ctx.render.height > 0 ? ctx.render.height : ctx.requested_height;
+    if (!setup_ahb_buffer(ctx, width, height)) {
       return false;
     }
-    ctx.render.width = static_cast<int>(ctx.render.ahb_desc.width);
-    ctx.render.height = static_cast<int>(ctx.render.ahb_desc.height);
-    ctx.render.stride = static_cast<int>(ctx.render.ahb_desc.stride);
-    if (ctx.render.stride == 0) {
-      ctx.render.stride = ctx.render.width;
-    }
-    ctx.render.pixels = reinterpret_cast<uint32_t*>(out);
-    return ctx.render.pixels != nullptr;
   }
+  void* out = nullptr;
+  ARect rect{0, 0, static_cast<int32_t>(ctx.render.ahb_desc.width),
+             static_cast<int32_t>(ctx.render.ahb_desc.height)};
+  const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                         AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+  if (ctx.symbols.AHardwareBuffer_lock(ctx.render.ahb_buffer, usage, -1, &rect, &out) != 0) {
+    return false;
+  }
+  ctx.render.width = static_cast<int>(ctx.render.ahb_desc.width);
+  ctx.render.height = static_cast<int>(ctx.render.ahb_desc.height);
+  ctx.render.stride = static_cast<int>(ctx.render.ahb_desc.stride);
+  if (ctx.render.stride == 0) {
+    ctx.render.stride = ctx.render.width;
+  }
+  ctx.render.pixels = reinterpret_cast<uint32_t*>(out);
+  return ctx.render.pixels != nullptr;
+}
 
-  if (ctx.render.use_surface_direct) {
-    if (!can_use_surface_direct(ctx)) {
-      return false;
+static bool lock_surface_direct_buffer(MidrawContext& ctx) {
+  if (!can_use_surface_direct(ctx)) {
+    return false;
+  }
+  auto close_fence = [](int fd) {
+    if (fd >= 0) {
+      close(fd);
     }
+  };
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
     ctx.render.direct_buffer = nullptr;
     ctx.render.direct_graphic = nullptr;
     ANativeWindowBuffer* buffer = nullptr;
     int fence_fd = -1;
     int res = ctx.symbols.Surface_dequeueBuffer(ctx.render.surface_native, &buffer, &fence_fd);
     if (res != 0 || !buffer) {
-      if (fence_fd >= 0) {
-        close(fence_fd);
+      close_fence(fence_fd);
+      if (attempt == 0 && !ctx.render.direct_prime_attempted && ctx.render.window &&
+          ctx.symbols.ANativeWindow_lock && ctx.symbols.ANativeWindow_unlockAndPost) {
+        ctx.render.direct_prime_attempted = true;
+        ANativeWindow_Buffer probe{};
+        if (ctx.symbols.ANativeWindow_lock(ctx.render.window, &probe, nullptr) == 0) {
+          ctx.symbols.ANativeWindow_unlockAndPost(ctx.render.window);
+        }
+        continue;
       }
       return false;
     }
@@ -2588,6 +2602,40 @@ static bool lock_buffer(MidrawContext& ctx) {
     ctx.render.stride = stride_pixels > 0 ? stride_pixels : buffer->stride;
     ctx.render.pixels = reinterpret_cast<uint32_t*>(out);
     return ctx.render.pixels != nullptr;
+  }
+  return false;
+}
+
+static bool lock_buffer(MidrawContext& ctx) {
+  if (ctx.render.use_ahb) {
+    if (lock_ahb_buffer(ctx)) {
+      return true;
+    }
+    release_ahb_buffer(ctx);
+    ctx.render.use_ahb = false;
+  }
+
+  if (ctx.render.use_surface_direct) {
+    if (lock_surface_direct_buffer(ctx)) {
+      return true;
+    }
+    static bool warned = false;
+    if (!warned) {
+      fprintf(stderr, "midraw: surface direct failed, fallback to safe path\n");
+      warned = true;
+    }
+    ctx.render.use_surface_direct = false;
+    ctx.render.direct_buffer = nullptr;
+    ctx.render.direct_graphic = nullptr;
+    const int width = ctx.render.width > 0 ? ctx.render.width : ctx.requested_width;
+    const int height = ctx.render.height > 0 ? ctx.render.height : ctx.requested_height;
+    if (can_use_ahb(ctx) && setup_ahb_buffer(ctx, width, height)) {
+      if (lock_ahb_buffer(ctx)) {
+        return true;
+      }
+      release_ahb_buffer(ctx);
+      ctx.render.use_ahb = false;
+    }
   }
 
   if (!ctx.render.window) {

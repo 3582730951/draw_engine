@@ -137,6 +137,7 @@ struct RenderContext {
   void* direct_graphic = nullptr;
   bool use_ahb = false;
   bool use_surface_direct = false;
+  bool direct_prime_attempted = false;
   int width = 0;
   int height = 0;
   int stride = 0;
