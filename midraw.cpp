@@ -2632,6 +2632,14 @@ static bool lock_buffer(MidrawContext& ctx) {
     }
     release_ahb_buffer(ctx);
     ctx.render.use_ahb = false;
+    if (ctx.ahb_only) {
+      static bool warned = false;
+      if (!warned) {
+        fprintf(stderr, "midraw: AHB-only enabled, AHB lock failed\n");
+        warned = true;
+      }
+      return false;
+    }
   }
 
   if (ctx.render.use_surface_direct) {
