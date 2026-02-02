@@ -1431,6 +1431,14 @@ static bool aa_lines_enabled() {
   return cached != 0;
 }
 
+static bool aa_fast_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("MIDRAW_AA_FAST", 1);
+  }
+  return cached != 0;
+}
+
 static bool aa_circles_enabled() {
   static int cached = -1;
   if (cached < 0) {
@@ -1567,6 +1575,57 @@ static void draw_line_aa_physical(RenderContext& ctx,
   }
 }
 
+static void draw_line_aa_fast_physical(RenderContext& ctx,
+                                       int x0,
+                                       int y0,
+                                       int x1,
+                                       int y1,
+                                       uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  if (x0 == x1 && y0 == y1) {
+    plot_pixel_physical(ctx, x0, y0, color);
+    return;
+  }
+  const ColorComponents comp = color_components(color);
+  bool steep = abs(y1 - y0) > abs(x1 - x0);
+  if (steep) {
+    int tmp = x0; x0 = y0; y0 = tmp;
+    tmp = x1; x1 = y1; y1 = tmp;
+  }
+  if (x0 > x1) {
+    int tmp = x0; x0 = x1; x1 = tmp;
+    tmp = y0; y0 = y1; y1 = tmp;
+  }
+  const int dx = x1 - x0;
+  const int dy = y1 - y0;
+  if (dx == 0) {
+    if (steep) {
+      draw_line_aa_physical(ctx, y0, x0, y1, x1, color);
+    } else {
+      draw_line_aa_physical(ctx, x0, y0, x1, y1, color);
+    }
+    return;
+  }
+  const int32_t gradient = static_cast<int32_t>((static_cast<int64_t>(dy) << 16) / dx);
+  int32_t intery = static_cast<int32_t>(y0 << 16);
+  for (int x = x0; x <= x1; ++x) {
+    const int y = static_cast<int>(intery >> 16);
+    const uint8_t frac = static_cast<uint8_t>((intery >> 8) & 0xFF);
+    const uint8_t a0 = static_cast<uint8_t>(255 - frac);
+    const uint8_t a1 = frac;
+    if (steep) {
+      blend_pixel_physical(ctx, y, x, comp, a0);
+      blend_pixel_physical(ctx, y + 1, x, comp, a1);
+    } else {
+      blend_pixel_physical(ctx, x, y, comp, a0);
+      blend_pixel_physical(ctx, x, y + 1, comp, a1);
+    }
+    intery += gradient;
+  }
+}
+
 static void draw_circle_aa(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
   if (!ctx.pixels || radius <= 0) {
     return;
@@ -1686,7 +1745,11 @@ static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
                       (cmax_x - cmin_x + 1) + pad * 2,
                       (cmax_y - cmin_y + 1) + pad * 2);
     if (ctx.rotation == 0) {
-      draw_line_aa_physical(ctx, cx1, cy1, cx2, cy2, color);
+      if (aa_fast_enabled()) {
+        draw_line_aa_fast_physical(ctx, cx1, cy1, cx2, cy2, color);
+      } else {
+        draw_line_aa_physical(ctx, cx1, cy1, cx2, cy2, color);
+      }
     } else {
       draw_line_aa(ctx, cx1, cy1, cx2, cy2, color);
     }
