@@ -16,7 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "utils/NativeSurfaceUtils.h"
+#include "NativeSurfaceUtils.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
 #include <arm_neon.h>

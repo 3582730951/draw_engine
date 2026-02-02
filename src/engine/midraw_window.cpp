@@ -2,7 +2,7 @@
 
 #include "generated_symbols.h"
 #include "midraw.h"
-#include "utils/NativeSurfaceUtils.h"
+#include "NativeSurfaceUtils.h"
 
 #include <android/native_window.h>
 #include <cstddef>
