@@ -484,6 +484,18 @@ static bool init_symbols(AndroidSymbols* symbols) {
                                   kCandidates_ASurfaceTransaction_release,
                                   sizeof(kCandidates_ASurfaceTransaction_release) /
                                       sizeof(kCandidates_ASurfaceTransaction_release[0])));
+  if (!symbols->ASurfaceTransaction_release) {
+    static const char* kCandidates_ASurfaceTransaction_delete[] = {
+        "ASurfaceTransaction_delete"};
+    symbols->ASurfaceTransaction_release =
+        reinterpret_cast<PFN_ASurfaceTransaction_release>(load_symbol_candidates_dual(
+            symbols->libandroid,
+            symbols->libgui,
+            "ASurfaceTransaction_delete",
+            kCandidates_ASurfaceTransaction_delete,
+            sizeof(kCandidates_ASurfaceTransaction_delete) /
+                sizeof(kCandidates_ASurfaceTransaction_delete[0])));
+  }
   symbols->ASurfaceTransaction_setBufferSize =
       reinterpret_cast<PFN_ASurfaceTransaction_setBufferSize>(load_symbol_candidates_dual(
           symbols->libandroid,
