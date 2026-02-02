@@ -163,13 +163,6 @@ static bool env_truthy(const char* name) {
   return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
 }
 
-static int env_int(const char* name, int default_value) {
-  const char* value = getenv(name);
-  if (!value || !value[0]) {
-    return default_value;
-  }
-  return atoi(value);
-}
 
 static const SymbolVersion* pick_symbol_version(int sdk) {
   if (kSymbolVersionCount == 0) {
@@ -807,11 +800,10 @@ bool midraw_create_window(AndroidSymbols& symbols,
                           int32_t requested_width,
                           int32_t requested_height,
                           const MidrawConfig* config) {
-  const bool ahb_only = env_int("MIDRAW_AHB_ONLY", 1) != 0;
   const bool force_osimgui = env_truthy("MIDRAW_USE_OSIMGUI");
   const bool force_legacy = env_truthy("MIDRAW_USE_LEGACY_SCC");
   const char* prefer_env = getenv("MIDRAW_PREFER_OSIMGUI");
-  const bool prefer_osimgui = prefer_env ? (prefer_env[0] != '0') : !ahb_only;
+  const bool prefer_osimgui = prefer_env ? (prefer_env[0] != '0') : true;
 
   if (force_osimgui) {
     if (create_window_osimgui(symbols, render, requested_width, requested_height, config)) {
