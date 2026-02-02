@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <time.h>
 #include <sys/system_properties.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -223,6 +224,21 @@ static int env_int(const char* name, int default_value) {
     return default_value;
   }
   return atoi(value);
+}
+
+static bool debug_timing_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("MIDRAW_DEBUG_TIMING", 0) != 0 ? 1 : 0;
+  }
+  return cached != 0;
+}
+
+static uint64_t now_ns() {
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(ts.tv_nsec);
 }
 
 static bool env_truthy(const char* name) {
@@ -2745,10 +2761,23 @@ static bool lock_buffer(MidrawContext& ctx) {
 }
 
 static void unlock_post(MidrawContext& ctx) {
+  const bool timing_debug = debug_timing_enabled();
   if (ctx.render.use_ahb) {
+    uint64_t unlock_ns = 0;
+    uint64_t tx_create_ns = 0;
+    uint64_t tx_set_ns = 0;
+    uint64_t tx_apply_ns = 0;
+    uint64_t tx_release_ns = 0;
     int fence = -1;
     if (ctx.symbols.AHardwareBuffer_unlock && ctx.render.ahb_buffer) {
+      uint64_t t0 = 0;
+      if (timing_debug) {
+        t0 = now_ns();
+      }
       ctx.symbols.AHardwareBuffer_unlock(ctx.render.ahb_buffer, &fence);
+      if (timing_debug) {
+        unlock_ns = now_ns() - t0;
+      }
       if (fence >= 0) {
         close(fence);
       }
@@ -2757,13 +2786,55 @@ static void unlock_post(MidrawContext& ctx) {
                                                              : ctx.render.surface;
     if (target_surface && ctx.symbols.ASurfaceTransaction_create &&
         ctx.symbols.ASurfaceTransaction_apply && ctx.symbols.ASurfaceTransaction_setBuffer) {
+      uint64_t t0 = 0;
+      if (timing_debug) {
+        t0 = now_ns();
+      }
       ASurfaceTransaction* tx = ctx.symbols.ASurfaceTransaction_create();
+      if (timing_debug) {
+        tx_create_ns = now_ns() - t0;
+      }
       if (tx) {
-        ctx.symbols.ASurfaceTransaction_setBuffer(tx, target_surface, ctx.render.ahb_buffer, -1);
-        ctx.symbols.ASurfaceTransaction_apply(tx);
-        if (ctx.symbols.ASurfaceTransaction_release) {
-          ctx.symbols.ASurfaceTransaction_release(tx);
+        if (timing_debug) {
+          t0 = now_ns();
         }
+        ctx.symbols.ASurfaceTransaction_setBuffer(tx, target_surface, ctx.render.ahb_buffer, -1);
+        if (timing_debug) {
+          tx_set_ns = now_ns() - t0;
+          t0 = now_ns();
+        }
+        ctx.symbols.ASurfaceTransaction_apply(tx);
+        if (timing_debug) {
+          tx_apply_ns = now_ns() - t0;
+        }
+        if (ctx.symbols.ASurfaceTransaction_release) {
+          if (timing_debug) {
+            t0 = now_ns();
+          }
+          ctx.symbols.ASurfaceTransaction_release(tx);
+          if (timing_debug) {
+            tx_release_ns = now_ns() - t0;
+          }
+        }
+      }
+    }
+    if (timing_debug) {
+      static uint64_t last_log_ns = 0;
+      const uint64_t now = now_ns();
+      const bool slow = unlock_ns > 5000000ull || tx_create_ns > 5000000ull ||
+                        tx_set_ns > 5000000ull || tx_apply_ns > 5000000ull ||
+                        tx_release_ns > 5000000ull;
+      if (slow || (now - last_log_ns) > 1000000000ull) {
+        fprintf(stderr,
+                "midraw timing: unlock=%.3f ms tx_create=%.3f ms tx_set=%.3f ms "
+                "tx_apply=%.3f ms tx_release=%.3f ms fence=%d\n",
+                unlock_ns / 1000000.0,
+                tx_create_ns / 1000000.0,
+                tx_set_ns / 1000000.0,
+                tx_apply_ns / 1000000.0,
+                tx_release_ns / 1000000.0,
+                fence);
+        last_log_ns = now;
       }
     }
     ctx.render.pixels = nullptr;
