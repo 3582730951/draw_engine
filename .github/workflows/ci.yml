@@ -132,8 +132,8 @@ jobs:
               API_DIR="${BUILD_DIR}/public_api/include"
               mkdir -p "${API_DIR}"
               cp "${GITHUB_WORKSPACE}/include/"*.h "${API_DIR}/" || true
-              if [[ -f "${GITHUB_WORKSPACE}/user_dock.md" ]]; then
-                cp "${GITHUB_WORKSPACE}/user_dock.md" "${BUILD_DIR}/public_api/user_dock.md"
+              if [[ -f "${GITHUB_WORKSPACE}/docs/user_dock.md" ]]; then
+                cp "${GITHUB_WORKSPACE}/docs/user_dock.md" "${BUILD_DIR}/public_api/user_dock.md"
               fi
             done
           done
@@ -169,5 +169,5 @@ jobs:
             build_*_Release/draw_demo
             build_*_Release/public_api/**
             generated/android_symbol_candidates.h
-            user_dock.md
+            docs/user_dock.md
             include/*.h

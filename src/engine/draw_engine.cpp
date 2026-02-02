@@ -1,6 +1,6 @@
-#include "include/draw_engine.h"
-#include "include/midraw.h"
-#include "shaders/vk_shaders.h"
+#include "draw_engine.h"
+#include "midraw.h"
+#include "vk_shaders.h"
 
 #include <android/native_window.h>
 #include <dlfcn.h>
@@ -36,10 +36,10 @@
 #endif
 
 #define STB_IMAGE_IMPLEMENTATION
-#include "third_party/stb_image.h"
+#include "stb_image.h"
 
 #define STB_TRUETYPE_IMPLEMENTATION
-#include "third_party/stb_truetype/stb_truetype.h"
+#include "stb_truetype/stb_truetype.h"
 
 struct AChoreographer;
 

@@ -84,9 +84,9 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/dist_debug/include"
           cp "${GITHUB_WORKSPACE}/include/"*.h "${GITHUB_WORKSPACE}/dist/include/" || true
           cp "${GITHUB_WORKSPACE}/include/"*.h "${GITHUB_WORKSPACE}/dist_debug/include/" || true
-          if [[ -f "${GITHUB_WORKSPACE}/user_dock.md" ]]; then
-            cp "${GITHUB_WORKSPACE}/user_dock.md" "${GITHUB_WORKSPACE}/dist/user_dock.md"
-            cp "${GITHUB_WORKSPACE}/user_dock.md" "${GITHUB_WORKSPACE}/dist_debug/user_dock.md"
+          if [[ -f "${GITHUB_WORKSPACE}/docs/user_dock.md" ]]; then
+            cp "${GITHUB_WORKSPACE}/docs/user_dock.md" "${GITHUB_WORKSPACE}/dist/user_dock.md"
+            cp "${GITHUB_WORKSPACE}/docs/user_dock.md" "${GITHUB_WORKSPACE}/dist_debug/user_dock.md"
           fi
           for ABI in ${ANDROID_ABIS}; do
             OUT_DIR="${GITHUB_WORKSPACE}/dist/${ABI}"
@@ -95,8 +95,8 @@ jobs:
             find "${BUILD_RELEASE}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DIR}" \;
             mkdir -p "${OUT_DIR}/include"
             cp "${GITHUB_WORKSPACE}/include/"*.h "${OUT_DIR}/include/" || true
-            if [[ -f "${GITHUB_WORKSPACE}/user_dock.md" ]]; then
-              cp "${GITHUB_WORKSPACE}/user_dock.md" "${OUT_DIR}/user_dock.md"
+            if [[ -f "${GITHUB_WORKSPACE}/docs/user_dock.md" ]]; then
+              cp "${GITHUB_WORKSPACE}/docs/user_dock.md" "${OUT_DIR}/user_dock.md"
             fi
 
             OUT_DEBUG="${GITHUB_WORKSPACE}/dist_debug/${ABI}"
@@ -105,8 +105,8 @@ jobs:
             find "${BUILD_DEBUG}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DEBUG}" \;
             mkdir -p "${OUT_DEBUG}/include"
             cp "${GITHUB_WORKSPACE}/include/"*.h "${OUT_DEBUG}/include/" || true
-            if [[ -f "${GITHUB_WORKSPACE}/user_dock.md" ]]; then
-              cp "${GITHUB_WORKSPACE}/user_dock.md" "${OUT_DEBUG}/user_dock.md"
+            if [[ -f "${GITHUB_WORKSPACE}/docs/user_dock.md" ]]; then
+              cp "${GITHUB_WORKSPACE}/docs/user_dock.md" "${OUT_DEBUG}/user_dock.md"
             fi
           done
           cp "${GITHUB_WORKSPACE}/include/generated_symbols.h" "${GITHUB_WORKSPACE}/dist" || true

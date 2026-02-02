@@ -1,5 +1,5 @@
-#include "include/midraw.h"
-#include "midraw_internal.h"
+#include "midraw.h"
+#include "internal/midraw_internal.h"
 
 #include <android/native_window.h>
 #include <dlfcn.h>
@@ -22,7 +22,7 @@
 #include <arm_neon.h>
 #endif
 
-#include "generated/android_symbol_candidates.h"
+#include "android_symbol_candidates.h"
 
 #if defined(MIDRAW_USE_STB_TRUETYPE)
 #include "stb_truetype.h"

@@ -1,7 +1,7 @@
-#include "midraw_internal.h"
+#include "internal/midraw_internal.h"
 
-#include "generated/generated_symbols.h"
-#include "include/midraw.h"
+#include "generated_symbols.h"
+#include "midraw.h"
 #include "utils/NativeSurfaceUtils.h"
 
 #include <android/native_window.h>

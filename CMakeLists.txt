@@ -22,9 +22,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 set(MIDRAW_SOURCES
-    ${CMAKE_CURRENT_LIST_DIR}/midraw.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/midraw_window.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/draw_engine.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/engine/midraw.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/engine/midraw_window.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/engine/draw_engine.cpp
 )
 
 set(MIDRAW_PUBLIC_HEADERS
@@ -59,7 +59,11 @@ if(MIDRAW_BUILD_SHARED)
   add_library(midraw_shared SHARED ${MIDRAW_SOURCES})
   set_target_properties(midraw_shared PROPERTIES OUTPUT_NAME midraw)
   target_include_directories(midraw_shared PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+  target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/generated)
+  target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/shaders)
   target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
+  target_include_directories(midraw_shared PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party/stb_truetype)
   target_include_directories(midraw_shared PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/third_party/OS-ImGui-Android/include)
   target_link_libraries(midraw_shared PUBLIC dl)
@@ -99,7 +103,11 @@ if(MIDRAW_BUILD_STATIC)
   add_library(midraw_static STATIC ${MIDRAW_SOURCES})
   set_target_properties(midraw_static PROPERTIES OUTPUT_NAME midraw)
   target_include_directories(midraw_static PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include)
+  target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+  target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/generated)
+  target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/shaders)
   target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
+  target_include_directories(midraw_static PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party/stb_truetype)
   target_include_directories(midraw_static PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/third_party/OS-ImGui-Android/include)
   target_link_libraries(midraw_static PUBLIC dl)
@@ -136,7 +144,7 @@ if(MIDRAW_BUILD_STATIC)
 endif()
 
 if(MIDRAW_BUILD_BENCHMARK)
-  add_executable(benchmark ${CMAKE_CURRENT_LIST_DIR}/main.cpp)
+  add_executable(benchmark ${CMAKE_CURRENT_LIST_DIR}/apps/benchmark/main.cpp)
   target_include_directories(benchmark PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
   if(TARGET midraw_static)
     target_link_libraries(benchmark PRIVATE midraw_static dl)
@@ -146,7 +154,7 @@ if(MIDRAW_BUILD_BENCHMARK)
 endif()
 
 if(MIDRAW_BUILD_DEMO)
-  add_executable(draw_demo ${CMAKE_CURRENT_LIST_DIR}/demo.cpp)
+  add_executable(draw_demo ${CMAKE_CURRENT_LIST_DIR}/apps/demo/main.cpp)
   target_include_directories(draw_demo PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
   if(TARGET midraw_static)
     target_link_libraries(draw_demo PRIVATE midraw_static dl)
@@ -156,7 +164,7 @@ if(MIDRAW_BUILD_DEMO)
 endif()
 
 if(MIDRAW_BUILD_OVERLAY)
-  add_executable(overlay_engine ${CMAKE_CURRENT_LIST_DIR}/src/overlay_engine.cpp)
+  add_executable(overlay_engine ${CMAKE_CURRENT_LIST_DIR}/apps/overlay/overlay_engine.cpp)
   target_include_directories(overlay_engine PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
   target_link_libraries(overlay_engine PRIVATE dl)
 endif()
