@@ -138,6 +138,11 @@ struct RenderContext {
   bool use_ahb = false;
   bool use_surface_direct = false;
   bool direct_prime_attempted = false;
+  uint32_t* staging_pixels = nullptr;
+  int staging_width = 0;
+  int staging_height = 0;
+  int staging_stride = 0;
+  bool use_staging = false;
   int width = 0;
   int height = 0;
   int stride = 0;

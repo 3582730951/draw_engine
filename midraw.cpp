@@ -249,6 +249,14 @@ static bool env_truthy(const char* name) {
   return strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
 }
 
+static bool ahb_staging_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("MIDRAW_AHB_STAGING", 1) != 0 ? 1 : 0;
+  }
+  return cached != 0;
+}
+
 static int read_sdk_version() {
   const char* override = getenv("MIDRAW_SDK");
   if (override && override[0]) {
@@ -2403,12 +2411,54 @@ static void wait_for_fence(int fence_fd) {
   close(fence_fd);
 }
 
+static void release_staging_buffer(RenderContext& render);
+
 static void release_ahb_buffer(MidrawContext& ctx) {
   if (ctx.render.ahb_buffer && ctx.symbols.AHardwareBuffer_release) {
     ctx.symbols.AHardwareBuffer_release(ctx.render.ahb_buffer);
   }
   ctx.render.ahb_buffer = nullptr;
   ctx.render.ahb_desc = {};
+  release_staging_buffer(ctx.render);
+}
+
+static void release_staging_buffer(RenderContext& render) {
+  if (render.staging_pixels) {
+    free(render.staging_pixels);
+  }
+  render.staging_pixels = nullptr;
+  render.staging_width = 0;
+  render.staging_height = 0;
+  render.staging_stride = 0;
+  render.use_staging = false;
+}
+
+static bool ensure_staging_buffer(MidrawContext& ctx, int width, int height) {
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  if (ctx.render.staging_pixels && ctx.render.staging_width == width &&
+      ctx.render.staging_height == height) {
+    ctx.render.use_staging = true;
+    return true;
+  }
+  release_staging_buffer(ctx.render);
+  const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  if (count == 0 || count > (SIZE_MAX / sizeof(uint32_t))) {
+    return false;
+  }
+  const size_t bytes = count * sizeof(uint32_t);
+  void* buffer = malloc(bytes);
+  if (!buffer) {
+    return false;
+  }
+  memset(buffer, 0, bytes);
+  ctx.render.staging_pixels = static_cast<uint32_t*>(buffer);
+  ctx.render.staging_width = width;
+  ctx.render.staging_height = height;
+  ctx.render.staging_stride = width;
+  ctx.render.use_staging = true;
+  return true;
 }
 
 static void apply_surface_tx(MidrawContext& ctx, ASurfaceControl* surface, int width, int height) {
@@ -2533,6 +2583,7 @@ static void configure_fastpath(MidrawContext& ctx) {
   ctx.render.direct_graphic = nullptr;
   ctx.render.direct_prime_attempted = false;
   ctx.render.ahb_surface = nullptr;
+  ctx.render.use_staging = false;
   ctx.ahb_only = env_int("MIDRAW_AHB_ONLY", 1) != 0;
 
   if (env_int("MIDRAW_FASTPATH", 1) == 0) {
@@ -2604,6 +2655,19 @@ static bool lock_ahb_buffer(MidrawContext& ctx) {
       return false;
     }
   }
+  const int width = static_cast<int>(ctx.render.ahb_desc.width);
+  const int height = static_cast<int>(ctx.render.ahb_desc.height);
+  if (ahb_staging_enabled()) {
+    if (!ensure_staging_buffer(ctx, width, height)) {
+      return false;
+    }
+    ctx.render.width = width;
+    ctx.render.height = height;
+    ctx.render.stride = ctx.render.staging_stride;
+    ctx.render.pixels = ctx.render.staging_pixels;
+    return ctx.render.pixels != nullptr;
+  }
+  ctx.render.use_staging = false;
   void* out = nullptr;
   ARect rect{0, 0, static_cast<int32_t>(ctx.render.ahb_desc.width),
              static_cast<int32_t>(ctx.render.ahb_desc.height)};
@@ -2612,8 +2676,8 @@ static bool lock_ahb_buffer(MidrawContext& ctx) {
   if (ctx.symbols.AHardwareBuffer_lock(ctx.render.ahb_buffer, usage, -1, &rect, &out) != 0) {
     return false;
   }
-  ctx.render.width = static_cast<int>(ctx.render.ahb_desc.width);
-  ctx.render.height = static_cast<int>(ctx.render.ahb_desc.height);
+  ctx.render.width = width;
+  ctx.render.height = height;
   ctx.render.stride = static_cast<int>(ctx.render.ahb_desc.stride);
   if (ctx.render.stride == 0) {
     ctx.render.stride = ctx.render.width;
@@ -2769,7 +2833,69 @@ static void unlock_post(MidrawContext& ctx) {
     uint64_t tx_apply_ns = 0;
     uint64_t tx_release_ns = 0;
     int fence = -1;
-    if (ctx.symbols.AHardwareBuffer_unlock && ctx.render.ahb_buffer) {
+    if (ctx.render.use_staging && ctx.render.staging_pixels &&
+        ctx.symbols.AHardwareBuffer_lock && ctx.symbols.AHardwareBuffer_unlock &&
+        ctx.render.ahb_buffer) {
+      void* out = nullptr;
+      const int width = static_cast<int>(ctx.render.ahb_desc.width);
+      const int height = static_cast<int>(ctx.render.ahb_desc.height);
+      ARect rect{0, 0, width, height};
+      const uint64_t usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+      if (ctx.symbols.AHardwareBuffer_lock(ctx.render.ahb_buffer, usage, -1, &rect, &out) == 0 &&
+          out) {
+        int copy_min_x = 0;
+        int copy_min_y = 0;
+        int copy_max_x = width;
+        int copy_max_y = height;
+        if (rect_valid(ctx.render.present_min_x, ctx.render.present_min_y,
+                       ctx.render.present_max_x, ctx.render.present_max_y)) {
+          copy_min_x = ctx.render.present_min_x;
+          copy_min_y = ctx.render.present_min_y;
+          copy_max_x = ctx.render.present_max_x;
+          copy_max_y = ctx.render.present_max_y;
+          if (copy_min_x < 0) {
+            copy_min_x = 0;
+          }
+          if (copy_min_y < 0) {
+            copy_min_y = 0;
+          }
+          if (copy_max_x > width) {
+            copy_max_x = width;
+          }
+          if (copy_max_y > height) {
+            copy_max_y = height;
+          }
+          if (copy_max_x <= copy_min_x || copy_max_y <= copy_min_y) {
+            copy_min_x = 0;
+            copy_min_y = 0;
+            copy_max_x = width;
+            copy_max_y = height;
+          }
+        }
+        const int copy_w = copy_max_x - copy_min_x;
+        const int copy_h = copy_max_y - copy_min_y;
+        const int dst_stride = static_cast<int>(ctx.render.ahb_desc.stride);
+        const int src_stride = ctx.render.staging_stride;
+        uint32_t* dst_base = static_cast<uint32_t*>(out);
+        const uint32_t* src_base = ctx.render.staging_pixels;
+        for (int row = 0; row < copy_h; ++row) {
+          const uint32_t* src_row = src_base + (copy_min_y + row) * src_stride + copy_min_x;
+          uint32_t* dst_row = dst_base + (copy_min_y + row) * dst_stride + copy_min_x;
+          memcpy(dst_row, src_row, static_cast<size_t>(copy_w) * sizeof(uint32_t));
+        }
+        uint64_t t0 = 0;
+        if (timing_debug) {
+          t0 = now_ns();
+        }
+        ctx.symbols.AHardwareBuffer_unlock(ctx.render.ahb_buffer, &fence);
+        if (timing_debug) {
+          unlock_ns = now_ns() - t0;
+        }
+        if (fence >= 0) {
+          close(fence);
+        }
+      }
+    } else if (ctx.symbols.AHardwareBuffer_unlock && ctx.render.ahb_buffer) {
       uint64_t t0 = 0;
       if (timing_debug) {
         t0 = now_ns();
