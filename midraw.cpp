@@ -745,6 +745,82 @@ static inline void map_coords(const RenderContext& ctx, int x, int y, int* out_x
   }
 }
 
+static inline int line_out_code(int x, int y, int w, int h) {
+  int code = 0;
+  if (x < 0) {
+    code |= 1;
+  } else if (x >= w) {
+    code |= 2;
+  }
+  if (y < 0) {
+    code |= 4;
+  } else if (y >= h) {
+    code |= 8;
+  }
+  return code;
+}
+
+static bool clip_line(int* x0, int* y0, int* x1, int* y1, int w, int h) {
+  if (!x0 || !y0 || !x1 || !y1 || w <= 0 || h <= 0) {
+    return false;
+  }
+  int x_start = *x0;
+  int y_start = *y0;
+  int x_end = *x1;
+  int y_end = *y1;
+  int out0 = line_out_code(x_start, y_start, w, h);
+  int out1 = line_out_code(x_end, y_end, w, h);
+  while (true) {
+    if ((out0 | out1) == 0) {
+      *x0 = x_start;
+      *y0 = y_start;
+      *x1 = x_end;
+      *y1 = y_end;
+      return true;
+    }
+    if (out0 & out1) {
+      return false;
+    }
+    const int out = out0 ? out0 : out1;
+    int x = 0;
+    int y = 0;
+    if (out & 8) {
+      if (y_end == y_start) {
+        return false;
+      }
+      x = x_start + (x_end - x_start) * (h - 1 - y_start) / (y_end - y_start);
+      y = h - 1;
+    } else if (out & 4) {
+      if (y_end == y_start) {
+        return false;
+      }
+      x = x_start + (x_end - x_start) * (0 - y_start) / (y_end - y_start);
+      y = 0;
+    } else if (out & 2) {
+      if (x_end == x_start) {
+        return false;
+      }
+      y = y_start + (y_end - y_start) * (w - 1 - x_start) / (x_end - x_start);
+      x = w - 1;
+    } else {
+      if (x_end == x_start) {
+        return false;
+      }
+      y = y_start + (y_end - y_start) * (0 - x_start) / (x_end - x_start);
+      x = 0;
+    }
+    if (out == out0) {
+      x_start = x;
+      y_start = y;
+      out0 = line_out_code(x_start, y_start, w, h);
+    } else {
+      x_end = x;
+      y_end = y;
+      out1 = line_out_code(x_end, y_end, w, h);
+    }
+  }
+}
+
 static inline void reset_rect(int& min_x, int& min_y, int& max_x, int& max_y) {
   min_x = INT_MAX;
   min_y = INT_MAX;
@@ -1463,11 +1539,24 @@ static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
   const int min_y = y1 < y2 ? y1 : y2;
   const int max_y = y1 > y2 ? y1 : y2;
   if (aa_lines_enabled()) {
+    int cx1 = x1;
+    int cy1 = y1;
+    int cx2 = x2;
+    int cy2 = y2;
+    const int lw = logical_width(ctx);
+    const int lh = logical_height(ctx);
+    if (!clip_line(&cx1, &cy1, &cx2, &cy2, lw, lh)) {
+      return;
+    }
     const int pad = 1;
-    expand_dirty_rect(ctx, min_x - pad, min_y - pad,
-                      (max_x - min_x + 1) + pad * 2,
-                      (max_y - min_y + 1) + pad * 2);
-    draw_line_aa(ctx, x1, y1, x2, y2, color);
+    const int cmin_x = cx1 < cx2 ? cx1 : cx2;
+    const int cmax_x = cx1 > cx2 ? cx1 : cx2;
+    const int cmin_y = cy1 < cy2 ? cy1 : cy2;
+    const int cmax_y = cy1 > cy2 ? cy1 : cy2;
+    expand_dirty_rect(ctx, cmin_x - pad, cmin_y - pad,
+                      (cmax_x - cmin_x + 1) + pad * 2,
+                      (cmax_y - cmin_y + 1) + pad * 2);
+    draw_line_aa(ctx, cx1, cy1, cx2, cy2, color);
     return;
   }
   expand_dirty_rect(ctx, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
