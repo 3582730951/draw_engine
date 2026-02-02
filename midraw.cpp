@@ -2991,6 +2991,10 @@ static void replay_commands(MidrawContext& ctx) {
 
 static void unlock_and_post_deferred(MidrawContext& ctx) {
   ctx.recording = false;
+  const bool timing_debug = debug_timing_enabled();
+  uint64_t lock_ns = 0;
+  uint64_t clear_ns = 0;
+  uint64_t replay_ns = 0;
   if (ctx.render.frame_index == 0 &&
       !rect_valid(ctx.render.prev_dirty_min_x, ctx.render.prev_dirty_min_y,
                   ctx.render.prev_dirty_max_x, ctx.render.prev_dirty_max_y)) {
@@ -3053,13 +3057,41 @@ static void unlock_and_post_deferred(MidrawContext& ctx) {
     }
   }
 
+  uint64_t t0 = 0;
+  if (timing_debug) {
+    t0 = now_ns();
+  }
   if (!lock_buffer(ctx)) {
     fprintf(stderr, "ANativeWindow_lock failed\n");
     return;
   }
+  if (timing_debug) {
+    lock_ns = now_ns() - t0;
+  }
   ensure_prev_dirty_initialized(ctx.render);
+  if (timing_debug) {
+    t0 = now_ns();
+  }
   clear_previous_dirty(ctx.render);
+  if (timing_debug) {
+    clear_ns = now_ns() - t0;
+    t0 = now_ns();
+  }
   replay_commands(ctx);
+  if (timing_debug) {
+    replay_ns = now_ns() - t0;
+    static uint64_t last_log_ns = 0;
+    const uint64_t now = now_ns();
+    const bool slow = lock_ns > 5000000ull || clear_ns > 5000000ull || replay_ns > 5000000ull;
+    if (slow || (now - last_log_ns) > 1000000000ull) {
+      fprintf(stderr,
+              "midraw timing: lock_buffer=%.3f ms clear_prev=%.3f ms replay=%.3f ms\n",
+              lock_ns / 1000000.0,
+              clear_ns / 1000000.0,
+              replay_ns / 1000000.0);
+      last_log_ns = now;
+    }
+  }
 
   if (rect_valid(ctx.render.dirty_min_x, ctx.render.dirty_min_y, ctx.render.dirty_max_x,
                  ctx.render.dirty_max_y)) {
