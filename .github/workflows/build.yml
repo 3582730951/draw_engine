@@ -13,6 +13,7 @@ jobs:
       ANDROID_SDK_ROOT: ${{ github.workspace }}/.android_sdk
       ANDROID_LIB_DUMP_REPO: https://github.com/example/android-lib-dump
       ANDROID_ABIS: "armeabi-v7a arm64-v8a x86 x86_64"
+      BUILD_TYPES: "Release Debug"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,37 +61,50 @@ jobs:
       - name: Build (CMake + NDK)
         run: |
           for ABI in ${ANDROID_ABIS}; do
-            BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}"
-            cmake -S "${GITHUB_WORKSPACE}" -B "${BUILD_DIR}" -G Ninja \
-              -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-              -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-28 \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DMIDRAW_BUILD_SHARED=ON \
-              -DMIDRAW_BUILD_STATIC=ON \
-              -DMIDRAW_BUILD_BENCHMARK=ON \
-              -DMIDRAW_BUILD_OVERLAY=ON \
-              -DMIDRAW_BUILD_DEMO=ON
-            cmake --build "${BUILD_DIR}"
+            for BUILD_TYPE in ${BUILD_TYPES}; do
+              BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}_${BUILD_TYPE}"
+              cmake -S "${GITHUB_WORKSPACE}" -B "${BUILD_DIR}" -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+                -DANDROID_ABI="${ABI}" -DANDROID_PLATFORM=android-28 \
+                -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+                -DMIDRAW_BUILD_SHARED=ON \
+                -DMIDRAW_BUILD_STATIC=ON \
+                -DMIDRAW_BUILD_BENCHMARK=ON \
+                -DMIDRAW_BUILD_OVERLAY=ON \
+                -DMIDRAW_BUILD_DEMO=ON
+              cmake --build "${BUILD_DIR}"
+            done
           done
 
       - name: Collect artifacts
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${GITHUB_WORKSPACE}/dist_debug"
           for ABI in ${ANDROID_ABIS}; do
-            BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}"
             OUT_DIR="${GITHUB_WORKSPACE}/dist/${ABI}"
             mkdir -p "${OUT_DIR}"
-            find "${BUILD_DIR}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DIR}" \;
+            BUILD_RELEASE="${GITHUB_WORKSPACE}/build_${ABI}_Release"
+            find "${BUILD_RELEASE}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DIR}" \;
+
+            OUT_DEBUG="${GITHUB_WORKSPACE}/dist_debug/${ABI}"
+            mkdir -p "${OUT_DEBUG}"
+            BUILD_DEBUG="${GITHUB_WORKSPACE}/build_${ABI}_Debug"
+            find "${BUILD_DEBUG}" -type f \( -name "libmidraw.so" -o -name "libmidraw.a" -o -name "overlay_engine" -o -name "benchmark" -o -name "draw_demo" \) -exec cp {} "${OUT_DEBUG}" \;
           done
           cp "${GITHUB_WORKSPACE}/include/generated_symbols.h" "${GITHUB_WORKSPACE}/dist" || true
           echo "Collected files:"
           find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -print
+          find "${GITHUB_WORKSPACE}/dist_debug" -maxdepth 2 -type f -print
           {
             echo "dist listing:";
             find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -print;
+            echo "";
+            echo "dist_debug listing:";
+            find "${GITHUB_WORKSPACE}/dist_debug" -maxdepth 2 -type f -print;
             echo;
             echo "file info:";
             find "${GITHUB_WORKSPACE}/dist" -maxdepth 2 -type f -exec file {} \; || true;
+            find "${GITHUB_WORKSPACE}/dist_debug" -maxdepth 2 -type f -exec file {} \; || true;
           } | tee "${GITHUB_WORKSPACE}/dist/manifest.txt"
           cat "${GITHUB_WORKSPACE}/dist/manifest.txt" >> "${GITHUB_STEP_SUMMARY}" || true
 
@@ -119,6 +133,7 @@ jobs:
           name: android-build
           path: |
             dist/**
+            dist_debug/**
 
   android16-root-test:
     needs: android-build
