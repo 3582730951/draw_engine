@@ -420,6 +420,14 @@ static bool env_present(const char* name) {
   return value && value[0];
 }
 
+static bool debug_timing_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("DRAW_ENGINE_DEBUG_TIMING", 0) != 0 ? 1 : 0;
+  }
+  return cached != 0;
+}
+
 static inline float clampf(float v, float lo, float hi) {
   if (v < lo) {
     return lo;
@@ -4465,10 +4473,29 @@ int draw_begin_frame(void) {
     return DRAW_ENGINE_OK;
   }
   maybe_recreate_on_rotation();
+  const bool timing_debug = debug_timing_enabled();
+  uint64_t lock_start_ns = 0;
   if (g_engine.backend == BACKEND_CPU) {
     MidrawContext* ctx = active_cpu_ctx();
+    if (timing_debug) {
+      lock_start_ns = now_ns();
+    }
     if (!ctx || midraw_lock(ctx) != 0) {
+      if (timing_debug && lock_start_ns != 0) {
+        const uint64_t lock_ns = now_ns() - lock_start_ns;
+        fprintf(stderr,
+                "draw_engine timing: cpu lock failed after %.3f ms\n",
+                lock_ns / 1000000.0);
+      }
       return DRAW_ENGINE_EFAILED;
+    }
+    if (timing_debug && lock_start_ns != 0) {
+      const uint64_t lock_ns = now_ns() - lock_start_ns;
+      if (lock_ns > 5000000ull) {
+        fprintf(stderr,
+                "draw_engine timing: cpu lock %.3f ms\n",
+                lock_ns / 1000000.0);
+      }
     }
   } else {
     gpu_refresh_size_and_rotation();
@@ -4488,10 +4515,23 @@ void draw_end_frame(void) {
   if (!g_engine.cpu_ctx || !g_engine.in_frame) {
     return;
   }
+  const bool timing_debug = debug_timing_enabled();
+  uint64_t unlock_start_ns = 0;
   if (g_engine.backend == BACKEND_CPU) {
     MidrawContext* ctx = active_cpu_ctx();
     if (ctx) {
+      if (timing_debug) {
+        unlock_start_ns = now_ns();
+      }
       midraw_unlock_post(ctx);
+      if (timing_debug && unlock_start_ns != 0) {
+        const uint64_t unlock_ns = now_ns() - unlock_start_ns;
+        if (unlock_ns > 5000000ull) {
+          fprintf(stderr,
+                  "draw_engine timing: cpu unlock %.3f ms\n",
+                  unlock_ns / 1000000.0);
+        }
+      }
     }
   } else if (g_engine.backend == BACKEND_VULKAN) {
     vk_draw_frame(g_gpu);
@@ -4516,9 +4556,30 @@ void draw_end_frame(void) {
       target_fps = static_cast<float>(g_engine.target_fps);
     }
     const uint64_t target_ns = fps_to_frame_ns(target_fps);
+    uint64_t sleep_ns = 0;
     if (target_ns > 0 && draw_ns < target_ns) {
-      const uint64_t sleep_ns = target_ns - draw_ns;
+      sleep_ns = target_ns - draw_ns;
       usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+    }
+    if (timing_debug) {
+      static uint64_t last_log_ns = 0;
+      const uint64_t now = end_ns;
+      const bool slow_draw = draw_ns > 50000000ull;
+      const bool slow_sleep = sleep_ns > 50000000ull;
+      if (slow_draw || slow_sleep || (now - last_log_ns) > 1000000000ull) {
+        fprintf(stderr,
+                "draw_engine timing: mode=%d backend=%d draw=%.3f ms target_fps=%.2f "
+                "auto_fps=%.2f target_ns=%.3f ms sleep=%.3f ms avg_draw=%.3f ms\n",
+                g_engine.mode,
+                g_engine.backend,
+                draw_ns / 1000000.0,
+                target_fps,
+                g_engine.auto_fps,
+                target_ns / 1000000.0,
+                sleep_ns / 1000000.0,
+                g_engine.avg_draw_ns / 1000000.0);
+        last_log_ns = now;
+      }
     }
   }
   g_engine.in_frame = false;
