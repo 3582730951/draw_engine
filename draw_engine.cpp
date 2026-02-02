@@ -692,6 +692,50 @@ static uint64_t now_ns() {
          static_cast<uint64_t>(ts.tv_nsec);
 }
 
+static bool precise_sleep_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("DRAW_ENGINE_PRECISE_SLEEP", 1) != 0 ? 1 : 0;
+  }
+  return cached != 0;
+}
+
+static uint64_t spin_threshold_ns() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("DRAW_ENGINE_SPIN_US", 200);
+    if (cached < 0) {
+      cached = 0;
+    }
+  }
+  return static_cast<uint64_t>(cached) * 1000ull;
+}
+
+static void sleep_until_ns(uint64_t deadline_ns) {
+  if (deadline_ns == 0) {
+    return;
+  }
+  const uint64_t spin_ns = spin_threshold_ns();
+  for (;;) {
+    const uint64_t now = now_ns();
+    if (now >= deadline_ns) {
+      return;
+    }
+    const uint64_t remaining = deadline_ns - now;
+    if (remaining > spin_ns + 1000000ull) {
+      const uint64_t sleep_ns = remaining - spin_ns;
+      timespec ts{};
+      ts.tv_sec = static_cast<time_t>(sleep_ns / 1000000000ull);
+      ts.tv_nsec = static_cast<long>(sleep_ns % 1000000000ull);
+      nanosleep(&ts, nullptr);
+    } else {
+      while (now_ns() < deadline_ns) {
+      }
+      return;
+    }
+  }
+}
+
 static bool query_native_window_size(ANativeWindow* window, int* out_w, int* out_h) {
   using PFN_GetWidth = int32_t (*)(ANativeWindow*);
   using PFN_GetHeight = int32_t (*)(ANativeWindow*);
@@ -4557,9 +4601,21 @@ void draw_end_frame(void) {
     }
     const uint64_t target_ns = fps_to_frame_ns(target_fps);
     uint64_t sleep_ns = 0;
-    if (target_ns > 0 && draw_ns < target_ns) {
-      sleep_ns = target_ns - draw_ns;
-      usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+    if (target_ns > 0) {
+      uint64_t deadline = 0;
+      if (g_engine.frame_start_ns > 0) {
+        deadline = g_engine.frame_start_ns + target_ns;
+      } else if (end_ns >= draw_ns) {
+        deadline = end_ns + (target_ns - draw_ns);
+      }
+      if (deadline > end_ns) {
+        sleep_ns = deadline - end_ns;
+        if (precise_sleep_enabled()) {
+          sleep_until_ns(deadline);
+        } else {
+          usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+        }
+      }
     }
     if (timing_debug) {
       static uint64_t last_log_ns = 0;

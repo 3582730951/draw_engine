@@ -988,6 +988,14 @@ static inline uint8x8_t mul_div255_u8(uint8x8_t a, uint8x8_t b) {
   uint16x8_t prod = vmull_u8(a, b);
   return div255_u16x8(prod);
 }
+
+static bool blend_neon_enabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("MIDRAW_BLEND_NEON", 1);
+  }
+  return cached != 0;
+}
 #endif
 
 static inline uint32_t blend_pixel(uint32_t dst, const ColorComponents& src, uint8_t coverage) {
@@ -1002,6 +1010,29 @@ static inline uint32_t blend_pixel(uint32_t dst, const ColorComponents& src, uin
     return (static_cast<uint32_t>(src.a) << 24) | (static_cast<uint32_t>(src.r) << 16) |
            (static_cast<uint32_t>(src.g) << 8) | static_cast<uint32_t>(src.b);
   }
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+  if (blend_neon_enabled()) {
+    const uint8_t dst_a = static_cast<uint8_t>((dst >> 24) & 0xFF);
+    const uint8_t dst_r = static_cast<uint8_t>((dst >> 16) & 0xFF);
+    const uint8_t dst_g = static_cast<uint8_t>((dst >> 8) & 0xFF);
+    const uint8_t dst_b = static_cast<uint8_t>(dst & 0xFF);
+    const uint8_t eff = static_cast<uint8_t>(effective_a);
+    const uint8_t inv = static_cast<uint8_t>(255 - eff);
+    const uint8x8_t src_vec = {src.a, src.r, src.g, src.b, 0, 0, 0, 0};
+    const uint8x8_t dst_vec = {dst_a, dst_r, dst_g, dst_b, 0, 0, 0, 0};
+    const uint8x8_t eff_vec = vdup_n_u8(eff);
+    const uint8x8_t inv_vec = vdup_n_u8(inv);
+    const uint16x8_t src_mul = vmull_u8(src_vec, eff_vec);
+    const uint16x8_t dst_mul = vmull_u8(dst_vec, inv_vec);
+    const uint8x8_t out = div255_u16x8(vaddq_u16(src_mul, dst_mul));
+    const uint8_t out_a = vget_lane_u8(out, 0);
+    const uint8_t out_r = vget_lane_u8(out, 1);
+    const uint8_t out_g = vget_lane_u8(out, 2);
+    const uint8_t out_b = vget_lane_u8(out, 3);
+    return (static_cast<uint32_t>(out_a) << 24) | (static_cast<uint32_t>(out_r) << 16) |
+           (static_cast<uint32_t>(out_g) << 8) | static_cast<uint32_t>(out_b);
+  }
+#endif
   const uint32_t inv = 255 - effective_a;
   const uint8_t dst_a = static_cast<uint8_t>((dst >> 24) & 0xFF);
   const uint8_t dst_r = static_cast<uint8_t>((dst >> 16) & 0xFF);
