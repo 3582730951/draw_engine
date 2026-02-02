@@ -1,0 +1,181 @@
+# MiDrawEngine 用户文档（user_dock）
+
+本文档随构建产物一起分发，用于说明 `.a` / `.so` 的使用方式、初始化流程与公共 API 的功能与用法。
+
+## 1. 构建产物结构
+
+Release / Debug 产物都会包含：
+- `libmidraw.so` / `libmidraw.a`
+- `draw_demo` / `benchmark` / `overlay_engine`
+- 公共头文件：`include/midraw.h`、`include/draw_engine.h`
+- 本文档：`user_dock.md`
+
+## 2. 链接方式
+
+### 2.1 使用 `.so`
+- 运行时将 `libmidraw.so` 放入应用的 `lib/<ABI>/`，并确保运行时可加载。
+- 编译链接时建议链接：`-lmidraw -ldl -llog`
+- 如果启用 GPU：额外链接 `-lvulkan`（Vulkan）或 `-lEGL -lGLESv3`（OpenGL ES）。
+
+### 2.2 使用 `.a`
+- 将 `libmidraw.a` 加入链接。
+- 需要显式链接其依赖：`-ldl -llog`，以及 GPU 相关库（Vulkan / EGL / GLES）。
+
+### 2.3 CMake 示例
+```cmake
+add_library(midraw STATIC IMPORTED)
+set_target_properties(midraw PROPERTIES IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/libmidraw.a")
+
+target_include_directories(app PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+target_link_libraries(app PRIVATE midraw dl log)
+# 如启用 GPU:
+# target_link_libraries(app PRIVATE vulkan)
+# 或 target_link_libraries(app PRIVATE EGL GLESv3)
+```
+
+## 3. 使用流程（推荐高层 DrawEngine API）
+
+典型流程：
+1) `init_engine_mode(mode)` 或 `init_draw_engine(mode)`
+2) `init_draw_windows(name, randomize_name)`
+3) 进入主循环：
+   - `draw_begin_frame()`
+   - 调用绘制函数（draw_*）
+   - `draw_end_frame()`
+4) 退出时 `shutdown_draw_engine()`
+
+### 3.1 模式说明
+- `DRAW_ENGINE_MODE_AUTO (0)`：自动选择最优后端
+- `DRAW_ENGINE_MODE_GPU (1)`：强制 GPU
+- `DRAW_ENGINE_MODE_CPU (2)`：强制 CPU
+- `DRAW_ENGINE_MODE_HYBRID (3)`：CPU + GPU 混合
+
+### 3.2 FPS 行为
+- `draw_engine_set_fps(fps)`：
+  - GPU：目标 fps，允许一定波动
+  - CPU/混合：自动基于 CPU 负载调整
+- 未设置 fps 时，GPU 默认使用当前显示刷新率（获取失败则回退 60fps）
+- `get_mode_is_need_set_fps()`：提示当前后端是否需要/建议设置 fps（GPU 返回 true）
+
+## 4. 公共 API 说明（DrawEngine）
+
+### 初始化/关闭
+- `int init_engine_mode(int mode)`
+  - 等同 `init_draw_engine(mode)`，设置模式并初始化。
+- `int init_draw_engine(int mode)`
+  - 初始化引擎，返回 0 成功。
+- `int init_draw_windows(const char* name, int randomize_name)`
+  - 创建透明画布窗口。`randomize_name!=0` 可随机化窗口名。
+- `void shutdown_draw_engine(void)`
+  - 释放所有资源。
+
+### 帧控制
+- `int draw_begin_frame(void)`
+  - 开始一帧绘制，必须在任何 draw_* 之前调用。
+- `void draw_end_frame(void)`
+  - 结束一帧并提交。
+
+### 画布信息/设置
+- `int draw_screen_width(void)` / `int draw_screen_height(void)`
+  - 返回当前逻辑宽高。
+- `int draw_set_render_scale(float scale)`
+  - 设定渲染缩放（0.25~1.0）。
+- `int draw_set_render_size(int width, int height)`
+  - 强制渲染尺寸。
+
+### 绘制函数
+- `void draw_text(const char* text, int x0, int y0, int x1, int y1, uint32_t color)`
+  - 绘制文本（支持裁剪区域）。
+- `void draw_rect(int x, int y, int w, int h, int filled, uint32_t color)`
+  - 绘制矩形，`filled=1` 实心。
+- `void draw_circle(int cx, int cy, int radius, uint32_t color)`
+  - 绘制圆形。
+- `void draw_line(int x1, int y1, int x2, int y2, uint32_t color)`
+  - 绘制线段。
+
+### 图像
+- `DrawImage* draw_load_image_from_memory(const unsigned char* data, int size)`
+  - 从内存加载 PNG/JPG 等图像。
+- `void draw_free_image(DrawImage* image)`
+  - 释放图像。
+- `void draw_image(const DrawImage* image, int x, int y)`
+  - 绘制图像。
+
+### 设置/查询
+- `void draw_engine_set_fps(int fps)`
+  - 设置目标帧率（见 3.2）。
+- `void draw_engine_set_hybrid_cpu_mask(uint32_t mask)`
+  - 混合模式下指定 CPU 绘制类别（按位掩码）。
+- `void draw_engine_set_sensitive(int enable)`
+  - 标记敏感绘制区域（混合模式可强制走 CPU）。
+- `int draw_engine_set_option(int option, int value)`
+  - 设置选项（例如渲染尺寸/目标 fps/质量等级等）。
+- `int draw_engine_get_option(int option, int* out_value)`
+  - 查询选项值。
+- `int draw_engine_get_capabilities(DrawEngineCaps* out_caps)`
+  - 获取设备/后端能力。
+- `bool get_mode_is_need_set_fps(void)`
+  - 自动模式下是否建议设置 fps。
+
+## 5. 低层 API（Midraw）
+
+适合需要直接控制 CPU 绘制的场景。
+
+### 初始化/关闭
+- `int midraw_init(MidrawContext** out_ctx, const MidrawConfig* config)`
+  - 创建上下文，`config` 可指定窗口名/旋转/尺寸/字体。
+- `void midraw_shutdown(MidrawContext* ctx)`
+  - 释放上下文资源。
+
+### 帧控制
+- `int midraw_lock(MidrawContext* ctx)`
+  - 锁定帧缓冲，开始绘制。
+- `void midraw_unlock_post(MidrawContext* ctx)`
+  - 解锁并提交。
+
+### 尺寸/窗口
+- `int midraw_logical_width(const MidrawContext* ctx)` / `int midraw_logical_height(const MidrawContext* ctx)`
+  - 逻辑宽高。
+- `int midraw_resize(MidrawContext* ctx, int width, int height)`
+  - 调整尺寸。
+- `void* midraw_get_native_window(MidrawContext* ctx)`
+  - 返回底层 ANativeWindow*。
+- `int midraw_set_layer(MidrawContext* ctx, int32_t layer)`
+  - 设置图层 Z-order。
+- `int midraw_display_rotation(MidrawContext* ctx, int* out_rotation, int* out_width, int* out_height)`
+  - 查询显示旋转与尺寸。
+
+### 绘制函数
+- `void midraw_draw_pixel(MidrawContext* ctx, int x, int y, uint32_t color)`
+- `void midraw_draw_line(MidrawContext* ctx, int x1, int y1, int x2, int y2, uint32_t color)`
+- `void midraw_draw_rect(MidrawContext* ctx, int x, int y, int w, int h, int filled, uint32_t color)`
+- `void midraw_draw_circle(MidrawContext* ctx, int cx, int cy, int radius, uint32_t color)`
+- `void midraw_draw_text(MidrawContext* ctx, const char* text, int x, int y, uint32_t color)`
+- `void midraw_draw_text_rect(MidrawContext* ctx, const char* text, int x0, int y0, int x1, int y1, uint32_t color)`
+- `void midraw_draw_image(MidrawContext* ctx, const uint32_t* pixels, int img_w, int img_h, int x, int y)`
+
+## 6. 错误码
+
+- `*_OK = 0`
+- `*_EINVAL`：参数非法
+- `*_ENOTINIT`：未初始化
+- `*_EFAILED` / `*_ENOBACKEND`：失败或后端不可用
+
+## 7. 典型示例（DrawEngine）
+
+```c
+init_draw_engine(DRAW_ENGINE_MODE_AUTO);
+init_draw_windows("MyOverlay", 1);
+for (;;) {
+  if (draw_begin_frame() == 0) {
+    draw_rect(10, 10, 100, 50, 1, 0x80FF0000);
+    draw_text("Hello", 20, 20, 200, 60, 0xFFFFFFFF);
+    draw_end_frame();
+  }
+}
+shutdown_draw_engine();
+```
+
+---
+如需更详细的参数或高级配置，请查看 `include/midraw.h` 与 `include/draw_engine.h`。

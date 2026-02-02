@@ -124,6 +124,20 @@ jobs:
             done
           done
 
+      - name: Stage public API docs
+        run: |
+          for ABI in ${ANDROID_ABIS}; do
+            for BUILD_TYPE in ${BUILD_TYPES}; do
+              BUILD_DIR="${GITHUB_WORKSPACE}/build_${ABI}_${BUILD_TYPE}"
+              API_DIR="${BUILD_DIR}/public_api/include"
+              mkdir -p "${API_DIR}"
+              cp "${GITHUB_WORKSPACE}/include/"*.h "${API_DIR}/" || true
+              if [[ -f "${GITHUB_WORKSPACE}/user_dock.md" ]]; then
+                cp "${GITHUB_WORKSPACE}/user_dock.md" "${BUILD_DIR}/public_api/user_dock.md"
+              fi
+            done
+          done
+
       - name: Summarize build outputs
         run: |
           {
@@ -147,9 +161,13 @@ jobs:
             build_*_Debug/benchmark
             build_*_Debug/overlay_engine
             build_*_Debug/draw_demo
+            build_*_Debug/public_api/**
             build_*_Release/libmidraw.so
             build_*_Release/libmidraw.a
             build_*_Release/benchmark
             build_*_Release/overlay_engine
             build_*_Release/draw_demo
+            build_*_Release/public_api/**
             generated/android_symbol_candidates.h
+            user_dock.md
+            include/*.h
