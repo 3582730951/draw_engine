@@ -2425,12 +2425,20 @@ static bool ensure_ahb_surface(MidrawContext& ctx, int width, int height) {
     apply_surface_tx(ctx, ctx.render.ahb_surface, width, height);
     return true;
   }
-  if (!ctx.symbols.ASurfaceControl_createFromWindow || !ctx.render.window) {
+  if (ctx.render.window && ctx.symbols.ASurfaceControl_createFromWindow) {
+    ctx.render.ahb_surface =
+        ctx.symbols.ASurfaceControl_createFromWindow(ctx.render.window, "midraw_ahb");
+    if (ctx.render.ahb_surface) {
+      apply_surface_tx(ctx, ctx.render.ahb_surface, width, height);
+      return true;
+    }
+  }
+  if (!ctx.symbols.ASurfaceControl_create) {
     return false;
   }
-  ctx.render.ahb_surface =
-      ctx.symbols.ASurfaceControl_createFromWindow(ctx.render.window, "midraw_ahb");
+  ctx.render.ahb_surface = ctx.symbols.ASurfaceControl_create("midraw_ahb", nullptr);
   if (!ctx.render.ahb_surface) {
+    fprintf(stderr, "midraw: ASurfaceControl_create failed for AHB surface\n");
     return false;
   }
   apply_surface_tx(ctx, ctx.render.ahb_surface, width, height);
@@ -2472,7 +2480,8 @@ static bool setup_ahb_buffer(MidrawContext& ctx, int width, int height) {
 
 static bool can_use_ahb(const MidrawContext& ctx) {
   if (!ctx.render.surface && !ctx.render.ahb_surface &&
-      !(ctx.render.window && ctx.symbols.ASurfaceControl_createFromWindow)) {
+      !(ctx.render.window && ctx.symbols.ASurfaceControl_createFromWindow) &&
+      !ctx.symbols.ASurfaceControl_create) {
     return false;
   }
   return ctx.symbols.ASurfaceTransaction_create && ctx.symbols.ASurfaceTransaction_setBuffer &&
