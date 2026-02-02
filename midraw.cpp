@@ -2944,21 +2944,54 @@ static void replay_commands(MidrawContext& ctx) {
   if (ctx.command_count == 0) {
     return;
   }
+  const bool timing_debug = debug_timing_enabled();
+  uint64_t t_pixel = 0;
+  uint64_t t_line = 0;
+  uint64_t t_rect = 0;
+  uint64_t t_circle = 0;
+  uint64_t t_text = 0;
+  uint64_t t_image = 0;
+  size_t c_pixel = 0;
+  size_t c_line = 0;
+  size_t c_rect = 0;
+  size_t c_circle = 0;
+  size_t c_text = 0;
+  size_t c_image = 0;
   for (size_t i = 0; i < ctx.command_count; ++i) {
     const size_t index = (ctx.command_head + i) % kCommandCapacity;
     const DrawCommand& cmd = ctx.command_buffer[index];
+    uint64_t t0 = 0;
+    if (timing_debug) {
+      t0 = now_ns();
+    }
     switch (cmd.type) {
       case DrawCommandType::Pixel:
         draw_pixel(ctx.render, cmd.a, cmd.b, cmd.color);
+        if (timing_debug) {
+          t_pixel += now_ns() - t0;
+          ++c_pixel;
+        }
         break;
       case DrawCommandType::Line:
         draw_line(ctx.render, cmd.a, cmd.b, cmd.c, cmd.d, cmd.color);
+        if (timing_debug) {
+          t_line += now_ns() - t0;
+          ++c_line;
+        }
         break;
       case DrawCommandType::Rect:
         draw_rect(ctx.render, cmd.a, cmd.b, cmd.c, cmd.d, cmd.e != 0, cmd.color);
+        if (timing_debug) {
+          t_rect += now_ns() - t0;
+          ++c_rect;
+        }
         break;
       case DrawCommandType::Circle:
         draw_circle(ctx.render, cmd.a, cmd.b, cmd.c, cmd.color);
+        if (timing_debug) {
+          t_circle += now_ns() - t0;
+          ++c_circle;
+        }
         break;
       case DrawCommandType::Text: {
         const char* text = &ctx.text_pool[cmd.e];
@@ -2978,13 +3011,44 @@ static void replay_commands(MidrawContext& ctx) {
             draw_text(ctx.render, text, cmd.a, cmd.b, cmd.color);
           }
         }
+        if (timing_debug) {
+          t_text += now_ns() - t0;
+          ++c_text;
+        }
       } break;
       case DrawCommandType::Image: {
         const uint32_t* pixels = reinterpret_cast<const uint32_t*>(cmd.ptr);
         draw_image(ctx.render, pixels, cmd.c, cmd.d, cmd.a, cmd.b);
+        if (timing_debug) {
+          t_image += now_ns() - t0;
+          ++c_image;
+        }
       } break;
       default:
         break;
+    }
+  }
+  if (timing_debug) {
+    static uint64_t last_log_ns = 0;
+    const uint64_t now = now_ns();
+    if ((now - last_log_ns) > 1000000000ull) {
+      fprintf(stderr,
+              "midraw timing: cmds=%zu px=%zu ln=%zu rc=%zu cc=%zu tx=%zu img=%zu "
+              "t(px)=%.3f t(ln)=%.3f t(rc)=%.3f t(cc)=%.3f t(tx)=%.3f t(img)=%.3f ms\n",
+              ctx.command_count,
+              c_pixel,
+              c_line,
+              c_rect,
+              c_circle,
+              c_text,
+              c_image,
+              t_pixel / 1000000.0,
+              t_line / 1000000.0,
+              t_rect / 1000000.0,
+              t_circle / 1000000.0,
+              t_text / 1000000.0,
+              t_image / 1000000.0);
+      last_log_ns = now;
     }
   }
 }
