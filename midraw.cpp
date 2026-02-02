@@ -1197,6 +1197,21 @@ static inline void blend_pixel_mapped(RenderContext& ctx,
   *dst = blend_pixel(*dst, src, coverage);
 }
 
+static inline void blend_pixel_physical(RenderContext& ctx,
+                                        int px,
+                                        int py,
+                                        const ColorComponents& src,
+                                        uint8_t coverage) {
+  if (!ctx.pixels) {
+    return;
+  }
+  if (px < 0 || py < 0 || px >= ctx.width || py >= ctx.height) {
+    return;
+  }
+  uint32_t* dst = ctx.pixels + py * ctx.stride + px;
+  *dst = blend_pixel(*dst, src, coverage);
+}
+
 static inline void plot_pixel_physical(RenderContext& ctx, int px, int py, uint32_t color) {
   if (!ctx.pixels) {
     return;
@@ -1486,6 +1501,72 @@ static void draw_line_aa(RenderContext& ctx, int x0, int y0, int x1, int y1, uin
   }
 }
 
+static void draw_line_aa_physical(RenderContext& ctx,
+                                  int x0,
+                                  int y0,
+                                  int x1,
+                                  int y1,
+                                  uint32_t color) {
+  if (!ctx.pixels) {
+    return;
+  }
+  const ColorComponents comp = color_components(color);
+  bool steep = abs(y1 - y0) > abs(x1 - x0);
+  if (steep) {
+    int tmp = x0; x0 = y0; y0 = tmp;
+    tmp = x1; x1 = y1; y1 = tmp;
+  }
+  if (x0 > x1) {
+    int tmp = x0; x0 = x1; x1 = tmp;
+    tmp = y0; y0 = y1; y1 = tmp;
+  }
+  const float dx = static_cast<float>(x1 - x0);
+  const float dy = static_cast<float>(y1 - y0);
+  const float gradient = (dx == 0.0f) ? 1.0f : (dy / dx);
+
+  float xend = roundf(static_cast<float>(x0));
+  float yend = static_cast<float>(y0) + gradient * (xend - static_cast<float>(x0));
+  float xgap = rfpart(static_cast<float>(x0) + 0.5f);
+  int xpxl1 = static_cast<int>(xend);
+  int ypxl1 = static_cast<int>(floorf(yend));
+  if (steep) {
+    blend_pixel_physical(ctx, ypxl1, xpxl1, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_physical(ctx, ypxl1 + 1, xpxl1, comp, to_coverage(fpart(yend) * xgap));
+  } else {
+    blend_pixel_physical(ctx, xpxl1, ypxl1, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_physical(ctx, xpxl1, ypxl1 + 1, comp, to_coverage(fpart(yend) * xgap));
+  }
+  float intery = yend + gradient;
+
+  xend = roundf(static_cast<float>(x1));
+  yend = static_cast<float>(y1) + gradient * (xend - static_cast<float>(x1));
+  xgap = fpart(static_cast<float>(x1) + 0.5f);
+  int xpxl2 = static_cast<int>(xend);
+  int ypxl2 = static_cast<int>(floorf(yend));
+  if (steep) {
+    blend_pixel_physical(ctx, ypxl2, xpxl2, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_physical(ctx, ypxl2 + 1, xpxl2, comp, to_coverage(fpart(yend) * xgap));
+  } else {
+    blend_pixel_physical(ctx, xpxl2, ypxl2, comp, to_coverage(rfpart(yend) * xgap));
+    blend_pixel_physical(ctx, xpxl2, ypxl2 + 1, comp, to_coverage(fpart(yend) * xgap));
+  }
+
+  for (int x = xpxl1 + 1; x < xpxl2; ++x) {
+    if (steep) {
+      blend_pixel_physical(ctx, static_cast<int>(floorf(intery)), x, comp,
+                           to_coverage(rfpart(intery)));
+      blend_pixel_physical(ctx, static_cast<int>(floorf(intery)) + 1, x, comp,
+                           to_coverage(fpart(intery)));
+    } else {
+      blend_pixel_physical(ctx, x, static_cast<int>(floorf(intery)), comp,
+                           to_coverage(rfpart(intery)));
+      blend_pixel_physical(ctx, x, static_cast<int>(floorf(intery)) + 1, comp,
+                           to_coverage(fpart(intery)));
+    }
+    intery += gradient;
+  }
+}
+
 static void draw_circle_aa(RenderContext& ctx, int cx, int cy, int radius, uint32_t color) {
   if (!ctx.pixels || radius <= 0) {
     return;
@@ -1530,6 +1611,54 @@ static void draw_circle_aa(RenderContext& ctx, int cx, int cy, int radius, uint3
   }
 }
 
+static void draw_circle_aa_physical(RenderContext& ctx,
+                                    int cx,
+                                    int cy,
+                                    int radius,
+                                    uint32_t color) {
+  if (!ctx.pixels || radius <= 0) {
+    return;
+  }
+  const ColorComponents comp = color_components(color);
+  const float r = static_cast<float>(radius);
+  const float r2 = r * r;
+  for (int x = 0; x <= radius; ++x) {
+    const float fx = static_cast<float>(x);
+    const float fy = sqrtf(r2 - fx * fx);
+    const int iy = static_cast<int>(floorf(fy));
+    const float frac = fy - static_cast<float>(iy);
+    const uint8_t a0 = to_coverage(1.0f - frac);
+    const uint8_t a1 = to_coverage(frac);
+
+    const int px = cx + x;
+    const int nx = cx - x;
+    const int py = cy + iy;
+    const int ny = cy - iy;
+
+    blend_pixel_physical(ctx, px, py, comp, a0);
+    blend_pixel_physical(ctx, px, py + 1, comp, a1);
+    blend_pixel_physical(ctx, px, ny, comp, a0);
+    blend_pixel_physical(ctx, px, ny - 1, comp, a1);
+    blend_pixel_physical(ctx, nx, py, comp, a0);
+    blend_pixel_physical(ctx, nx, py + 1, comp, a1);
+    blend_pixel_physical(ctx, nx, ny, comp, a0);
+    blend_pixel_physical(ctx, nx, ny - 1, comp, a1);
+
+    const int py2 = cy + x;
+    const int ny2 = cy - x;
+    const int px2 = cx + iy;
+    const int nx2 = cx - iy;
+    blend_pixel_physical(ctx, px2, py2, comp, a0);
+    blend_pixel_physical(ctx, px2 + 1, py2, comp, a1);
+    blend_pixel_physical(ctx, px2, ny2, comp, a0);
+    blend_pixel_physical(ctx, px2 + 1, ny2, comp, a1);
+    blend_pixel_physical(ctx, nx2, py2, comp, a0);
+    blend_pixel_physical(ctx, nx2 - 1, py2, comp, a1);
+    blend_pixel_physical(ctx, nx2, ny2, comp, a0);
+    blend_pixel_physical(ctx, nx2 - 1, ny2, comp, a1);
+  }
+}
+
 static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32_t color) {
   if (!ctx.pixels) {
     return;
@@ -1556,7 +1685,11 @@ static void draw_line(RenderContext& ctx, int x1, int y1, int x2, int y2, uint32
     expand_dirty_rect(ctx, cmin_x - pad, cmin_y - pad,
                       (cmax_x - cmin_x + 1) + pad * 2,
                       (cmax_y - cmin_y + 1) + pad * 2);
-    draw_line_aa(ctx, cx1, cy1, cx2, cy2, color);
+    if (ctx.rotation == 0) {
+      draw_line_aa_physical(ctx, cx1, cy1, cx2, cy2, color);
+    } else {
+      draw_line_aa(ctx, cx1, cy1, cx2, cy2, color);
+    }
     return;
   }
   expand_dirty_rect(ctx, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1);
@@ -1581,7 +1714,11 @@ static void draw_circle(RenderContext& ctx, int cx, int cy, int radius, uint32_t
     const int pad = 1;
     expand_dirty_rect(ctx, cx - radius - pad, cy - radius - pad,
                       radius * 2 + 1 + pad * 2, radius * 2 + 1 + pad * 2);
-    draw_circle_aa(ctx, cx, cy, radius, color);
+    if (ctx.rotation == 0) {
+      draw_circle_aa_physical(ctx, cx, cy, radius, color);
+    } else {
+      draw_circle_aa(ctx, cx, cy, radius, color);
+    }
     return;
   }
   expand_dirty_rect(ctx, cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1);
