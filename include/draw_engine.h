@@ -310,6 +310,14 @@ DRAW_ENGINE_API int draw_ui_listbox(const char* label,
                                     const char* const* items,
                                     int item_count,
                                     int* current);
+DRAW_ENGINE_API int draw_ui_listbox_multi(const char* label,
+                                          int x,
+                                          int y,
+                                          int w,
+                                          int h,
+                                          const char* const* items,
+                                          int item_count,
+                                          uint32_t* mask);
 DRAW_ENGINE_API int draw_ui_combo(const char* label,
                                   int x,
                                   int y,
@@ -324,6 +332,14 @@ DRAW_ENGINE_API int draw_ui_tabs(int x,
                                  const char* const* labels,
                                  int label_count,
                                  int* current);
+DRAW_ENGINE_API int draw_ui_scrollbar(const char* label,
+                                      int x,
+                                      int y,
+                                      int h,
+                                      int content_h,
+                                      int* scroll_y);
+DRAW_ENGINE_API int draw_ui_tree_node(const char* label, int x, int y, int* open);
+DRAW_ENGINE_API int draw_ui_color_picker_rgba(const char* label, int x, int y, uint32_t* color);
 DRAW_ENGINE_API int draw_ui_checkbox(const char* label, int x, int y, int* value);
 DRAW_ENGINE_API int draw_ui_slider_int(const char* label,
                                        int x,

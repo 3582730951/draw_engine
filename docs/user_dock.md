@@ -14,12 +14,11 @@ Release / Debug 产物都会包含：
 
 ### 2.1 使用 `.so`
 - 运行时将 `libmidraw.so` 放入应用的 `lib/<ABI>/`，并确保运行时可加载。
-- 编译链接时建议链接：`-lmidraw -ldl -llog`
-- 如果启用 GPU：额外链接 `-lvulkan`（Vulkan）或 `-lEGL -lGLESv3`（OpenGL ES）。
+- **无需额外参数**，直接调用 API 即可。
 
 ### 2.2 使用 `.a`
 - 将 `libmidraw.a` 加入链接。
-- 需要显式链接其依赖：`-ldl -llog`，以及 GPU 相关库（Vulkan / EGL / GLES）。
+- **无需额外参数**，直接调用 API 即可。
 
 ### 2.3 CMake 示例
 ```cmake
@@ -28,10 +27,7 @@ set_target_properties(midraw PROPERTIES IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/l
 
 target_include_directories(app PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-target_link_libraries(app PRIVATE midraw dl log)
-# 如启用 GPU:
-# target_link_libraries(app PRIVATE vulkan)
-# 或 target_link_libraries(app PRIVATE EGL GLESv3)
+target_link_libraries(app PRIVATE midraw)
 ```
 
 ## 3. 使用流程（推荐高层 DrawEngine API）
@@ -152,10 +148,18 @@ API：
   - 单选按钮，点击后把 `current` 设为 `value`。
 - `int draw_ui_listbox(const char* label, int x, int y, int w, int h, const char* const* items, int item_count, int* current)`
   - 列表选择框。
+- `int draw_ui_listbox_multi(const char* label, int x, int y, int w, int h, const char* const* items, int item_count, uint32_t* mask)`
+  - 多选列表（使用 bitmask，最多 32 项）。
 - `int draw_ui_combo(const char* label, int x, int y, int w, const char* const* items, int item_count, int* current)`
   - 下拉选择框。
 - `int draw_ui_tabs(int x, int y, int w, int h, const char* const* labels, int label_count, int* current)`
   - 标签页切换。
+- `int draw_ui_scrollbar(const char* label, int x, int y, int h, int content_h, int* scroll_y)`
+  - 垂直滚动条，返回更新；`scroll_y` 需由调用者用于内容偏移。
+- `int draw_ui_tree_node(const char* label, int x, int y, int* open)`
+  - 树节点展开/收起。
+- `int draw_ui_color_picker_rgba(const char* label, int x, int y, uint32_t* color)`
+  - RGBA 颜色选择器（返回 1 表示颜色变更）。
 - `int draw_ui_checkbox(const char* label, int x, int y, int* value)`
   - 绘制复选框，点击切换 `value`（1=选中）。
 - `int draw_ui_slider_int(const char* label, int x, int y, int w, int min_value, int max_value, int* value)`
@@ -195,6 +199,9 @@ Java/Kotlin 侧：
 ```java
 // Java
 public native void nativeSetImeContext(Context context, View view);
+public native void nativeInputChar(int codepoint);
+public native void nativeInputKey(int key, int down);
+public static final int DRAW_UI_KEY_BACKSPACE = 1;
 
 @Override
 protected void onCreate(Bundle savedInstanceState) {
@@ -202,6 +209,39 @@ protected void onCreate(Bundle savedInstanceState) {
   SurfaceView sv = new SurfaceView(this);
   setContentView(sv);
   nativeSetImeContext(this, sv);
+
+  // 备用输入桥：使用 EditText 收集 IME 文本并转发给 native
+  final EditText imeEdit = new EditText(this);
+  imeEdit.setSingleLine(true);
+  imeEdit.setText("");
+  imeEdit.setAlpha(0.0f);
+  addContentView(imeEdit, new ViewGroup.LayoutParams(1, 1));
+
+  final String[] lastText = {""};
+  imeEdit.addTextChangedListener(new TextWatcher() {
+    @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+    @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+    @Override public void afterTextChanged(Editable s) {
+      String now = s.toString();
+      int oldLen = lastText[0].length();
+      int newLen = now.length();
+      if (newLen < oldLen) {
+        int diff = oldLen - newLen;
+        for (int i = 0; i < diff; i++) {
+          nativeInputKey(DRAW_UI_KEY_BACKSPACE, 1);
+          nativeInputKey(DRAW_UI_KEY_BACKSPACE, 0);
+        }
+      } else if (newLen > oldLen) {
+        String add = now.substring(oldLen);
+        for (int i = 0; i < add.length(); ) {
+          int cp = add.codePointAt(i);
+          nativeInputChar(cp);
+          i += Character.charCount(cp);
+        }
+      }
+      lastText[0] = now;
+    }
+  });
 }
 ```
 

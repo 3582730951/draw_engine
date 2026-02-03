@@ -178,7 +178,7 @@ int main() {
         draw_ui_touch_poll();
       }
       draw_ui_new_frame();
-      if (draw_ui_begin_window("MiDraw UI", &ui_x, &ui_y, 360, 360,
+      if (draw_ui_begin_window("MiDraw UI", &ui_x, &ui_y, 360, 520,
                                DRAW_UI_WINDOW_MOVABLE)) {
         int row_y = 0;
         draw_ui_text("Immediate UI Window", 0, row_y, 0xFFFFFFFF);
@@ -231,6 +231,10 @@ int main() {
           static int combo_index = 1;
           const char* combo_items[] = { "Low", "Medium", "High" };
           draw_ui_combo("Quality", 0, row_y, 200, combo_items, 3, &combo_index);
+          row_y += 64;
+
+          static uint32_t ui_color = DRAW_COLOR_ORANGE;
+          draw_ui_color_picker_rgba("Tint", 0, row_y, &ui_color);
         } else if (ui_tab == 3) {
           static int radio_value = 0;
           if (draw_ui_radio("CPU Mode", 0, row_y, 0, &radio_value)) {
@@ -245,6 +249,20 @@ int main() {
           static int list_index = 0;
           const char* list_items[] = { "Circle", "Rect", "Line", "Text" };
           draw_ui_listbox("Active Tool", 0, row_y, 200, 96, list_items, 4, &list_index);
+          row_y += 104;
+
+          static int tree_open = 1;
+          draw_ui_tree_node("Flags", 0, row_y, &tree_open);
+          row_y += 22;
+          if (tree_open) {
+            static uint32_t list_mask = 0x3u;
+            const char* flag_items[] = { "AA Line", "AA Circle", "Snap", "Clip" };
+            draw_ui_listbox_multi("Options", 0, row_y, 200, 96, flag_items, 4, &list_mask);
+            row_y += 104;
+          }
+
+          static int scroll_y = 0;
+          draw_ui_scrollbar("ListScroll", 220, row_y - 104, 120, 200, &scroll_y);
         }
       }
       draw_ui_end_window();

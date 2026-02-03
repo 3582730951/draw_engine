@@ -335,6 +335,7 @@ struct UiState {
   int input_char_count;
   bool key_down[DRAW_UI_KEY_MAX + 1];
   bool key_pressed[DRAW_UI_KEY_MAX + 1];
+  float scroll_drag_off;
 };
 
 static UiState g_ui{};
@@ -935,6 +936,162 @@ int draw_ui_listbox(const char* label,
   return changed;
 }
 
+int draw_ui_listbox_multi(const char* label,
+                          int x,
+                          int y,
+                          int w,
+                          int h,
+                          const char* const* items,
+                          int item_count,
+                          uint32_t* mask) {
+  if (!g_engine.cpu_ctx || !label || !items || item_count <= 0 || !mask) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 60) {
+    w = 200;
+  }
+  const int item_h = 22;
+  if (h <= 0) {
+    h = item_h * item_count + 6;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int list_y = label_y + 18;
+  const int bx = base_x + x;
+  const int by = list_y;
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+  draw_rect(bx, by, w, h, 1, g_ui.style.window_bg);
+  draw_rect(bx, by, w, h, 0, g_ui.style.border);
+
+  int changed = 0;
+  int y_cursor = by + 3;
+  for (int i = 0; i < item_count; ++i) {
+    const int item_y = y_cursor + i * item_h;
+    const bool hovered =
+        ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx + 2, item_y, w - 4, item_h);
+    const uint32_t id =
+        ui_hash(items[i]) ^ (g_ui.window_id * 16777619u) ^
+        static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8)) ^
+        static_cast<uint32_t>(i);
+    if (g_ui.input.pressed && hovered) {
+      g_ui.active_id = id;
+    }
+    const bool can_toggle = (i < 32);
+    if (g_ui.input.released && g_ui.active_id == id) {
+      if (hovered && can_toggle) {
+        *mask ^= (1u << static_cast<uint32_t>(i));
+        changed = 1;
+      }
+      g_ui.active_id = 0;
+    }
+    const bool selected = can_toggle && ((*mask & (1u << static_cast<uint32_t>(i))) != 0);
+    uint32_t color = g_ui.style.button_bg;
+    if (selected) {
+      color = g_ui.style.button_active;
+    } else if (hovered) {
+      color = g_ui.style.button_hover;
+    }
+    draw_rect(bx + 2, item_y, w - 4, item_h - 1, 1, color);
+    draw_text(items[i] ? items[i] : "",
+              bx + g_ui.style.padding,
+              item_y + 3,
+              bx + w - g_ui.style.padding,
+              item_y + item_h,
+              g_ui.style.text);
+  }
+  return changed;
+}
+
+int draw_ui_scrollbar(const char* label,
+                      int x,
+                      int y,
+                      int h,
+                      int content_h,
+                      int* scroll_y) {
+  if (!g_engine.cpu_ctx || !label || !scroll_y) {
+    return 0;
+  }
+  ui_init_style();
+  if (h <= 0) {
+    return 0;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int bar_w = 12;
+  const int max_scroll = (content_h > h) ? (content_h - h) : 0;
+  if (*scroll_y < 0) {
+    *scroll_y = 0;
+  } else if (*scroll_y > max_scroll) {
+    *scroll_y = max_scroll;
+  }
+  int thumb_h = h;
+  if (content_h > 0) {
+    const float ratio = static_cast<float>(h) / static_cast<float>(content_h);
+    thumb_h = static_cast<int>(static_cast<float>(h) * ratio + 0.5f);
+  }
+  if (thumb_h < 20) {
+    thumb_h = 20;
+  }
+  if (thumb_h > h) {
+    thumb_h = h;
+  }
+  int thumb_y = by;
+  if (max_scroll > 0 && h > thumb_h) {
+    thumb_y = by + static_cast<int>((static_cast<float>(*scroll_y) /
+                                     static_cast<float>(max_scroll)) *
+                                        static_cast<float>(h - thumb_h) +
+                                    0.5f);
+  }
+
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, thumb_y, bar_w, thumb_h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+    g_ui.scroll_drag_off = g_ui.input.y - static_cast<float>(thumb_y);
+  }
+  bool changed = false;
+  if (g_ui.active_id == id && g_ui.input.down) {
+    float new_thumb = g_ui.input.y - g_ui.scroll_drag_off;
+    if (new_thumb < static_cast<float>(by)) {
+      new_thumb = static_cast<float>(by);
+    }
+    if (new_thumb > static_cast<float>(by + h - thumb_h)) {
+      new_thumb = static_cast<float>(by + h - thumb_h);
+    }
+    if (h > thumb_h && max_scroll > 0) {
+      const float t = (new_thumb - static_cast<float>(by)) /
+                      static_cast<float>(h - thumb_h);
+      const int new_scroll =
+          static_cast<int>(t * static_cast<float>(max_scroll) + 0.5f);
+      if (new_scroll != *scroll_y) {
+        *scroll_y = new_scroll;
+        changed = true;
+      }
+    }
+  }
+  if (g_ui.input.released && g_ui.active_id == id) {
+    g_ui.active_id = 0;
+  }
+
+  draw_rect(bx, by, bar_w, h, 1, g_ui.style.window_bg);
+  draw_rect(bx, by, bar_w, h, 0, g_ui.style.border);
+  uint32_t thumb_color = g_ui.style.button_hover;
+  if (g_ui.active_id == id && g_ui.input.down) {
+    thumb_color = g_ui.style.button_active;
+  } else if (hovered) {
+    thumb_color = g_ui.style.button_hover;
+  }
+  draw_rect(bx + 2, thumb_y, bar_w - 4, thumb_h, 1, thumb_color);
+  return changed ? 1 : 0;
+}
+
 int draw_ui_combo(const char* label,
                   int x,
                   int y,
@@ -1100,6 +1257,109 @@ int draw_ui_tabs(int x,
               g_ui.style.text);
   }
   return changed;
+}
+
+int draw_ui_tree_node(const char* label, int x, int y, int* open) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !open) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int hit_w = 220;
+  const int hit_h = 20;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, hit_w, hit_h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  int changed = 0;
+  if (g_ui.input.released && g_ui.active_id == id) {
+    if (hovered) {
+      *open = (*open == 0) ? 1 : 0;
+      changed = 1;
+    }
+    g_ui.active_id = 0;
+  }
+
+  const int arrow_x = bx + 4;
+  const int arrow_y = by + 6;
+  if (*open) {
+    draw_line(arrow_x, arrow_y, arrow_x + 8, arrow_y, g_ui.style.text);
+    draw_line(arrow_x + 2, arrow_y + 2, arrow_x + 6, arrow_y + 6, g_ui.style.text);
+    draw_line(arrow_x + 6, arrow_y + 6, arrow_x + 10, arrow_y + 2, g_ui.style.text);
+  } else {
+    draw_line(arrow_x, arrow_y, arrow_x + 6, arrow_y + 4, g_ui.style.text);
+    draw_line(arrow_x + 6, arrow_y + 4, arrow_x, arrow_y + 8, g_ui.style.text);
+  }
+  draw_text(label,
+            bx + 20,
+            by + 2,
+            bx + hit_w,
+            by + hit_h,
+            g_ui.style.text);
+  return changed;
+}
+
+int draw_ui_color_picker_rgba(const char* label, int x, int y, uint32_t* color) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !color) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int preview = 36;
+
+  uint32_t col = *color;
+  int a = static_cast<int>((col >> 24) & 0xFF);
+  int r = static_cast<int>((col >> 16) & 0xFF);
+  int g = static_cast<int>((col >> 8) & 0xFF);
+  int b = static_cast<int>(col & 0xFF);
+
+  draw_text(label, bx, by, bx + 220, by + 16, g_ui.style.text);
+  draw_rect(bx + 220, by, preview, preview, 1, col);
+  draw_rect(bx + 220, by, preview, preview, 0, g_ui.style.border);
+
+  char lab_r[64];
+  char lab_g[64];
+  char lab_b[64];
+  char lab_a[64];
+  snprintf(lab_r, sizeof(lab_r), "%s.R", label);
+  snprintf(lab_g, sizeof(lab_g), "%s.G", label);
+  snprintf(lab_b, sizeof(lab_b), "%s.B", label);
+  snprintf(lab_a, sizeof(lab_a), "%s.A", label);
+
+  int row_y = by + 18;
+  bool changed = false;
+  if (draw_ui_slider_int(lab_r, x, row_y, 200, 0, 255, &r)) {
+    changed = true;
+  }
+  row_y += 42;
+  if (draw_ui_slider_int(lab_g, x, row_y, 200, 0, 255, &g)) {
+    changed = true;
+  }
+  row_y += 42;
+  if (draw_ui_slider_int(lab_b, x, row_y, 200, 0, 255, &b)) {
+    changed = true;
+  }
+  row_y += 42;
+  if (draw_ui_slider_int(lab_a, x, row_y, 200, 0, 255, &a)) {
+    changed = true;
+  }
+
+  if (changed) {
+    *color = draw_color_rgba(static_cast<uint8_t>(r),
+                             static_cast<uint8_t>(g),
+                             static_cast<uint8_t>(b),
+                             static_cast<uint8_t>(a));
+  }
+  return changed ? 1 : 0;
 }
 
 int draw_ui_checkbox(const char* label, int x, int y, int* value) {
