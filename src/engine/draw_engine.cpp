@@ -83,6 +83,7 @@ struct DrawEngineState {
   bool in_frame;
   bool initialized;
   bool hybrid;
+  bool overlay_locked;
   float render_scale;
   int render_width;
   int render_height;
@@ -103,6 +104,9 @@ struct DrawEngineState {
   int quality_min;
   int quality_max;
   uint64_t last_quality_ns;
+  uint64_t sleep_bias_ns;
+  uint64_t sleep_bias_max_ns;
+  bool sleep_bias_enabled;
 };
 
 static void gpu_shutdown(struct GpuState& gpu);
@@ -110,6 +114,9 @@ static bool gpu_init(struct GpuState& gpu, BackendType backend, ANativeWindow* w
                      int height, int rotation);
 static void gpu_refresh_size_and_rotation();
 static uint64_t now_ns();
+static void init_sleep_bias();
+static uint64_t apply_sleep_bias(uint64_t deadline_ns, uint64_t now_ns);
+static void update_sleep_bias(uint64_t deadline_ns, uint64_t woke_ns);
 
 struct GpuVertex {
   float x;
@@ -126,6 +133,18 @@ struct CachedTextVertex {
   float z;
   float u;
   float v;
+  uint32_t color;
+};
+
+struct TextInstance {
+  float x;
+  float y;
+  float w;
+  float h;
+  float u0;
+  float v0;
+  float u1;
+  float v1;
   uint32_t color;
 };
 
@@ -165,6 +184,7 @@ struct GpuFontAtlas {
   float ascent;
   float line_advance;
   bool truetype;
+  bool sdf;
   bool ready;
 };
 
@@ -180,6 +200,9 @@ struct CachedText {
   float font_ascent;
   float font_line;
   bool font_truetype;
+  bool font_sdf;
+  bool instanced;
+  std::vector<TextInstance> instances;
   std::vector<CachedTextVertex> vertices;
   uint64_t last_used;
 };
@@ -197,25 +220,37 @@ struct VulkanContext {
   VkExtent2D extent;
   std::vector<VkImage> images;
   std::vector<VkImageView> image_views;
-  std::vector<VkFramebuffer> framebuffers;
-  VkRenderPass render_pass;
+  std::vector<VkFramebuffer> framebuffers_2d;
+  std::vector<VkFramebuffer> framebuffers_3d;
+  VkRenderPass render_pass_2d;
+  VkRenderPass render_pass_3d;
   VkPipelineLayout pipeline_layout;
   VkPipeline pipeline_tri_2d;
   VkPipeline pipeline_line_2d;
+  VkPipeline pipeline_text_2d;
   VkPipeline pipeline_tri_3d;
   VkPipeline pipeline_line_3d;
   VkCommandPool command_pool;
-  VkCommandBuffer command_buffer;
-  VkSemaphore image_available;
-  VkSemaphore render_finished;
-  VkFence in_flight;
+  uint32_t frame_count;
+  uint32_t frame_index;
+  std::vector<VkCommandBuffer> command_buffers;
+  std::vector<VkSemaphore> image_available;
+  std::vector<VkSemaphore> render_finished;
+  std::vector<VkFence> in_flight;
   VkDescriptorSetLayout desc_layout;
   VkDescriptorPool desc_pool;
   VkSampler sampler;
   VkBuffer vertex_buffer;
   VkDeviceMemory vertex_memory;
   size_t vertex_capacity;
+  size_t vertex_buffer_size;
+  size_t vertex_stride;
   void* vertex_map;
+  VkBuffer text_buffer;
+  VkDeviceMemory text_memory;
+  size_t text_capacity;
+  size_t text_buffer_size;
+  void* text_map;
   VkSampleCountFlagBits msaa_samples;
   VkImage msaa_color_image;
   VkDeviceMemory msaa_color_memory;
@@ -242,13 +277,19 @@ struct GlesContext {
   GLuint program;
   GLuint vao;
   GLuint vbo;
+  GLuint program_text;
+  GLuint vao_text;
+  GLuint vbo_text;
   GLint u_mvp;
   GLint u_tex;
+  GLint u_mvp_text;
+  GLint u_tex_text;
   int major;
   int minor;
   bool supports_anisotropy;
   float max_anisotropy;
   int samples;
+  size_t text_buffer_size;
 };
 
 struct GpuState {
@@ -266,6 +307,7 @@ struct GpuState {
   std::vector<GpuCommand> commands;
   std::vector<GpuVertex> vertices;
   std::vector<GpuBatch> batches;
+  std::vector<TextInstance> text_instances;
   std::vector<float> circle_lut;
   int circle_segments;
   char text_pool[65536];
@@ -2002,6 +2044,12 @@ static BackendType choose_best_backend() {
 
 static MidrawContext* active_cpu_ctx() {
   if (g_engine.hybrid && g_engine.overlay_ctx) {
+    if (!g_engine.overlay_locked) {
+      if (midraw_lock(g_engine.overlay_ctx) != 0) {
+        return nullptr;
+      }
+      g_engine.overlay_locked = true;
+    }
     return g_engine.overlay_ctx;
   }
   return g_engine.cpu_ctx;
@@ -2391,6 +2439,65 @@ static uint64_t now_ns() {
          static_cast<uint64_t>(ts.tv_nsec);
 }
 
+static void init_sleep_bias() {
+  g_engine.sleep_bias_ns = 0;
+  g_engine.sleep_bias_enabled = env_int("DRAW_ENGINE_SLEEP_BIAS", 1) != 0;
+  int max_us = env_int("DRAW_ENGINE_SLEEP_BIAS_MAX_US", 2000);
+  if (max_us < 0) {
+    max_us = 0;
+  } else if (max_us > 10000) {
+    max_us = 10000;
+  }
+  g_engine.sleep_bias_max_ns = static_cast<uint64_t>(max_us) * 1000ull;
+}
+
+static bool sleep_bias_active() {
+  if (!g_engine.sleep_bias_enabled) {
+    return false;
+  }
+  if (g_engine.backend == BACKEND_CPU || g_engine.hybrid) {
+    return false;
+  }
+  return g_engine.sleep_bias_max_ns > 0;
+}
+
+static uint64_t apply_sleep_bias(uint64_t deadline_ns, uint64_t now_ns) {
+  if (!sleep_bias_active()) {
+    return deadline_ns;
+  }
+  const uint64_t bias = g_engine.sleep_bias_ns;
+  if (bias == 0) {
+    return deadline_ns;
+  }
+  if (deadline_ns <= now_ns + 1000ull) {
+    return deadline_ns;
+  }
+  if (deadline_ns > bias + now_ns) {
+    return deadline_ns - bias;
+  }
+  return now_ns + 1;
+}
+
+static void update_sleep_bias(uint64_t deadline_ns, uint64_t woke_ns) {
+  if (!sleep_bias_active()) {
+    return;
+  }
+  if (woke_ns > deadline_ns) {
+    const uint64_t overshoot = woke_ns - deadline_ns;
+    uint64_t delta = overshoot / 2;
+    if (delta < 1000ull) {
+      delta = 1000ull;
+    }
+    if (g_engine.sleep_bias_ns + delta >= g_engine.sleep_bias_max_ns) {
+      g_engine.sleep_bias_ns = g_engine.sleep_bias_max_ns;
+    } else {
+      g_engine.sleep_bias_ns += delta;
+    }
+  } else if (g_engine.sleep_bias_ns > 0) {
+    g_engine.sleep_bias_ns = (g_engine.sleep_bias_ns * 9) / 10;
+  }
+}
+
 static bool precise_sleep_enabled() {
   static int cached = -1;
   if (cached < 0) {
@@ -2463,6 +2570,61 @@ static bool query_native_window_size(ANativeWindow* window, int* out_w, int* out
     *out_h = h;
   }
   return true;
+}
+
+static void apply_window_frame_rate(ANativeWindow* window, float fps) {
+#if defined(__ANDROID__)
+  if (!window || fps <= 0.0f) {
+    return;
+  }
+  static int cached = -1;
+  if (cached < 0) {
+    cached = env_int("DRAW_ENGINE_SET_FRAME_RATE", 1) != 0 ? 1 : 0;
+  }
+  if (cached == 0) {
+    return;
+  }
+  using PFN_SetFrameRate = int (*)(ANativeWindow*, float, int8_t);
+  using PFN_SetFrameRateStrategy = int (*)(ANativeWindow*, float, int8_t, int8_t);
+  static void* libandroid = nullptr;
+  static PFN_SetFrameRate set_rate = nullptr;
+  static PFN_SetFrameRateStrategy set_rate_strategy = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    libandroid = dlopen("libandroid.so", RTLD_NOW);
+    if (libandroid) {
+      set_rate = reinterpret_cast<PFN_SetFrameRate>(
+          dlsym(libandroid, "ANativeWindow_setFrameRate"));
+      set_rate_strategy = reinterpret_cast<PFN_SetFrameRateStrategy>(
+          dlsym(libandroid, "ANativeWindow_setFrameRateWithChangeStrategy"));
+    }
+    tried = true;
+  }
+  if (!set_rate && !set_rate_strategy) {
+    return;
+  }
+#ifndef ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
+#define ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE 1
+#endif
+#ifndef ANATIVEWINDOW_CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+#define ANATIVEWINDOW_CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS 0
+#endif
+#ifndef ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS
+#define ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS 1
+#endif
+  const int8_t compat = ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE;
+  const int strategy_env = env_int("DRAW_ENGINE_FRAME_RATE_STRATEGY", 0);
+  const int8_t strategy = (strategy_env != 0) ? ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS
+                                             : ANATIVEWINDOW_CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS;
+  if (set_rate_strategy) {
+    set_rate_strategy(window, fps, compat, strategy);
+  } else if (set_rate) {
+    set_rate(window, fps, compat);
+  }
+#else
+  (void)window;
+  (void)fps;
+#endif
 }
 
 static float query_native_window_refresh_rate(ANativeWindow* window) {
@@ -2541,6 +2703,7 @@ static void maybe_apply_default_gpu_fps() {
     fps = 60;
   }
   g_engine.target_fps = fps;
+  apply_window_frame_rate(g_gpu.window, static_cast<float>(fps));
 }
 
 static bool set_native_window_geometry(ANativeWindow* window, int width, int height) {
@@ -2762,21 +2925,6 @@ static bool init_gpu_font_truetype(GpuState& gpu,
   if (!stbtt_InitFont(&font, ttf.data(), offset)) {
     return false;
   }
-  std::vector<stbtt_bakedchar> baked(96);
-  std::vector<unsigned char> bitmap(static_cast<size_t>(atlas_w * atlas_h));
-  const int ok = stbtt_BakeFontBitmap(ttf.data(),
-                                      offset,
-                                      static_cast<float>(pixel_height),
-                                      bitmap.data(),
-                                      atlas_w,
-                                      atlas_h,
-                                      32,
-                                      96,
-                                      baked.data());
-  if (ok <= 0) {
-    return false;
-  }
-
   int ascent = 0;
   int descent = 0;
   int line_gap = 0;
@@ -2785,41 +2933,141 @@ static bool init_gpu_font_truetype(GpuState& gpu,
   gpu.font.ascent = ascent * scale;
   gpu.font.line_advance = (ascent - descent + line_gap) * scale;
   gpu.font.truetype = true;
+  gpu.font.sdf = true;
 
-  unsigned char* rgba = static_cast<unsigned char*>(malloc(atlas_w * atlas_h * 4));
+  const int first_char = 32;
+  const int glyph_count = 96;
+  const int cols = 16;
+  const int rows = 6;
+  int padding = env_int("DRAW_ENGINE_SDF_PADDING", 4);
+  if (padding < 1) {
+    padding = 1;
+  }
+  int onedge = env_int("DRAW_ENGINE_SDF_ONEDGE", 128);
+  if (onedge <= 0 || onedge > 255) {
+    onedge = 128;
+  }
+  float dist_scale = env_float("DRAW_ENGINE_SDF_SCALE", 64.0f);
+  if (dist_scale <= 0.0f) {
+    dist_scale = 64.0f;
+  }
+
+  struct SdfGlyph {
+    int w;
+    int h;
+    int xoff;
+    int yoff;
+    float xadvance;
+    unsigned char* data;
+  };
+
+  std::vector<SdfGlyph> glyphs(static_cast<size_t>(glyph_count));
+  int max_w = 0;
+  int max_h = 0;
+  for (int i = 0; i < glyph_count; ++i) {
+    const int code = first_char + i;
+    int advance = 0;
+    int lsb = 0;
+    stbtt_GetCodepointHMetrics(&font, code, &advance, &lsb);
+    int w = 0;
+    int h = 0;
+    int xoff = 0;
+    int yoff = 0;
+    unsigned char* sdf = stbtt_GetCodepointSDF(&font,
+                                               scale,
+                                               code,
+                                               padding,
+                                               onedge,
+                                               dist_scale,
+                                               &w,
+                                               &h,
+                                               &xoff,
+                                               &yoff);
+    glyphs[static_cast<size_t>(i)] = {w, h, xoff, yoff, advance * scale, sdf};
+    if (w > max_w) {
+      max_w = w;
+    }
+    if (h > max_h) {
+      max_h = h;
+    }
+  }
+
+  int cell_w = max_w + 2;
+  int cell_h = max_h + 2;
+  if (cell_w < 1) {
+    cell_w = 1;
+  }
+  if (cell_h < 1) {
+    cell_h = 1;
+  }
+  int target_w = atlas_w;
+  int target_h = atlas_h;
+  const int needed_w = cols * cell_w;
+  const int needed_h = rows * cell_h;
+  if (target_w < needed_w) {
+    target_w = needed_w;
+  }
+  if (target_h < needed_h) {
+    target_h = needed_h;
+  }
+
+  unsigned char* rgba = static_cast<unsigned char*>(malloc(target_w * target_h * 4));
   if (!rgba) {
+    for (auto& g : glyphs) {
+      if (g.data) {
+        free(g.data);
+      }
+    }
     return false;
   }
-  for (int i = 0; i < atlas_w * atlas_h; ++i) {
-    const unsigned char a = bitmap[static_cast<size_t>(i)];
-    rgba[i * 4 + 0] = 255;
-    rgba[i * 4 + 1] = 255;
-    rgba[i * 4 + 2] = 255;
-    rgba[i * 4 + 3] = a;
-  }
+  memset(rgba, 0, static_cast<size_t>(target_w * target_h * 4));
 
-  for (int i = 0; i < 96; ++i) {
-    const stbtt_bakedchar& g = baked[i];
-    gpu.font.u0[i] = static_cast<float>(g.x0) / static_cast<float>(atlas_w);
-    gpu.font.v0[i] = static_cast<float>(g.y0) / static_cast<float>(atlas_h);
-    gpu.font.u1[i] = static_cast<float>(g.x1) / static_cast<float>(atlas_w);
-    gpu.font.v1[i] = static_cast<float>(g.y1) / static_cast<float>(atlas_h);
-    gpu.font.xoff[i] = g.xoff;
-    gpu.font.yoff[i] = g.yoff;
+  for (int i = 0; i < glyph_count; ++i) {
+    const int col = i % cols;
+    const int row = i / cols;
+    const int x0 = col * cell_w;
+    const int y0 = row * cell_h;
+    const SdfGlyph& g = glyphs[static_cast<size_t>(i)];
+    if (g.data && g.w > 0 && g.h > 0) {
+      for (int y = 0; y < g.h; ++y) {
+        const unsigned char* src = g.data + y * g.w;
+        unsigned char* dst = rgba + ((y0 + y) * target_w + x0) * 4;
+        for (int x = 0; x < g.w; ++x) {
+          const unsigned char a = src[x];
+          dst[x * 4 + 0] = 255;
+          dst[x * 4 + 1] = 255;
+          dst[x * 4 + 2] = 255;
+          dst[x * 4 + 3] = a;
+        }
+      }
+    }
+    gpu.font.u0[i] = static_cast<float>(x0) / static_cast<float>(target_w);
+    gpu.font.v0[i] = static_cast<float>(y0) / static_cast<float>(target_h);
+    gpu.font.u1[i] = static_cast<float>(x0 + g.w) / static_cast<float>(target_w);
+    gpu.font.v1[i] = static_cast<float>(y0 + g.h) / static_cast<float>(target_h);
+    gpu.font.xoff[i] = static_cast<float>(g.xoff);
+    gpu.font.yoff[i] = static_cast<float>(g.yoff);
     gpu.font.xadvance[i] = g.xadvance;
-    gpu.font.glyph_w[i] = static_cast<float>(g.x1 - g.x0);
-    gpu.font.glyph_h[i] = static_cast<float>(g.y1 - g.y0);
+    gpu.font.glyph_w[i] = static_cast<float>(g.w);
+    gpu.font.glyph_h[i] = static_cast<float>(g.h);
   }
 
-  gpu.font.width = atlas_w;
-  gpu.font.height = atlas_h;
+  for (auto& g : glyphs) {
+    if (g.data) {
+      free(g.data);
+    }
+  }
+
+  gpu.font.width = target_w;
+  gpu.font.height = target_h;
   gpu.font.ready = true;
 
-  gpu.font_image.width = atlas_w;
-  gpu.font_image.height = atlas_h;
+  gpu.font_image.width = target_w;
+  gpu.font_image.height = target_h;
   gpu.font_image.rgba = rgba;
   gpu.font_image.pixels = nullptr;
-  fprintf(stderr, "GPU font: %s size=%d atlas=%dx%d\n", path, pixel_height, atlas_w, atlas_h);
+  fprintf(stderr, "GPU font: %s size=%d atlas=%dx%d SDF\n",
+          path, pixel_height, target_w, target_h);
   return true;
 }
 
@@ -2905,6 +3153,7 @@ static void init_gpu_font(GpuState& gpu) {
   gpu.font.ascent = static_cast<float>(glyph_h);
   gpu.font.line_advance = static_cast<float>(glyph_h);
   gpu.font.truetype = false;
+  gpu.font.sdf = false;
   gpu.font.ready = true;
 
   gpu.font_image.width = font_w;
@@ -2920,6 +3169,7 @@ static void gpu_reset_frame(GpuState& gpu) {
   gpu.commands.clear();
   gpu.vertices.clear();
   gpu.batches.clear();
+  gpu.text_instances.clear();
   gpu.text_offset = 0;
 }
 
@@ -2931,11 +3181,11 @@ static void gpu_reserve(GpuState& gpu) {
   int segments = g_engine.circle_segments > 0 ? g_engine.circle_segments : 64;
   int reserve_vertices = env_int("DRAW_ENGINE_RESERVE_VERTICES", 0);
   if (reserve_vertices <= 0) {
-    int worst = expected * (segments * 2);
-    if (worst < 16384) {
-      worst = 16384;
-    } else if (worst > 131072) {
-      worst = 131072;
+    int worst = expected * (segments * 18);
+    if (worst < 32768) {
+      worst = 32768;
+    } else if (worst > 262144) {
+      worst = 262144;
     }
     reserve_vertices = worst;
   }
@@ -2947,6 +3197,15 @@ static void gpu_reserve(GpuState& gpu) {
   if (reserve_batches <= 0) {
     reserve_batches = expected + 64;
   }
+  int reserve_text = env_int("DRAW_ENGINE_RESERVE_TEXT_INST", 0);
+  if (reserve_text <= 0) {
+    reserve_text = expected * 12;
+    if (reserve_text < 256) {
+      reserve_text = 256;
+    } else if (reserve_text > 65536) {
+      reserve_text = 65536;
+    }
+  }
   if (gpu.vertices.capacity() < static_cast<size_t>(reserve_vertices)) {
     gpu.vertices.reserve(static_cast<size_t>(reserve_vertices));
   }
@@ -2955,6 +3214,9 @@ static void gpu_reserve(GpuState& gpu) {
   }
   if (gpu.batches.capacity() < static_cast<size_t>(reserve_batches)) {
     gpu.batches.reserve(static_cast<size_t>(reserve_batches));
+  }
+  if (gpu.text_instances.capacity() < static_cast<size_t>(reserve_text)) {
+    gpu.text_instances.reserve(static_cast<size_t>(reserve_text));
   }
 }
 
@@ -2993,7 +3255,9 @@ static void gpu_text_cache_init(GpuState& gpu) {
 }
 
 static size_t text_entry_bytes(const CachedText& entry) {
-  return entry.vertices.size() * sizeof(CachedTextVertex) + entry.text.size() + 1;
+  return entry.vertices.size() * sizeof(CachedTextVertex) +
+         entry.instances.size() * sizeof(TextInstance) +
+         entry.text.size() + 1;
 }
 
 static void gpu_text_cache_evict(GpuState& gpu, size_t needed_bytes) {
@@ -3022,7 +3286,9 @@ static CachedText* gpu_text_cache_find(GpuState& gpu,
                                        int y0,
                                        int x1,
                                        int y1,
-                                       uint32_t color) {
+                                       uint32_t color,
+                                       bool instanced,
+                                       bool sdf) {
   if (!text || gpu.text_cache.empty()) {
     return nullptr;
   }
@@ -3035,6 +3301,9 @@ static CachedText* gpu_text_cache_find(GpuState& gpu,
         entry.font_truetype != gpu.font.truetype ||
         entry.font_ascent != gpu.font.ascent ||
         entry.font_line != gpu.font.line_advance) {
+      continue;
+    }
+    if (entry.font_sdf != sdf || entry.instanced != instanced) {
       continue;
     }
     if (entry.text == text) {
@@ -3096,6 +3365,50 @@ static inline void map_logical_to_physical(const GpuState& gpu,
   }
 }
 
+static inline void gpu_map_point(const GpuState& gpu,
+                                 float x,
+                                 float y,
+                                 float* out_x,
+                                 float* out_y) {
+  float sx = x * gpu.scale_x;
+  float sy = y * gpu.scale_y;
+  if (gpu.rotation != 0) {
+    map_logical_to_physical(gpu, sx, sy, out_x, out_y);
+  } else {
+    *out_x = sx;
+    *out_y = sy;
+  }
+}
+
+static inline void gpu_map_rect(const GpuState& gpu,
+                                float x,
+                                float y,
+                                float w,
+                                float h,
+                                float* out_x,
+                                float* out_y,
+                                float* out_w,
+                                float* out_h) {
+  float x0 = x;
+  float y0 = y;
+  float x1 = x + w;
+  float y1 = y + h;
+  float px0 = 0.0f;
+  float py0 = 0.0f;
+  float px1 = 0.0f;
+  float py1 = 0.0f;
+  gpu_map_point(gpu, x0, y0, &px0, &py0);
+  gpu_map_point(gpu, x1, y1, &px1, &py1);
+  const float min_x = (px0 < px1) ? px0 : px1;
+  const float max_x = (px0 > px1) ? px0 : px1;
+  const float min_y = (py0 < py1) ? py0 : py1;
+  const float max_y = (py0 > py1) ? py0 : py1;
+  *out_x = min_x;
+  *out_y = min_y;
+  *out_w = max_x - min_x;
+  *out_h = max_y - min_y;
+}
+
 static void gpu_push_vertex(GpuState& gpu,
                             float x,
                             float y,
@@ -3128,6 +3441,44 @@ static void gpu_push_vertex(GpuState& gpu,
   gpu.vertices.push_back(vert);
 }
 
+static inline uint32_t color_scale_alpha(uint32_t color, float alpha_mul) {
+  if (alpha_mul >= 0.999f) {
+    return color;
+  }
+  if (alpha_mul <= 0.0f) {
+    return color & 0x00FFFFFFu;
+  }
+  uint32_t a = (color >> 24) & 0xFFu;
+  uint32_t scaled = static_cast<uint32_t>(static_cast<float>(a) * alpha_mul + 0.5f);
+  if (scaled > 255u) {
+    scaled = 255u;
+  }
+  return (color & 0x00FFFFFFu) | (scaled << 24);
+}
+
+static inline void gpu_push_quad(GpuState& gpu,
+                                 float x0,
+                                 float y0,
+                                 float x1,
+                                 float y1,
+                                 float x2,
+                                 float y2,
+                                 float x3,
+                                 float y3,
+                                 uint32_t c0,
+                                 uint32_t c1,
+                                 uint32_t c2,
+                                 uint32_t c3) {
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, c0, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, c1, true);
+  gpu_push_vertex(gpu, x2, y2, 0.0f, 0.0f, 0.0f, c2, true);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, c0, true);
+  gpu_push_vertex(gpu, x2, y2, 0.0f, 0.0f, 0.0f, c2, true);
+  gpu_push_vertex(gpu, x3, y3, 0.0f, 0.0f, 0.0f, c3, true);
+}
+
+static void gpu_push_line(GpuState& gpu, int x1, int y1, int x2, int y2, uint32_t color);
+
 static void gpu_push_rect(GpuState& gpu,
                           int x,
                           int y,
@@ -3155,16 +3506,14 @@ static void gpu_push_rect(GpuState& gpu,
     gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, col, true);
     gpu_add_batch(gpu, first, 6, tex, false, false);
   } else {
-    const int first = static_cast<int>(gpu.vertices.size());
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x1, y0, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col, true);
-    gpu_add_batch(gpu, first, 8, tex, true, false);
+    gpu_push_line(gpu, static_cast<int>(x0), static_cast<int>(y0),
+                  static_cast<int>(x1), static_cast<int>(y0), col);
+    gpu_push_line(gpu, static_cast<int>(x1), static_cast<int>(y0),
+                  static_cast<int>(x1), static_cast<int>(y1), col);
+    gpu_push_line(gpu, static_cast<int>(x1), static_cast<int>(y1),
+                  static_cast<int>(x0), static_cast<int>(y1), col);
+    gpu_push_line(gpu, static_cast<int>(x0), static_cast<int>(y1),
+                  static_cast<int>(x0), static_cast<int>(y0), col);
   }
 }
 
@@ -3178,72 +3527,218 @@ static void gpu_push_line(GpuState& gpu,
   if (cached_aa < 0) {
     cached_aa = env_int("DRAW_ENGINE_LINE_AA", 1);
   }
-  const float thickness = env_float("DRAW_ENGINE_LINE_WIDTH", 1.5f);
-  if (cached_aa != 0 && thickness > 1.0f) {
-    const float fx1 = static_cast<float>(x1);
-    const float fy1 = static_cast<float>(y1);
-    const float fx2 = static_cast<float>(x2);
-    const float fy2 = static_cast<float>(y2);
-    const float dx = fx2 - fx1;
-    const float dy = fy2 - fy1;
-    const float len = sqrtf(dx * dx + dy * dy);
-    if (len <= 0.0001f) {
-      return;
-    }
-    const float inv = 1.0f / len;
-    const float nx = -dy * inv * (thickness * 0.5f);
-    const float ny = dx * inv * (thickness * 0.5f);
-
-    const int first = static_cast<int>(gpu.vertices.size());
-    gpu_push_vertex(gpu, fx1 - nx, fy1 - ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, fx1 + nx, fy1 + ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, fx2 + nx, fy2 + ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, fx1 - nx, fy1 - ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, fx2 + nx, fy2 + ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, fx2 - nx, fy2 - ny, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_add_batch(gpu, first, 6, &gpu.white_image, false, false);
+  const float thickness = env_float("DRAW_ENGINE_LINE_WIDTH", 1.0f);
+  const float aa = (cached_aa != 0) ? env_float("DRAW_ENGINE_AA_SIZE", 1.0f) : 0.0f;
+  const float fx1 = static_cast<float>(x1);
+  const float fy1 = static_cast<float>(y1);
+  const float fx2 = static_cast<float>(x2);
+  const float fy2 = static_cast<float>(y2);
+  const float dx = fx2 - fx1;
+  const float dy = fy2 - fy1;
+  const float len = sqrtf(dx * dx + dy * dy);
+  if (len <= 0.0001f) {
     return;
   }
+  const float inv = 1.0f / len;
+  const float tx = dx * inv;
+  const float ty = dy * inv;
+  const float nx = -dy * inv;
+  const float ny = dx * inv;
+  const float half = thickness * 0.5f;
+  const float outer = half + aa;
+
+  const float inx = nx * half;
+  const float iny = ny * half;
+  const float outx = nx * outer;
+  const float outy = ny * outer;
+  const float capx = tx * aa;
+  const float capy = ty * aa;
+
+  const float i1x = fx1 + inx;
+  const float i1y = fy1 + iny;
+  const float i2x = fx2 + inx;
+  const float i2y = fy2 + iny;
+  const float i3x = fx2 - inx;
+  const float i3y = fy2 - iny;
+  const float i4x = fx1 - inx;
+  const float i4y = fy1 - iny;
+
+  const float o1x = fx1 + outx;
+  const float o1y = fy1 + outy;
+  const float o2x = fx2 + outx;
+  const float o2y = fy2 + outy;
+  const float o3x = fx2 - outx;
+  const float o3y = fy2 - outy;
+  const float o4x = fx1 - outx;
+  const float o4y = fy1 - outy;
+
+  const uint32_t col_inner = color;
+  const uint32_t col_outer = (aa > 0.0f) ? color_scale_alpha(color, 0.0f) : color;
 
   const int first = static_cast<int>(gpu.vertices.size());
-  gpu_push_vertex(gpu, static_cast<float>(x1), static_cast<float>(y1), 0.0f, 0.0f, 0.0f,
-                  color, true);
-  gpu_push_vertex(gpu, static_cast<float>(x2), static_cast<float>(y2), 0.0f, 0.0f, 0.0f,
-                  color, true);
-  gpu_add_batch(gpu, first, 2, &gpu.white_image, true, false);
+  gpu_push_quad(gpu, i1x, i1y, i2x, i2y, i3x, i3y, i4x, i4y,
+                col_inner, col_inner, col_inner, col_inner);
+
+  if (aa > 0.0f) {
+    gpu_push_quad(gpu, o1x, o1y, o2x, o2y, i2x, i2y, i1x, i1y,
+                  col_outer, col_outer, col_inner, col_inner);
+    gpu_push_quad(gpu, i4x, i4y, i3x, i3y, o3x, o3y, o4x, o4y,
+                  col_inner, col_inner, col_outer, col_outer);
+
+    const float so1x = o1x - capx;
+    const float so1y = o1y - capy;
+    const float so4x = o4x - capx;
+    const float so4y = o4y - capy;
+    gpu_push_quad(gpu, so4x, so4y, so1x, so1y, i1x, i1y, i4x, i4y,
+                  col_outer, col_outer, col_inner, col_inner);
+
+    const float eo2x = o2x + capx;
+    const float eo2y = o2y + capy;
+    const float eo3x = o3x + capx;
+    const float eo3y = o3y + capy;
+    gpu_push_quad(gpu, i3x, i3y, i2x, i2y, eo2x, eo2y, eo3x, eo3y,
+                  col_inner, col_inner, col_outer, col_outer);
+  }
+
+  const int count = static_cast<int>(gpu.vertices.size()) - first;
+  if (count > 0) {
+    gpu_add_batch(gpu, first, count, &gpu.white_image, false, false);
+  }
+}
+
+static inline int gpu_circle_segments_for_radius(int radius) {
+  int max_segments = g_engine.circle_segments;
+  if (max_segments <= 0) {
+    max_segments = env_int("DRAW_ENGINE_CIRCLE_SEGMENTS", 64);
+  }
+  if (max_segments < 8) {
+    max_segments = 8;
+  }
+  int min_segments = env_int("DRAW_ENGINE_CIRCLE_MIN_SEGMENTS", 12);
+  if (min_segments < 8) {
+    min_segments = 8;
+  }
+  int auto_segments = static_cast<int>(radius * 0.5f) + min_segments;
+  if (auto_segments < min_segments) {
+    auto_segments = min_segments;
+  }
+  if (auto_segments > max_segments) {
+    auto_segments = max_segments;
+  }
+  return auto_segments;
+}
+
+static inline void gpu_push_ring_segment(GpuState& gpu,
+                                         float cx,
+                                         float cy,
+                                         float r0,
+                                         float r1,
+                                         float cos0,
+                                         float sin0,
+                                         float cos1,
+                                         float sin1,
+                                         uint32_t col0,
+                                         uint32_t col1) {
+  if (r1 <= r0) {
+    return;
+  }
+  const float x0 = cx + cos0 * r0;
+  const float y0 = cy + sin0 * r0;
+  const float x1 = cx + cos1 * r0;
+  const float y1 = cy + sin1 * r0;
+  const float x2 = cx + cos1 * r1;
+  const float y2 = cy + sin1 * r1;
+  const float x3 = cx + cos0 * r1;
+  const float y3 = cy + sin0 * r1;
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col0, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, col0, true);
+  gpu_push_vertex(gpu, x2, y2, 0.0f, 0.0f, 0.0f, col1, true);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, col0, true);
+  gpu_push_vertex(gpu, x2, y2, 0.0f, 0.0f, 0.0f, col1, true);
+  gpu_push_vertex(gpu, x3, y3, 0.0f, 0.0f, 0.0f, col1, true);
 }
 
 static void gpu_push_circle(GpuState& gpu, int cx, int cy, int radius, uint32_t color) {
   if (radius <= 0) {
     return;
   }
-  int segments = g_engine.circle_segments;
-  if (segments <= 0) {
-    segments = env_int("DRAW_ENGINE_CIRCLE_SEGMENTS", 64);
-  }
-  if (segments < 8) {
-    segments = 8;
-  }
+  const float thickness = env_float("DRAW_ENGINE_CIRCLE_WIDTH", 1.0f);
+  const float aa = env_float("DRAW_ENGINE_AA_SIZE", 1.0f);
+  int segments = gpu_circle_segments_for_radius(radius);
   ensure_circle_lut(gpu, segments);
   const int first = static_cast<int>(gpu.vertices.size());
+  const float half = thickness * 0.5f;
+  float r_inner = static_cast<float>(radius) - half;
+  float r_outer = static_cast<float>(radius) + half;
+  float r_inner_aa = r_inner - aa;
+  float r_outer_aa = r_outer + aa;
+  if (r_inner < 0.0f) {
+    r_inner = 0.0f;
+  }
+  if (r_inner_aa < 0.0f) {
+    r_inner_aa = 0.0f;
+  }
+  if (r_outer < 0.0f) {
+    r_outer = 0.0f;
+  }
+  if (r_outer_aa < r_outer) {
+    r_outer_aa = r_outer;
+  }
+
+  const uint32_t col_inner = color;
+  const uint32_t col_outer = color_scale_alpha(color, 0.0f);
+
   for (int i = 0; i < segments; ++i) {
     const int j = (i + 1) < segments ? (i + 1) : 0;
-    const float x0 = static_cast<float>(cx) +
-                     gpu.circle_lut[static_cast<size_t>(i * 2 + 0)] *
-                         static_cast<float>(radius);
-    const float y0 = static_cast<float>(cy) +
-                     gpu.circle_lut[static_cast<size_t>(i * 2 + 1)] *
-                         static_cast<float>(radius);
-    const float x1 = static_cast<float>(cx) +
-                     gpu.circle_lut[static_cast<size_t>(j * 2 + 0)] *
-                         static_cast<float>(radius);
-    const float y1 = static_cast<float>(cy) +
-                     gpu.circle_lut[static_cast<size_t>(j * 2 + 1)] *
-                         static_cast<float>(radius);
-    gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, color, true);
-    gpu_push_vertex(gpu, x1, y1, 0.0f, 0.0f, 0.0f, color, true);
+    const float cos0 = gpu.circle_lut[static_cast<size_t>(i * 2 + 0)];
+    const float sin0 = gpu.circle_lut[static_cast<size_t>(i * 2 + 1)];
+    const float cos1 = gpu.circle_lut[static_cast<size_t>(j * 2 + 0)];
+    const float sin1 = gpu.circle_lut[static_cast<size_t>(j * 2 + 1)];
+
+    if (aa > 0.0f && r_inner > 0.0f) {
+      gpu_push_ring_segment(gpu,
+                            static_cast<float>(cx),
+                            static_cast<float>(cy),
+                            r_inner_aa,
+                            r_inner,
+                            cos0,
+                            sin0,
+                            cos1,
+                            sin1,
+                            col_outer,
+                            col_inner);
+    }
+
+    gpu_push_ring_segment(gpu,
+                          static_cast<float>(cx),
+                          static_cast<float>(cy),
+                          r_inner,
+                          r_outer,
+                          cos0,
+                          sin0,
+                          cos1,
+                          sin1,
+                          col_inner,
+                          col_inner);
+
+    if (aa > 0.0f) {
+      gpu_push_ring_segment(gpu,
+                            static_cast<float>(cx),
+                            static_cast<float>(cy),
+                            r_outer,
+                            r_outer_aa,
+                            cos0,
+                            sin0,
+                            cos1,
+                            sin1,
+                            col_inner,
+                            col_outer);
+    }
   }
-  gpu_add_batch(gpu, first, segments * 2, &gpu.white_image, true, false);
+  const int count = static_cast<int>(gpu.vertices.size()) - first;
+  if (count > 0) {
+    gpu_add_batch(gpu, first, count, &gpu.white_image, false, false);
+  }
 }
 
 static void gpu_push_line3d(GpuState& gpu,
@@ -3274,6 +3769,13 @@ static void gpu_push_text(GpuState& gpu,
   const char* text_ptr = text;
   const bool use_cache =
       (gpu.text_cache_limit > 0 && gpu.text_cache_max_entries > 0);
+  static int cached_instancing = -1;
+  if (cached_instancing < 0) {
+    cached_instancing = env_int("DRAW_ENGINE_TEXT_INSTANCE", 1);
+  }
+  const bool instanced = (cached_instancing != 0);
+  const float v_offset = gpu.font.sdf ? 0.0f : 2.0f;
+  const uint32_t color_rgba = color_to_rgba(color);
   const int clip_x0 = x0;
   const int clip_y0 = y0;
   const int clip_x1 = (x1 > x0) ? x1 : 0;
@@ -3281,19 +3783,131 @@ static void gpu_push_text(GpuState& gpu,
 
   if (use_cache) {
     CachedText* cached =
-        gpu_text_cache_find(gpu, text_ptr, x0, y0, x1, y1, color);
-    if (cached && !cached->vertices.empty()) {
-      const int first = static_cast<int>(gpu.vertices.size());
-      for (const auto& v : cached->vertices) {
-        gpu_push_vertex(gpu, v.x, v.y, v.z, v.u, v.v, v.color, true);
+        gpu_text_cache_find(gpu, text_ptr, x0, y0, x1, y1, color, instanced, gpu.font.sdf);
+    if (cached) {
+      if (instanced) {
+        if (!cached->instances.empty()) {
+          gpu.text_instances.insert(gpu.text_instances.end(),
+                                    cached->instances.begin(),
+                                    cached->instances.end());
+          cached->last_used = gpu.frame_index;
+          return;
+        }
+      } else if (!cached->vertices.empty()) {
+        const int first = static_cast<int>(gpu.vertices.size());
+        for (const auto& v : cached->vertices) {
+          gpu_push_vertex(gpu, v.x, v.y, v.z, v.u, v.v, v.color, true);
+        }
+        const int count = static_cast<int>(gpu.vertices.size()) - first;
+        if (count > 0) {
+          gpu_add_batch(gpu, first, count, &gpu.font_image, false, false);
+        }
+        cached->last_used = gpu.frame_index;
+        return;
       }
-      const int count = static_cast<int>(gpu.vertices.size()) - first;
-      if (count > 0) {
-        gpu_add_batch(gpu, first, count, &gpu.font_image, false, false);
-      }
-      cached->last_used = gpu.frame_index;
-      return;
     }
+  }
+
+  if (instanced) {
+    std::vector<TextInstance> cached_instances;
+    if (use_cache) {
+      cached_instances.reserve(strlen(text_ptr));
+    }
+    float cursor_x = static_cast<float>(x0);
+    float cursor_y = static_cast<float>(y0);
+    float baseline = cursor_y + gpu.font.ascent;
+    const int first_char = 32;
+    const int last_char = 127;
+
+    while (*text) {
+      char c = *text++;
+      if (c == '\n') {
+        cursor_x = static_cast<float>(x0);
+        cursor_y += gpu.font.line_advance;
+        baseline = cursor_y + gpu.font.ascent;
+        continue;
+      }
+      if (c < first_char || c > last_char) {
+        cursor_x += gpu.font.xadvance[0];
+        continue;
+      }
+      int idx = c - first_char;
+      const float u0 = gpu.font.u0[idx];
+      const float v0 = gpu.font.v0[idx];
+      const float u1 = gpu.font.u1[idx];
+      const float v1 = gpu.font.v1[idx];
+
+      const float gw = gpu.font.glyph_w[idx];
+      const float gh = gpu.font.glyph_h[idx];
+      if (gw <= 0.0f || gh <= 0.0f) {
+        cursor_x += gpu.font.xadvance[idx];
+        continue;
+      }
+      const float gx0 = cursor_x + gpu.font.xoff[idx];
+      const float gy0 = baseline + gpu.font.yoff[idx];
+      const float gx1 = gx0 + gw;
+      const float gy1 = gy0 + gh;
+      if (clip_x1 > clip_x0 && clip_y1 > clip_y0) {
+        if (gx1 <= static_cast<float>(clip_x0) ||
+            gx0 >= static_cast<float>(clip_x1) ||
+            gy1 <= static_cast<float>(clip_y0) ||
+            gy0 >= static_cast<float>(clip_y1)) {
+          cursor_x += gpu.font.xadvance[idx];
+          continue;
+        }
+      }
+
+      float rx = 0.0f;
+      float ry = 0.0f;
+      float rw = 0.0f;
+      float rh = 0.0f;
+      gpu_map_rect(gpu, gx0, gy0, gw, gh, &rx, &ry, &rw, &rh);
+
+      TextInstance inst{};
+      inst.x = rx;
+      inst.y = ry;
+      inst.w = rw;
+      inst.h = rh;
+      inst.u0 = u0;
+      inst.v0 = v0 + v_offset;
+      inst.u1 = u1;
+      inst.v1 = v1 + v_offset;
+      inst.color = color_rgba;
+      gpu.text_instances.push_back(inst);
+      if (use_cache) {
+        cached_instances.push_back(inst);
+      }
+      cursor_x += gpu.font.xadvance[idx];
+    }
+
+    if (use_cache && !cached_instances.empty()) {
+      CachedText entry{};
+      entry.text = text_ptr;
+      entry.x0 = x0;
+      entry.y0 = y0;
+      entry.x1 = x1;
+      entry.y1 = y1;
+      entry.color = color;
+      entry.font_w = gpu.font.width;
+      entry.font_h = gpu.font.height;
+      entry.font_ascent = gpu.font.ascent;
+      entry.font_line = gpu.font.line_advance;
+      entry.font_truetype = gpu.font.truetype;
+      entry.font_sdf = gpu.font.sdf;
+      entry.instanced = true;
+      entry.last_used = gpu.frame_index;
+      entry.instances.swap(cached_instances);
+      const size_t bytes = text_entry_bytes(entry);
+      if (bytes <= gpu.text_cache_limit) {
+        gpu_text_cache_evict(gpu, bytes);
+        if (gpu.text_cache_bytes + bytes <= gpu.text_cache_limit &&
+            static_cast<int>(gpu.text_cache.size()) < gpu.text_cache_max_entries) {
+          gpu.text_cache_bytes += bytes;
+          gpu.text_cache.push_back(std::move(entry));
+        }
+      }
+    }
+    return;
   }
 
   std::vector<CachedTextVertex> cached_vertices;
@@ -3302,14 +3916,14 @@ static void gpu_push_text(GpuState& gpu,
   }
 
   auto emit = [&](float x, float y, float u, float v) {
-    gpu_push_vertex(gpu, x, y, 0.0f, u, v, color, true);
+    gpu_push_vertex(gpu, x, y, 0.0f, u, v + v_offset, color, true);
     if (use_cache) {
       CachedTextVertex vtx{};
       vtx.x = x;
       vtx.y = y;
       vtx.z = 0.0f;
       vtx.u = u;
-      vtx.v = v;
+      vtx.v = v + v_offset;
       vtx.color = color;
       cached_vertices.push_back(vtx);
     }
@@ -3387,6 +4001,8 @@ static void gpu_push_text(GpuState& gpu,
     entry.font_ascent = gpu.font.ascent;
     entry.font_line = gpu.font.line_advance;
     entry.font_truetype = gpu.font.truetype;
+    entry.font_sdf = gpu.font.sdf;
+    entry.instanced = false;
     entry.last_used = gpu.frame_index;
     entry.vertices.swap(cached_vertices);
     const size_t bytes = text_entry_bytes(entry);
@@ -3414,13 +4030,14 @@ static void gpu_push_image(GpuState& gpu, const DrawImage* image, int x, int y) 
   const float y0 = static_cast<float>(y);
   const float x1 = static_cast<float>(x + w);
   const float y1 = static_cast<float>(y + h);
+  const float v_off = 2.0f;
   const int first = static_cast<int>(gpu.vertices.size());
-  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu, true);
-  gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f, 0xFFFFFFFFu, true);
-  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu, true);
-  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f, 0xFFFFFFFFu, true);
-  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu, true);
-  gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f + v_off, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y0, 0.0f, 1.0f, 0.0f + v_off, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f + v_off, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x0, y0, 0.0f, 0.0f, 0.0f + v_off, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x1, y1, 0.0f, 1.0f, 1.0f + v_off, 0xFFFFFFFFu, true);
+  gpu_push_vertex(gpu, x0, y1, 0.0f, 0.0f, 1.0f + v_off, 0xFFFFFFFFu, true);
   gpu_add_batch(gpu, first, 6, image, false, false);
 }
 
@@ -3658,10 +4275,14 @@ static bool vk_create_msaa_color_image(VulkanContext& vk, int width, int height)
 }
 
 static void vk_destroy_swapchain(VulkanContext& vk) {
-  for (auto fb : vk.framebuffers) {
+  for (auto fb : vk.framebuffers_2d) {
     vkDestroyFramebuffer(vk.device, fb, nullptr);
   }
-  vk.framebuffers.clear();
+  vk.framebuffers_2d.clear();
+  for (auto fb : vk.framebuffers_3d) {
+    vkDestroyFramebuffer(vk.device, fb, nullptr);
+  }
+  vk.framebuffers_3d.clear();
   for (auto view : vk.image_views) {
     vkDestroyImageView(vk.device, view, nullptr);
   }
@@ -3723,10 +4344,21 @@ static bool vk_create_swapchain_resources(VulkanContext& vk, int width, int heig
   vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count,
                                             present_modes.data());
   VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
-  for (auto mode : present_modes) {
-    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-      present_mode = mode;
-      break;
+  const int present_pref = env_int("DRAW_ENGINE_VK_PRESENT_MODE", 0);
+  if (present_pref == 2) {
+    for (auto mode : present_modes) {
+      if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+        present_mode = mode;
+        break;
+      }
+    }
+  }
+  if (present_mode == VK_PRESENT_MODE_FIFO_KHR) {
+    for (auto mode : present_modes) {
+      if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+        present_mode = mode;
+        break;
+      }
     }
   }
 
@@ -3747,6 +4379,15 @@ static bool vk_create_swapchain_resources(VulkanContext& vk, int width, int heig
   vk.extent = extent;
 
   uint32_t image_count = caps.minImageCount + 1;
+  int req_images = env_int("DRAW_ENGINE_VK_SWAPCHAIN_IMAGES", 0);
+  if (req_images > 0) {
+    image_count = static_cast<uint32_t>(req_images);
+  } else if (present_mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+    image_count = caps.minImageCount + 2;
+  }
+  if (image_count < caps.minImageCount) {
+    image_count = caps.minImageCount;
+  }
   if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
     image_count = caps.maxImageCount;
   }
@@ -3819,29 +4460,44 @@ static bool vk_create_swapchain_resources(VulkanContext& vk, int width, int heig
     }
   }
 
-  vk.framebuffers.resize(vk.image_views.size());
-  for (size_t i = 0; i < vk.image_views.size(); ++i) {
-    VkImageView attachments[3];
-    uint32_t attachment_count = 0;
-    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
-      attachments[attachment_count++] = vk.msaa_color_view;
-      attachments[attachment_count++] = vk.image_views[i];
-      attachments[attachment_count++] = vk.depth_view;
-    } else {
-      attachments[attachment_count++] = vk.image_views[i];
-      attachments[attachment_count++] = vk.depth_view;
+  auto create_framebuffers = [&](VkRenderPass pass,
+                                 bool with_depth,
+                                 std::vector<VkFramebuffer>& out) -> bool {
+    out.resize(vk.image_views.size());
+    for (size_t i = 0; i < vk.image_views.size(); ++i) {
+      VkImageView attachments[3];
+      uint32_t attachment_count = 0;
+      if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+        attachments[attachment_count++] = vk.msaa_color_view;
+        attachments[attachment_count++] = vk.image_views[i];
+        if (with_depth) {
+          attachments[attachment_count++] = vk.depth_view;
+        }
+      } else {
+        attachments[attachment_count++] = vk.image_views[i];
+        if (with_depth) {
+          attachments[attachment_count++] = vk.depth_view;
+        }
+      }
+      VkFramebufferCreateInfo fb{};
+      fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+      fb.renderPass = pass;
+      fb.attachmentCount = attachment_count;
+      fb.pAttachments = attachments;
+      fb.width = extent.width;
+      fb.height = extent.height;
+      fb.layers = 1;
+      if (vkCreateFramebuffer(vk.device, &fb, nullptr, &out[i]) != VK_SUCCESS) {
+        return false;
+      }
     }
-    VkFramebufferCreateInfo fb{};
-    fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fb.renderPass = vk.render_pass;
-    fb.attachmentCount = attachment_count;
-    fb.pAttachments = attachments;
-    fb.width = extent.width;
-    fb.height = extent.height;
-    fb.layers = 1;
-    if (vkCreateFramebuffer(vk.device, &fb, nullptr, &vk.framebuffers[i]) != VK_SUCCESS) {
-      return false;
-    }
+    return true;
+  };
+  if (!create_framebuffers(vk.render_pass_2d, false, vk.framebuffers_2d)) {
+    return false;
+  }
+  if (!create_framebuffers(vk.render_pass_3d, true, vk.framebuffers_3d)) {
+    return false;
   }
   return true;
 }
@@ -4095,7 +4751,7 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   vk.supports_timestamps = props.limits.timestampComputeAndGraphics == VK_TRUE;
   vk.timestamp_period = props.limits.timestampPeriod;
   vk.max_anisotropy = vk.supports_anisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
-  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 4);
+  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 1);
   VkSampleCountFlags counts =
       props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
   vk.msaa_samples = choose_sample_count(counts, msaa_req);
@@ -4157,10 +4813,21 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   vkGetPhysicalDeviceSurfacePresentModesKHR(vk.physical, vk.surface, &present_count,
                                             present_modes.data());
   VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
-  for (auto mode : present_modes) {
-    if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-      present_mode = mode;
-      break;
+  const int present_pref = env_int("DRAW_ENGINE_VK_PRESENT_MODE", 0);
+  if (present_pref == 2) {
+    for (auto mode : present_modes) {
+      if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+        present_mode = mode;
+        break;
+      }
+    }
+  }
+  if (present_mode == VK_PRESENT_MODE_FIFO_KHR) {
+    for (auto mode : present_modes) {
+      if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+        present_mode = mode;
+        break;
+      }
     }
   }
 
@@ -4203,6 +4870,15 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
           extent.height);
 
   uint32_t image_count = caps.minImageCount + 1;
+  int req_images = env_int("DRAW_ENGINE_VK_SWAPCHAIN_IMAGES", 0);
+  if (req_images > 0) {
+    image_count = static_cast<uint32_t>(req_images);
+  } else if (present_mode == VK_PRESENT_MODE_MAILBOX_KHR) {
+    image_count = caps.minImageCount + 2;
+  }
+  if (image_count < caps.minImageCount) {
+    image_count = caps.minImageCount;
+  }
   if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
     image_count = caps.maxImageCount;
   }
@@ -4312,34 +4988,47 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   resolve_ref.attachment = 1;
   resolve_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-  VkAttachmentReference depth_ref{};
-  depth_ref.attachment = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 1 : 2;
-  depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  auto create_render_pass = [&](bool with_depth, VkRenderPass* out_pass) -> bool {
+    VkAttachmentDescription attachments[3];
+    uint32_t attachment_count = 0;
+    attachments[attachment_count++] = color;
+    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+      attachments[attachment_count++] = resolve;
+    }
+    if (with_depth) {
+      attachments[attachment_count++] = depth;
+    }
 
-  VkSubpassDescription subpass{};
-  subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  subpass.colorAttachmentCount = 1;
-  subpass.pColorAttachments = &color_ref;
-  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
-    subpass.pResolveAttachments = &resolve_ref;
+    VkAttachmentReference depth_ref{};
+    depth_ref.attachment = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 1 : 2;
+    depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+      subpass.pResolveAttachments = &resolve_ref;
+    }
+    subpass.pDepthStencilAttachment = with_depth ? &depth_ref : nullptr;
+
+    VkRenderPassCreateInfo rp{};
+    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rp.attachmentCount = attachment_count;
+    rp.pAttachments = attachments;
+    rp.subpassCount = 1;
+    rp.pSubpasses = &subpass;
+    if (vkCreateRenderPass(vk.device, &rp, nullptr, out_pass) != VK_SUCCESS) {
+      return false;
+    }
+    return true;
+  };
+
+  if (!create_render_pass(false, &vk.render_pass_2d) ||
+      !create_render_pass(true, &vk.render_pass_3d)) {
+    fprintf(stderr, "vkCreateRenderPass failed\n");
+    return false;
   }
-  subpass.pDepthStencilAttachment = &depth_ref;
-
-  VkAttachmentDescription attachments[3];
-  uint32_t attachment_count = 0;
-  attachments[attachment_count++] = color;
-  if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
-    attachments[attachment_count++] = resolve;
-  }
-  attachments[attachment_count++] = depth;
-
-  VkRenderPassCreateInfo rp{};
-  rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  rp.attachmentCount = attachment_count;
-  rp.pAttachments = attachments;
-  rp.subpassCount = 1;
-  rp.pSubpasses = &subpass;
-  vkCreateRenderPass(vk.device, &rp, nullptr, &vk.render_pass);
 
   VkDescriptorSetLayoutBinding binding{};
   binding.binding = 0;
@@ -4380,7 +5069,9 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
 
   VkShaderModule vert = create_shader(kSimpleVertSpv, sizeof(kSimpleVertSpv) / sizeof(uint32_t));
   VkShaderModule frag = create_shader(kSimpleFragSpv, sizeof(kSimpleFragSpv) / sizeof(uint32_t));
-  if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
+  VkShaderModule text_vert =
+      create_shader(kTextInstVertSpv, sizeof(kTextInstVertSpv) / sizeof(uint32_t));
+  if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE || text_vert == VK_NULL_HANDLE) {
     fprintf(stderr, "vkCreateShaderModule failed\n");
     return false;
   }
@@ -4394,6 +5085,16 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   stages[1].module = frag;
   stages[1].pName = "main";
+
+  VkPipelineShaderStageCreateInfo stages_text[2]{};
+  stages_text[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages_text[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages_text[0].module = text_vert;
+  stages_text[0].pName = "main";
+  stages_text[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages_text[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  stages_text[1].module = frag;
+  stages_text[1].pName = "main";
 
   VkVertexInputBindingDescription binding_desc{};
   binding_desc.binding = 0;
@@ -4420,6 +5121,32 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   vi.pVertexBindingDescriptions = &binding_desc;
   vi.vertexAttributeDescriptionCount = 3;
   vi.pVertexAttributeDescriptions = attrs;
+
+  VkVertexInputBindingDescription text_binding{};
+  text_binding.binding = 0;
+  text_binding.stride = sizeof(TextInstance);
+  text_binding.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+
+  VkVertexInputAttributeDescription text_attrs[3]{};
+  text_attrs[0].location = 0;
+  text_attrs[0].binding = 0;
+  text_attrs[0].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+  text_attrs[0].offset = 0;
+  text_attrs[1].location = 1;
+  text_attrs[1].binding = 0;
+  text_attrs[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+  text_attrs[1].offset = 16;
+  text_attrs[2].location = 2;
+  text_attrs[2].binding = 0;
+  text_attrs[2].format = VK_FORMAT_R8G8B8A8_UNORM;
+  text_attrs[2].offset = 32;
+
+  VkPipelineVertexInputStateCreateInfo vi_text{};
+  vi_text.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  vi_text.vertexBindingDescriptionCount = 1;
+  vi_text.pVertexBindingDescriptions = &text_binding;
+  vi_text.vertexAttributeDescriptionCount = 3;
+  vi_text.pVertexAttributeDescriptions = text_attrs;
 
   VkViewport viewport{};
   viewport.width = static_cast<float>(extent.width);
@@ -4471,7 +5198,11 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   dyn.dynamicStateCount = 2;
   dyn.pDynamicStates = dyn_states;
 
-  auto create_pipeline = [&](VkPrimitiveTopology topology, bool depth_enable) -> VkPipeline {
+  auto create_pipeline = [&](VkPrimitiveTopology topology,
+                             bool depth_enable,
+                             VkPipelineVertexInputStateCreateInfo* vertex_input,
+                             VkPipelineShaderStageCreateInfo* stage_state,
+                             VkRenderPass pass) -> VkPipeline {
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = topology;
@@ -4488,8 +5219,8 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     VkGraphicsPipelineCreateInfo gp{};
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gp.stageCount = 2;
-    gp.pStages = stages;
-    gp.pVertexInputState = &vi;
+    gp.pStages = stage_state;
+    gp.pVertexInputState = vertex_input;
     gp.pInputAssemblyState = &ia;
     gp.pViewportState = &vp;
     gp.pRasterizationState = &rs;
@@ -4498,7 +5229,7 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     gp.pColorBlendState = &cb;
     gp.pDynamicState = &dyn;
     gp.layout = vk.pipeline_layout;
-    gp.renderPass = vk.render_pass;
+    gp.renderPass = pass;
     gp.subpass = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline) !=
@@ -4508,40 +5239,64 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     return pipeline;
   };
 
-  vk.pipeline_tri_2d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false);
-  vk.pipeline_line_2d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
-  vk.pipeline_tri_3d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
-  vk.pipeline_line_3d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, true);
+  vk.pipeline_tri_2d =
+      create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, &vi, stages, vk.render_pass_2d);
+  vk.pipeline_line_2d =
+      create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false, &vi, stages, vk.render_pass_2d);
+  vk.pipeline_text_2d = create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false,
+                                        &vi_text, stages_text, vk.render_pass_2d);
+  vk.pipeline_tri_3d =
+      create_pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, &vi, stages, vk.render_pass_3d);
+  vk.pipeline_line_3d =
+      create_pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, true, &vi, stages, vk.render_pass_3d);
 
   if (vk.pipeline_tri_2d == VK_NULL_HANDLE || vk.pipeline_line_2d == VK_NULL_HANDLE ||
-      vk.pipeline_tri_3d == VK_NULL_HANDLE || vk.pipeline_line_3d == VK_NULL_HANDLE) {
+      vk.pipeline_text_2d == VK_NULL_HANDLE || vk.pipeline_tri_3d == VK_NULL_HANDLE ||
+      vk.pipeline_line_3d == VK_NULL_HANDLE) {
     fprintf(stderr, "vkCreateGraphicsPipelines failed\n");
     return false;
   }
   vkDestroyShaderModule(vk.device, vert, nullptr);
   vkDestroyShaderModule(vk.device, frag, nullptr);
+  vkDestroyShaderModule(vk.device, text_vert, nullptr);
 
-  vk.framebuffers.resize(vk.image_views.size());
-  for (size_t i = 0; i < vk.image_views.size(); ++i) {
-    VkImageView attachments[3];
-    uint32_t attachment_count = 0;
-    if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
-      attachments[attachment_count++] = vk.msaa_color_view;
-      attachments[attachment_count++] = vk.image_views[i];
-      attachments[attachment_count++] = vk.depth_view;
-    } else {
-      attachments[attachment_count++] = vk.image_views[i];
-      attachments[attachment_count++] = vk.depth_view;
+  auto create_framebuffers = [&](VkRenderPass pass,
+                                 bool with_depth,
+                                 std::vector<VkFramebuffer>& out) -> bool {
+    out.resize(vk.image_views.size());
+    for (size_t i = 0; i < vk.image_views.size(); ++i) {
+      VkImageView attachments[3];
+      uint32_t attachment_count = 0;
+      if (vk.msaa_samples != VK_SAMPLE_COUNT_1_BIT) {
+        attachments[attachment_count++] = vk.msaa_color_view;
+        attachments[attachment_count++] = vk.image_views[i];
+        if (with_depth) {
+          attachments[attachment_count++] = vk.depth_view;
+        }
+      } else {
+        attachments[attachment_count++] = vk.image_views[i];
+        if (with_depth) {
+          attachments[attachment_count++] = vk.depth_view;
+        }
+      }
+      VkFramebufferCreateInfo fb{};
+      fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+      fb.renderPass = pass;
+      fb.attachmentCount = attachment_count;
+      fb.pAttachments = attachments;
+      fb.width = extent.width;
+      fb.height = extent.height;
+      fb.layers = 1;
+      if (vkCreateFramebuffer(vk.device, &fb, nullptr, &out[i]) != VK_SUCCESS) {
+        return false;
+      }
     }
-    VkFramebufferCreateInfo fb{};
-    fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fb.renderPass = vk.render_pass;
-    fb.attachmentCount = attachment_count;
-    fb.pAttachments = attachments;
-    fb.width = extent.width;
-    fb.height = extent.height;
-    fb.layers = 1;
-    vkCreateFramebuffer(vk.device, &fb, nullptr, &vk.framebuffers[i]);
+    return true;
+  };
+  if (!create_framebuffers(vk.render_pass_2d, false, vk.framebuffers_2d) ||
+      !create_framebuffers(vk.render_pass_3d, true, vk.framebuffers_3d)) {
+    fprintf(stderr, "vkCreateFramebuffer failed\n");
+    return false;
   }
 
   VkCommandPoolCreateInfo pool{};
@@ -4550,27 +5305,47 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   vkCreateCommandPool(vk.device, &pool, nullptr, &vk.command_pool);
 
+  int frames_in_flight = env_int("DRAW_ENGINE_VK_FRAMES", 3);
+  if (frames_in_flight < 1) {
+    frames_in_flight = 1;
+  }
+  if (frames_in_flight > 3) {
+    frames_in_flight = 3;
+  }
+  if (!vk.images.empty() &&
+      frames_in_flight > static_cast<int>(vk.images.size())) {
+    frames_in_flight = static_cast<int>(vk.images.size());
+  }
+  vk.frame_count = static_cast<uint32_t>(frames_in_flight);
+  vk.frame_index = 0;
+
   VkCommandBufferAllocateInfo alloc{};
   alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   alloc.commandPool = vk.command_pool;
   alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  alloc.commandBufferCount = 1;
-  vkAllocateCommandBuffers(vk.device, &alloc, &vk.command_buffer);
+  alloc.commandBufferCount = vk.frame_count;
+  vk.command_buffers.resize(vk.frame_count);
+  vkAllocateCommandBuffers(vk.device, &alloc, vk.command_buffers.data());
 
   VkSemaphoreCreateInfo sem{};
   sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-  vkCreateSemaphore(vk.device, &sem, nullptr, &vk.image_available);
-  vkCreateSemaphore(vk.device, &sem, nullptr, &vk.render_finished);
   VkFenceCreateInfo fence{};
   fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-  vkCreateFence(vk.device, &fence, nullptr, &vk.in_flight);
+  vk.image_available.resize(vk.frame_count);
+  vk.render_finished.resize(vk.frame_count);
+  vk.in_flight.resize(vk.frame_count);
+  for (uint32_t i = 0; i < vk.frame_count; ++i) {
+    vkCreateSemaphore(vk.device, &sem, nullptr, &vk.image_available[i]);
+    vkCreateSemaphore(vk.device, &sem, nullptr, &vk.render_finished[i]);
+    vkCreateFence(vk.device, &fence, nullptr, &vk.in_flight[i]);
+  }
 
   if (vk.supports_timestamps) {
     VkQueryPoolCreateInfo qp{};
     qp.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qp.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qp.queryCount = 2;
+    qp.queryCount = vk.frame_count * 2;
     if (vkCreateQueryPool(vk.device, &qp, nullptr, &vk.query_pool) != VK_SUCCESS) {
       vk.query_pool = VK_NULL_HANDLE;
       vk.supports_timestamps = false;
@@ -4598,10 +5373,15 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
   samp.maxAnisotropy = vk.supports_anisotropy ? vk.max_anisotropy : 1.0f;
   vkCreateSampler(vk.device, &samp, nullptr, &vk.sampler);
 
-  const size_t max_vertices = 200000;
-  vk.vertex_capacity = max_vertices * sizeof(GpuVertex);
+  int max_vertices = env_int("DRAW_ENGINE_VK_MAX_VERTICES", 300000);
+  if (max_vertices < 65536) {
+    max_vertices = 65536;
+  }
+  vk.vertex_stride = sizeof(GpuVertex);
+  vk.vertex_capacity = static_cast<size_t>(max_vertices) * vk.vertex_stride;
+  vk.vertex_buffer_size = vk.vertex_capacity * vk.frame_count;
   if (!vk_create_buffer(vk,
-                        vk.vertex_capacity,
+                        vk.vertex_buffer_size,
                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                         &vk.vertex_buffer,
@@ -4609,7 +5389,24 @@ static bool vk_init_context(VulkanContext& vk, ANativeWindow* window, int width,
     fprintf(stderr, "vk vertex buffer failed\n");
     return false;
   }
-  vkMapMemory(vk.device, vk.vertex_memory, 0, vk.vertex_capacity, 0, &vk.vertex_map);
+  vkMapMemory(vk.device, vk.vertex_memory, 0, vk.vertex_buffer_size, 0, &vk.vertex_map);
+
+  int max_text = env_int("DRAW_ENGINE_TEXT_MAX_INST", 8192);
+  if (max_text < 256) {
+    max_text = 256;
+  }
+  vk.text_capacity = static_cast<size_t>(max_text) * sizeof(TextInstance);
+  vk.text_buffer_size = vk.text_capacity * vk.frame_count;
+  if (!vk_create_buffer(vk,
+                        vk.text_buffer_size,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        &vk.text_buffer,
+                        &vk.text_memory)) {
+    fprintf(stderr, "vk text buffer failed\n");
+    return false;
+  }
+  vkMapMemory(vk.device, vk.text_memory, 0, vk.text_buffer_size, 0, &vk.text_map);
 
   vk.ready = true;
   return true;
@@ -4629,6 +5426,15 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.vertex_memory) {
     vkFreeMemory(vk.device, vk.vertex_memory, nullptr);
   }
+  if (vk.text_map) {
+    vkUnmapMemory(vk.device, vk.text_memory);
+  }
+  if (vk.text_buffer) {
+    vkDestroyBuffer(vk.device, vk.text_buffer, nullptr);
+  }
+  if (vk.text_memory) {
+    vkFreeMemory(vk.device, vk.text_memory, nullptr);
+  }
   if (vk.sampler) {
     vkDestroySampler(vk.device, vk.sampler, nullptr);
   }
@@ -4638,14 +5444,26 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.desc_layout) {
     vkDestroyDescriptorSetLayout(vk.device, vk.desc_layout, nullptr);
   }
-  if (vk.image_available) {
-    vkDestroySemaphore(vk.device, vk.image_available, nullptr);
+  for (auto fence : vk.in_flight) {
+    if (fence) {
+      vkDestroyFence(vk.device, fence, nullptr);
+    }
   }
-  if (vk.render_finished) {
-    vkDestroySemaphore(vk.device, vk.render_finished, nullptr);
+  for (auto sem : vk.render_finished) {
+    if (sem) {
+      vkDestroySemaphore(vk.device, sem, nullptr);
+    }
   }
-  if (vk.in_flight) {
-    vkDestroyFence(vk.device, vk.in_flight, nullptr);
+  for (auto sem : vk.image_available) {
+    if (sem) {
+      vkDestroySemaphore(vk.device, sem, nullptr);
+    }
+  }
+  if (!vk.command_buffers.empty()) {
+    vkFreeCommandBuffers(vk.device,
+                         vk.command_pool,
+                         static_cast<uint32_t>(vk.command_buffers.size()),
+                         vk.command_buffers.data());
   }
   if (vk.command_pool) {
     vkDestroyCommandPool(vk.device, vk.command_pool, nullptr);
@@ -4659,6 +5477,9 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.pipeline_line_2d) {
     vkDestroyPipeline(vk.device, vk.pipeline_line_2d, nullptr);
   }
+  if (vk.pipeline_text_2d) {
+    vkDestroyPipeline(vk.device, vk.pipeline_text_2d, nullptr);
+  }
   if (vk.pipeline_tri_3d) {
     vkDestroyPipeline(vk.device, vk.pipeline_tri_3d, nullptr);
   }
@@ -4668,10 +5489,16 @@ static void vk_cleanup(VulkanContext& vk) {
   if (vk.pipeline_layout) {
     vkDestroyPipelineLayout(vk.device, vk.pipeline_layout, nullptr);
   }
-  if (vk.render_pass) {
-    vkDestroyRenderPass(vk.device, vk.render_pass, nullptr);
+  if (vk.render_pass_2d) {
+    vkDestroyRenderPass(vk.device, vk.render_pass_2d, nullptr);
   }
-  for (auto fb : vk.framebuffers) {
+  if (vk.render_pass_3d) {
+    vkDestroyRenderPass(vk.device, vk.render_pass_3d, nullptr);
+  }
+  for (auto fb : vk.framebuffers_2d) {
+    vkDestroyFramebuffer(vk.device, fb, nullptr);
+  }
+  for (auto fb : vk.framebuffers_3d) {
     vkDestroyFramebuffer(vk.device, fb, nullptr);
   }
   for (auto view : vk.image_views) {
@@ -4716,34 +5543,90 @@ static bool vk_draw_frame(GpuState& gpu) {
     return false;
   }
   const bool allow_timestamps = !hybrid_secure_enabled();
-  if (gpu.vertices.empty()) {
+  const bool has_vertices = !gpu.vertices.empty();
+  const bool has_text = !gpu.text_instances.empty();
+  if (!has_vertices && !has_text) {
     return true;
   }
-  if (gpu.vertices.size() * sizeof(GpuVertex) > vk.vertex_capacity) {
+  if (gpu.log_interval <= 0) {
+    gpu.log_interval = env_int("DRAW_ENGINE_LOG_INTERVAL", 120);
+  }
+  const bool want_log =
+      (gpu.log_interval > 0 &&
+       (gpu.frame_index % static_cast<uint64_t>(gpu.log_interval)) == 0);
+
+  const size_t frame_bytes = has_vertices ? (gpu.vertices.size() * sizeof(GpuVertex)) : 0;
+  if (has_vertices && frame_bytes > vk.vertex_capacity) {
     fprintf(stderr, "vk vertex overflow\n");
     return false;
   }
+  const size_t text_bytes = has_text ? (gpu.text_instances.size() * sizeof(TextInstance)) : 0;
+  if (has_text && text_bytes > vk.text_capacity) {
+    fprintf(stderr, "vk text overflow\n");
+    return false;
+  }
+  const uint32_t frame = (vk.frame_count > 0) ? (vk.frame_index % vk.frame_count) : 0;
+  VkFence fence = vk.in_flight[frame];
+  vkWaitForFences(vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+  vkResetFences(vk.device, 1, &fence);
 
-  memcpy(vk.vertex_map, gpu.vertices.data(), gpu.vertices.size() * sizeof(GpuVertex));
+  double gpu_ms = 0.0;
+  if (want_log && allow_timestamps && vk.supports_timestamps && vk.query_pool) {
+    uint64_t timestamps[2] = {};
+    const uint32_t query_index = frame * 2;
+    if (vkGetQueryPoolResults(vk.device,
+                              vk.query_pool,
+                              query_index,
+                              2,
+                              sizeof(timestamps),
+                              timestamps,
+                              sizeof(uint64_t),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+        VK_SUCCESS) {
+      if (timestamps[1] > timestamps[0]) {
+        gpu_ms = (timestamps[1] - timestamps[0]) * vk.timestamp_period / 1e6;
+      }
+    }
+  }
+
+  if (has_vertices) {
+    uint8_t* dst = static_cast<uint8_t*>(vk.vertex_map) + (vk.vertex_capacity * frame);
+    memcpy(dst, gpu.vertices.data(), frame_bytes);
+  }
+  if (has_text) {
+    uint8_t* dst = static_cast<uint8_t*>(vk.text_map) + (vk.text_capacity * frame);
+    memcpy(dst, gpu.text_instances.data(), text_bytes);
+  }
 
   uint32_t image_index = 0;
-  vkWaitForFences(vk.device, 1, &vk.in_flight, VK_TRUE, UINT64_MAX);
-  vkResetFences(vk.device, 1, &vk.in_flight);
-
-  if (vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX, vk.image_available,
-                            VK_NULL_HANDLE, &image_index) != VK_SUCCESS) {
+  if (vkAcquireNextImageKHR(vk.device,
+                            vk.swapchain,
+                            UINT64_MAX,
+                            vk.image_available[frame],
+                            VK_NULL_HANDLE,
+                            &image_index) != VK_SUCCESS) {
     return false;
   }
 
-  vkResetCommandBuffer(vk.command_buffer, 0);
+  VkCommandBuffer cmd = vk.command_buffers[frame];
+  vkResetCommandBuffer(cmd, 0);
   VkCommandBufferBeginInfo begin{};
   begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  vkBeginCommandBuffer(vk.command_buffer, &begin);
+  vkBeginCommandBuffer(cmd, &begin);
 
   if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
-    vkCmdResetQueryPool(vk.command_buffer, vk.query_pool, 0, 2);
-    vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        vk.query_pool, 0);
+    const uint32_t query_index = frame * 2;
+    vkCmdResetQueryPool(cmd, vk.query_pool, query_index, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        vk.query_pool, query_index);
+  }
+
+  bool has_3d = false;
+  for (const auto& batch : gpu.batches) {
+    if (batch.use_3d) {
+      has_3d = true;
+      break;
+    }
   }
 
   VkClearValue clear[3]{};
@@ -4765,13 +5648,17 @@ static bool vk_draw_frame(GpuState& gpu) {
 
   VkRenderPassBeginInfo rp{};
   rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-  rp.renderPass = vk.render_pass;
-  rp.framebuffer = vk.framebuffers[image_index];
+  rp.renderPass = has_3d ? vk.render_pass_3d : vk.render_pass_2d;
+  rp.framebuffer = has_3d ? vk.framebuffers_3d[image_index] : vk.framebuffers_2d[image_index];
   rp.renderArea.offset = {0, 0};
   rp.renderArea.extent = vk.extent;
-  rp.clearValueCount = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 2 : 3;
+  if (has_3d) {
+    rp.clearValueCount = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 2 : 3;
+  } else {
+    rp.clearValueCount = (vk.msaa_samples == VK_SAMPLE_COUNT_1_BIT) ? 1 : 2;
+  }
   rp.pClearValues = clear;
-  vkCmdBeginRenderPass(vk.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
   VkViewport viewport{};
   viewport.x = 0.0f;
@@ -4782,12 +5669,14 @@ static bool vk_draw_frame(GpuState& gpu) {
   viewport.maxDepth = 1.0f;
   VkRect2D scissor{};
   scissor.extent = vk.extent;
-  vkCmdSetViewport(vk.command_buffer, 0, 1, &viewport);
-  vkCmdSetScissor(vk.command_buffer, 0, 1, &scissor);
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-  VkBuffer vb = vk.vertex_buffer;
-  VkDeviceSize offsets[] = {0};
-  vkCmdBindVertexBuffers(vk.command_buffer, 0, 1, &vb, offsets);
+  if (has_vertices) {
+    VkBuffer vb = vk.vertex_buffer;
+    VkDeviceSize offsets[] = {static_cast<VkDeviceSize>(vk.vertex_capacity * frame)};
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, offsets);
+  }
 
   float ortho[16];
   mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.physical_width),
@@ -4809,13 +5698,13 @@ static bool vk_draw_frame(GpuState& gpu) {
       desired = batch.line ? vk.pipeline_line_2d : vk.pipeline_tri_2d;
     }
     if (desired != current_pipeline) {
-      vkCmdBindPipeline(vk.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, desired);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, desired);
       current_pipeline = desired;
     }
     const DrawImage* texture = static_cast<const DrawImage*>(batch.texture);
     VkDescriptorSet desc = texture ? texture->vk_desc : VK_NULL_HANDLE;
     if (desc != current_desc) {
-      vkCmdBindDescriptorSets(vk.command_buffer,
+      vkCmdBindDescriptorSets(cmd,
                               VK_PIPELINE_BIND_POINT_GRAPHICS,
                               vk.pipeline_layout,
                               0,
@@ -4829,68 +5718,72 @@ static bool vk_draw_frame(GpuState& gpu) {
       current_3d = batch.use_3d;
     }
     const float* mvp = current_3d ? perspective : ortho;
-    vkCmdPushConstants(vk.command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+    vkCmdPushConstants(cmd, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                        sizeof(float) * 16, mvp);
-    vkCmdDraw(vk.command_buffer, batch.count, 1, batch.first, 0);
+    vkCmdDraw(cmd, batch.count, 1, batch.first, 0);
   }
 
-  vkCmdEndRenderPass(vk.command_buffer);
+  if (has_text && vk.pipeline_text_2d != VK_NULL_HANDLE && gpu.font_image.vk_desc) {
+    VkBuffer tb = vk.text_buffer;
+    VkDeviceSize offsets[] = {static_cast<VkDeviceSize>(vk.text_capacity * frame)};
+    vkCmdBindVertexBuffers(cmd, 0, 1, &tb, offsets);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline_text_2d);
+    VkDescriptorSet desc = gpu.font_image.vk_desc;
+    vkCmdBindDescriptorSets(cmd,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk.pipeline_layout,
+                            0,
+                            1,
+                            &desc,
+                            0,
+                            nullptr);
+    vkCmdPushConstants(cmd, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(float) * 16, ortho);
+    vkCmdDraw(cmd, 6, static_cast<uint32_t>(gpu.text_instances.size()), 0, 0);
+  }
+
+  vkCmdEndRenderPass(cmd);
 
   if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
-    vkCmdWriteTimestamp(vk.command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                        vk.query_pool, 1);
+    const uint32_t query_index = frame * 2 + 1;
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        vk.query_pool, query_index);
   }
-  vkEndCommandBuffer(vk.command_buffer);
+  vkEndCommandBuffer(cmd);
 
   VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   VkSubmitInfo submit{};
   submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit.waitSemaphoreCount = 1;
-  submit.pWaitSemaphores = &vk.image_available;
+  submit.pWaitSemaphores = &vk.image_available[frame];
   submit.pWaitDstStageMask = &wait_stage;
   submit.commandBufferCount = 1;
-  submit.pCommandBuffers = &vk.command_buffer;
+  submit.pCommandBuffers = &cmd;
   submit.signalSemaphoreCount = 1;
-  submit.pSignalSemaphores = &vk.render_finished;
-  vkQueueSubmit(vk.queue, 1, &submit, vk.in_flight);
+  submit.pSignalSemaphores = &vk.render_finished[frame];
+  vkQueueSubmit(vk.queue, 1, &submit, vk.in_flight[frame]);
 
   VkPresentInfoKHR present{};
   present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   present.waitSemaphoreCount = 1;
-  present.pWaitSemaphores = &vk.render_finished;
+  present.pWaitSemaphores = &vk.render_finished[frame];
   present.swapchainCount = 1;
   present.pSwapchains = &vk.swapchain;
   present.pImageIndices = &image_index;
   vkQueuePresentKHR(vk.queue, &present);
 
-  double gpu_ms = 0.0;
-  if (allow_timestamps && vk.supports_timestamps && vk.query_pool) {
-    uint64_t timestamps[2] = {};
-    if (vkGetQueryPoolResults(vk.device,
-                              vk.query_pool,
-                              0,
-                              2,
-                              sizeof(timestamps),
-                              timestamps,
-                              sizeof(uint64_t),
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-      if (timestamps[1] > timestamps[0]) {
-        gpu_ms = (timestamps[1] - timestamps[0]) * vk.timestamp_period / 1e6;
-      }
-    }
-  }
   const uint64_t now = now_ns();
-  if (gpu.log_interval <= 0) {
-    gpu.log_interval = env_int("DRAW_ENGINE_LOG_INTERVAL", 120);
-  }
   if (gpu.last_log_ns == 0) {
     gpu.last_log_ns = now;
   }
-  if (gpu.log_interval > 0 && (gpu.frame_index % static_cast<uint64_t>(gpu.log_interval)) == 0) {
+  if (want_log) {
     fprintf(stderr, "GPU frame: %.3f ms (Vulkan)\n", gpu_ms);
     gpu.last_log_ns = now;
   }
   gpu.frame_index++;
+  if (vk.frame_count > 0) {
+    vk.frame_index = (frame + 1) % vk.frame_count;
+  }
   return true;
 }
 
@@ -4937,7 +5830,7 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
     return false;
   }
 
-  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 4);
+  const int msaa_req = env_int("DRAW_ENGINE_MSAA", 1);
   const EGLint config_attrs_msaa[] = {
       EGL_RED_SIZE, 8,
       EGL_GREEN_SIZE, 8,
@@ -5029,14 +5922,39 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
       "}\n";
   const char* fs_src =
       "#version 300 es\n"
-      "precision mediump float;\n"
+      "precision highp float;\n"
       "in vec2 vUV;\n"
       "in vec4 vColor;\n"
       "uniform sampler2D uTex;\n"
       "out vec4 fragColor;\n"
       "void main(){\n"
-      "  vec4 tex = texture(uTex, vUV);\n"
-      "  fragColor = tex * vColor;\n"
+      "  if (vUV.y > 1.5) {\n"
+      "    vec2 uv = vec2(vUV.x, vUV.y - 2.0);\n"
+      "    vec4 tex = texture(uTex, uv);\n"
+      "    fragColor = tex * vColor;\n"
+      "  } else {\n"
+      "    float sdf = texture(uTex, vUV).a;\n"
+      "    float w = fwidth(sdf);\n"
+      "    float alpha = smoothstep(0.5 - w, 0.5 + w, sdf);\n"
+      "    fragColor = vec4(vColor.rgb, vColor.a * alpha);\n"
+      "  }\n"
+      "}\n";
+  const char* vs_text_src =
+      "#version 300 es\n"
+      "layout(location=0) in vec4 aRect;\n"
+      "layout(location=1) in vec4 aUV;\n"
+      "layout(location=2) in vec4 aColor;\n"
+      "uniform mat4 uMVP;\n"
+      "out vec2 vUV;\n"
+      "out vec4 vColor;\n"
+      "void main(){\n"
+      "  int vid = gl_VertexID;\n"
+      "  int idx = (vid == 0) ? 0 : (vid == 1) ? 1 : (vid == 2) ? 2 : (vid == 3) ? 0 : (vid == 4) ? 2 : 3;\n"
+      "  vec2 corner = (idx == 0) ? vec2(0.0, 0.0) : (idx == 1) ? vec2(1.0, 0.0) : (idx == 2) ? vec2(1.0, 1.0) : vec2(0.0, 1.0);\n"
+      "  vec2 pos = aRect.xy + corner * aRect.zw;\n"
+      "  vUV = mix(aUV.xy, aUV.zw, corner);\n"
+      "  vColor = aColor;\n"
+      "  gl_Position = uMVP * vec4(pos, 0.0, 1.0);\n"
       "}\n";
   GLuint vs = gl_compile(GL_VERTEX_SHADER, vs_src);
   GLuint fs = gl_compile(GL_FRAGMENT_SHADER, fs_src);
@@ -5055,12 +5973,33 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
     return false;
   }
 
+  GLuint vs_text = gl_compile(GL_VERTEX_SHADER, vs_text_src);
+  GLuint fs_text = gl_compile(GL_FRAGMENT_SHADER, fs_src);
+  gl.program_text = glCreateProgram();
+  glAttachShader(gl.program_text, vs_text);
+  glAttachShader(gl.program_text, fs_text);
+  glLinkProgram(gl.program_text);
+  glDeleteShader(vs_text);
+  glDeleteShader(fs_text);
+  glGetProgramiv(gl.program_text, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    char log[512];
+    glGetProgramInfoLog(gl.program_text, sizeof(log), nullptr, log);
+    fprintf(stderr, "GL text program link error: %s\n", log);
+    return false;
+  }
+
   glGenVertexArrays(1, &gl.vao);
   glGenBuffers(1, &gl.vbo);
 
   glBindVertexArray(gl.vao);
   glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(GpuVertex) * 200000, nullptr, GL_DYNAMIC_DRAW);
+  int max_vertices = env_int("DRAW_ENGINE_GL_MAX_VERTICES", 300000);
+  if (max_vertices < 65536) {
+    max_vertices = 65536;
+  }
+  glBufferData(GL_ARRAY_BUFFER, sizeof(GpuVertex) * static_cast<size_t>(max_vertices),
+               nullptr, GL_DYNAMIC_DRAW);
   glEnableVertexAttribArray(0);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GpuVertex),
                         reinterpret_cast<void*>(0));
@@ -5073,6 +6012,32 @@ static bool gl_init_context(GlesContext& gl, ANativeWindow* window) {
 
   gl.u_mvp = glGetUniformLocation(gl.program, "uMVP");
   gl.u_tex = glGetUniformLocation(gl.program, "uTex");
+
+  gl.u_mvp_text = glGetUniformLocation(gl.program_text, "uMVP");
+  gl.u_tex_text = glGetUniformLocation(gl.program_text, "uTex");
+
+  glGenVertexArrays(1, &gl.vao_text);
+  glGenBuffers(1, &gl.vbo_text);
+  glBindVertexArray(gl.vao_text);
+  glBindBuffer(GL_ARRAY_BUFFER, gl.vbo_text);
+  int max_instances = env_int("DRAW_ENGINE_GL_TEXT_INSTANCES", 8192);
+  if (max_instances < 256) {
+    max_instances = 256;
+  }
+  gl.text_buffer_size = sizeof(TextInstance) * static_cast<size_t>(max_instances);
+  glBufferData(GL_ARRAY_BUFFER, gl.text_buffer_size, nullptr, GL_DYNAMIC_DRAW);
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(TextInstance),
+                        reinterpret_cast<void*>(0));
+  glVertexAttribDivisor(0, 1);
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(TextInstance),
+                        reinterpret_cast<void*>(16));
+  glVertexAttribDivisor(1, 1);
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(TextInstance),
+                        reinterpret_cast<void*>(32));
+  glVertexAttribDivisor(2, 1);
 
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -5118,9 +6083,24 @@ static void gl_cleanup(GlesContext& gl) {
   if (!gl.ready) {
     return;
   }
-  glDeleteBuffers(1, &gl.vbo);
-  glDeleteVertexArrays(1, &gl.vao);
-  glDeleteProgram(gl.program);
+  if (gl.vbo) {
+    glDeleteBuffers(1, &gl.vbo);
+  }
+  if (gl.vao) {
+    glDeleteVertexArrays(1, &gl.vao);
+  }
+  if (gl.vbo_text) {
+    glDeleteBuffers(1, &gl.vbo_text);
+  }
+  if (gl.vao_text) {
+    glDeleteVertexArrays(1, &gl.vao_text);
+  }
+  if (gl.program) {
+    glDeleteProgram(gl.program);
+  }
+  if (gl.program_text) {
+    glDeleteProgram(gl.program_text);
+  }
   eglMakeCurrent(gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   if (gl.surface != EGL_NO_SURFACE) {
     eglDestroySurface(gl.display, gl.surface);
@@ -5137,20 +6117,32 @@ static bool gl_draw_frame(GpuState& gpu) {
   if (!gl.ready) {
     return false;
   }
-  if (gpu.vertices.empty()) {
+  const bool has_vertices = !gpu.vertices.empty();
+  const bool has_text = !gpu.text_instances.empty();
+  if (!has_vertices && !has_text) {
     return true;
   }
+  bool has_3d = false;
+  for (const auto& batch : gpu.batches) {
+    if (batch.use_3d) {
+      has_3d = true;
+      break;
+    }
+  }
   const uint64_t start = now_ns();
-  glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-  glBufferSubData(GL_ARRAY_BUFFER, 0, gpu.vertices.size() * sizeof(GpuVertex),
-                  gpu.vertices.data());
+  if (has_vertices) {
+    glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, gpu.vertices.size() * sizeof(GpuVertex),
+                    gpu.vertices.data());
+  }
 
   glViewport(0, 0, gpu.physical_width, gpu.physical_height);
   glClearColor(0, 0, 0, 0);
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-  glUseProgram(gl.program);
-  glBindVertexArray(gl.vao);
+  if (has_3d) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  } else {
+    glClear(GL_COLOR_BUFFER_BIT);
+  }
 
   float ortho[16];
   mat4_ortho(ortho, 0.0f, static_cast<float>(gpu.physical_width),
@@ -5160,20 +6152,44 @@ static bool gl_draw_frame(GpuState& gpu) {
                                            static_cast<float>(gpu.physical_height),
                    0.1f, 100.0f);
 
-  for (const auto& batch : gpu.batches) {
-    const DrawImage* texture = static_cast<const DrawImage*>(batch.texture);
+  if (has_vertices) {
+    glUseProgram(gl.program);
+    glBindVertexArray(gl.vao);
+    for (const auto& batch : gpu.batches) {
+      const DrawImage* texture = static_cast<const DrawImage*>(batch.texture);
+      if (texture && texture->gl_ready) {
+        glBindTexture(GL_TEXTURE_2D, texture->gl_tex);
+      }
+      glUniform1i(gl.u_tex, 0);
+      glUniformMatrix4fv(gl.u_mvp, 1, GL_FALSE, batch.use_3d ? perspective : ortho);
+      if (batch.use_3d) {
+        glEnable(GL_DEPTH_TEST);
+      } else {
+        glDisable(GL_DEPTH_TEST);
+      }
+      GLenum mode = batch.line ? GL_LINES : GL_TRIANGLES;
+      glDrawArrays(mode, batch.first, batch.count);
+    }
+  }
+  if (has_text) {
+    const size_t bytes = gpu.text_instances.size() * sizeof(TextInstance);
+    if (bytes > gl.text_buffer_size) {
+      gl.text_buffer_size = bytes;
+      glBindBuffer(GL_ARRAY_BUFFER, gl.vbo_text);
+      glBufferData(GL_ARRAY_BUFFER, gl.text_buffer_size, nullptr, GL_DYNAMIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, gl.vbo_text);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, gpu.text_instances.data());
+    glUseProgram(gl.program_text);
+    glBindVertexArray(gl.vao_text);
+    const DrawImage* texture = &gpu.font_image;
     if (texture && texture->gl_ready) {
       glBindTexture(GL_TEXTURE_2D, texture->gl_tex);
     }
-    glUniform1i(gl.u_tex, 0);
-    glUniformMatrix4fv(gl.u_mvp, 1, GL_FALSE, batch.use_3d ? perspective : ortho);
-    if (batch.use_3d) {
-      glEnable(GL_DEPTH_TEST);
-    } else {
-      glDisable(GL_DEPTH_TEST);
-    }
-    GLenum mode = batch.line ? GL_LINES : GL_TRIANGLES;
-    glDrawArrays(mode, batch.first, batch.count);
+    glUniform1i(gl.u_tex_text, 0);
+    glUniformMatrix4fv(gl.u_mvp_text, 1, GL_FALSE, ortho);
+    glDisable(GL_DEPTH_TEST);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, static_cast<GLsizei>(gpu.text_instances.size()));
   }
   const int finish = env_int("DRAW_ENGINE_GL_FINISH", 0);
   if (finish != 0) {
@@ -5281,6 +6297,17 @@ static void gpu_refresh_size_and_rotation() {
   static int last_w = 0;
   static int last_h = 0;
   static int last_rot = -1;
+  static uint64_t last_query_ns = 0;
+  const int throttle_ms = env_int("DRAW_ENGINE_ROTATION_THROTTLE_MS", 200);
+  const bool force_update = g_engine.render_size_manual || g_engine.render_scale_manual;
+  if (!force_update && throttle_ms > 0) {
+    const uint64_t now = now_ns();
+    if (last_query_ns != 0 &&
+        (now - last_query_ns) < static_cast<uint64_t>(throttle_ms) * 1000000ull) {
+      return;
+    }
+    last_query_ns = now;
+  }
   int display_rot = 0;
   int display_w = 0;
   int display_h = 0;
@@ -5636,6 +6663,16 @@ static void maybe_recreate_on_rotation() {
   if (env_int("DRAW_ENGINE_RECREATE_ON_ROTATION", 1) == 0) {
     return;
   }
+  static uint64_t last_query_ns = 0;
+  const int throttle_ms = env_int("DRAW_ENGINE_RECREATE_THROTTLE_MS", 200);
+  if (throttle_ms > 0) {
+    const uint64_t now = now_ns();
+    if (last_query_ns != 0 &&
+        (now - last_query_ns) < static_cast<uint64_t>(throttle_ms) * 1000000ull) {
+      return;
+    }
+    last_query_ns = now;
+  }
   static int last_display_rot = INT_MIN;
   int display_rot = 0;
   int display_w = 0;
@@ -5724,6 +6761,17 @@ static bool gpu_init(GpuState& gpu, BackendType backend, ANativeWindow* window, 
   if (!ok) {
     return false;
   }
+  if (backend != BACKEND_CPU && !g_engine.hybrid) {
+    float fps = (g_engine.target_fps > 0) ? static_cast<float>(g_engine.target_fps)
+                                          : query_native_window_refresh_rate(window);
+    if (fps <= 0.0f) {
+      fps = query_choreographer_refresh_rate();
+    }
+    if (fps <= 0.0f) {
+      fps = 60.0f;
+    }
+    apply_window_frame_rate(window, fps);
+  }
   gpu_prepare_texture(gpu, &gpu.white_image);
   gpu_prepare_texture(gpu, &gpu.font_image);
   return true;
@@ -5795,6 +6843,7 @@ int init_draw_engine(int mode) {
   g_engine.auto_fps = 0.0f;
   g_engine.avg_draw_ns = 0.0;
   g_engine.frame_start_ns = 0;
+  init_sleep_bias();
   init_hybrid_policy();
   g_engine.auto_quality = env_int("DRAW_ENGINE_AUTO_QUALITY", 0);
   g_engine.quality_min = env_int("DRAW_ENGINE_QUALITY_MIN", 0);
@@ -5851,8 +6900,12 @@ void draw_engine_set_fps(int fps) {
   if (fps <= 0) {
     g_engine.target_fps = 0;
     g_engine.fps_manual = false;
+    g_engine.sleep_bias_ns = 0;
     if (g_engine.backend != BACKEND_CPU && !g_engine.hybrid) {
       maybe_apply_default_gpu_fps();
+    }
+    if (g_engine.backend != BACKEND_CPU && !g_engine.hybrid) {
+      apply_window_frame_rate(g_gpu.window, static_cast<float>(g_engine.target_fps));
     }
     return;
   }
@@ -5861,6 +6914,10 @@ void draw_engine_set_fps(int fps) {
   }
   g_engine.target_fps = fps;
   g_engine.fps_manual = true;
+  g_engine.sleep_bias_ns = 0;
+  if (g_engine.backend != BACKEND_CPU && !g_engine.hybrid) {
+    apply_window_frame_rate(g_gpu.window, static_cast<float>(g_engine.target_fps));
+  }
 }
 
 void draw_engine_set_hybrid_cpu_mask(uint32_t mask) {
@@ -6250,11 +7307,7 @@ int draw_begin_frame(void) {
   } else {
     gpu_refresh_size_and_rotation();
     gpu_reset_frame(g_gpu);
-    if (g_engine.hybrid && g_engine.overlay_ctx) {
-      if (midraw_lock(g_engine.overlay_ctx) != 0) {
-        return DRAW_ENGINE_EFAILED;
-      }
-    }
+    g_engine.overlay_locked = false;
   }
   g_engine.frame_start_ns = now_ns();
   g_engine.in_frame = true;
@@ -6288,8 +7341,10 @@ void draw_end_frame(void) {
   } else if (g_engine.backend == BACKEND_GLES) {
     gl_draw_frame(g_gpu);
   }
-  if (g_engine.backend != BACKEND_CPU && g_engine.hybrid && g_engine.overlay_ctx) {
+  if (g_engine.backend != BACKEND_CPU && g_engine.hybrid && g_engine.overlay_ctx &&
+      g_engine.overlay_locked) {
     midraw_unlock_post(g_engine.overlay_ctx);
+    g_engine.overlay_locked = false;
   }
   if (g_engine.frame_start_ns != 0) {
     const uint64_t end_ns = now_ns();
@@ -6315,11 +7370,16 @@ void draw_end_frame(void) {
         deadline = end_ns + (target_ns - draw_ns);
       }
       if (deadline > end_ns) {
-        sleep_ns = deadline - end_ns;
-        if (precise_sleep_enabled()) {
-          sleep_until_ns(deadline);
-        } else {
-          usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+        uint64_t adjusted_deadline = apply_sleep_bias(deadline, end_ns);
+        if (adjusted_deadline > end_ns) {
+          sleep_ns = adjusted_deadline - end_ns;
+          if (precise_sleep_enabled()) {
+            sleep_until_ns(adjusted_deadline);
+          } else {
+            usleep(static_cast<useconds_t>(sleep_ns / 1000ull));
+          }
+          const uint64_t woke_ns = now_ns();
+          update_sleep_bias(deadline, woke_ns);
         }
       }
     }
