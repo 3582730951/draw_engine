@@ -115,6 +115,11 @@ int main() {
   if (env_3d && env_3d[0]) {
     enable_3d = atoi(env_3d) != 0;
   }
+  int show_ui = 1;
+  const char* env_ui = getenv("DRAW_ENGINE_SHOW_UI");
+  if (env_ui && env_ui[0]) {
+    show_ui = atoi(env_ui) != 0;
+  }
   int stress_count = 0;
   if (stress > 0) {
     stress_count = (stress > 1) ? stress : 300;
@@ -135,6 +140,10 @@ int main() {
   if (init_draw_windows("SystemProfilerDemo", 1) != 0) {
     fprintf(stderr, "init_draw_windows failed\n");
     return 1;
+  }
+  int touch_ready = 0;
+  if (show_ui) {
+    touch_ready = (draw_ui_touch_open() == 0);
   }
 
   DrawImage* img = draw_load_image_from_memory(kDemoPng, sizeof(kDemoPng));
@@ -160,6 +169,85 @@ int main() {
       draw_text("GPU 2D HUD", 26, 26, w - 16, 72, 0xFF000000);
       draw_text("GPU 2D HUD", 24, 24, w - 16, 72, 0xFFFFFFFF);
       draw_text("TEXT OK", 24, 48, w - 16, 72, 0xFFFFFFFF);
+    }
+
+    static int ui_x = 40;
+    static int ui_y = 120;
+    if (show_ui) {
+      if (touch_ready) {
+        draw_ui_touch_poll();
+      }
+      draw_ui_new_frame();
+      if (draw_ui_begin_window("MiDraw UI", &ui_x, &ui_y, 360, 360,
+                               DRAW_UI_WINDOW_MOVABLE)) {
+        int row_y = 0;
+        draw_ui_text("Immediate UI Window", 0, row_y, 0xFFFFFFFF);
+        row_y += 22;
+
+        static int ui_tab = 0;
+        const char* tabs[] = { "Main", "Render", "Input", "List" };
+        draw_ui_tabs(0, row_y, 300, 26, tabs, 4, &ui_tab);
+        row_y += 34;
+
+        if (ui_tab == 0) {
+          int ui_3d = enable_3d ? 1 : 0;
+          if (draw_ui_checkbox("Enable 3D", 0, row_y, &ui_3d)) {
+            enable_3d = (ui_3d != 0);
+          }
+          row_y += 28;
+
+          int ui_stress = (stress_count > 0) ? 1 : 0;
+          if (draw_ui_checkbox("Stress (300 shapes)", 0, row_y, &ui_stress)) {
+            stress_count = ui_stress ? 300 : 0;
+          }
+          row_y += 32;
+
+          static int ui_sensitive = 0;
+          if (draw_ui_toggle("Sensitive Hint", 0, row_y, &ui_sensitive)) {
+            draw_engine_set_sensitive(ui_sensitive);
+          }
+          row_y += 32;
+        } else if (ui_tab == 1) {
+          if (draw_ui_slider_int("Target FPS", 0, row_y, 240, 30, 240, &fps)) {
+            draw_engine_set_fps(fps);
+          }
+          row_y += 48;
+
+          static float ui_scale = 1.0f;
+          if (draw_ui_slider_float("Render Scale", 0, row_y, 240, 0.5f, 1.0f, &ui_scale)) {
+            draw_set_render_scale(ui_scale);
+          }
+          row_y += 44;
+
+          const float progress = static_cast<float>((frame % 100) + 1) / 100.0f;
+          draw_ui_progress("Frame Progress", 0, row_y, 240, progress);
+          row_y += 28;
+          draw_ui_separator(0, row_y, 240);
+        } else if (ui_tab == 2) {
+          static char ui_text[64] = "Hello";
+          draw_ui_input_text("Text Input", 0, row_y, 240, ui_text, sizeof(ui_text));
+          row_y += 52;
+
+          static int combo_index = 1;
+          const char* combo_items[] = { "Low", "Medium", "High" };
+          draw_ui_combo("Quality", 0, row_y, 200, combo_items, 3, &combo_index);
+        } else if (ui_tab == 3) {
+          static int radio_value = 0;
+          if (draw_ui_radio("CPU Mode", 0, row_y, 0, &radio_value)) {
+            draw_engine_set_option(DRAW_ENGINE_OPT_QUALITY_LEVEL, 0);
+          }
+          row_y += 24;
+          if (draw_ui_radio("GPU Mode", 0, row_y, 1, &radio_value)) {
+            draw_engine_set_option(DRAW_ENGINE_OPT_QUALITY_LEVEL, 2);
+          }
+          row_y += 28;
+
+          static int list_index = 0;
+          const char* list_items[] = { "Circle", "Rect", "Line", "Text" };
+          draw_ui_listbox("Active Tool", 0, row_y, 200, 96, list_items, 4, &list_index);
+        }
+      }
+      draw_ui_end_window();
     }
 
     const int rect_w = (w > 0) ? w / 6 : 0;
@@ -292,6 +380,9 @@ int main() {
   }
 
   draw_free_image(img);
+  if (touch_ready) {
+    draw_ui_touch_close();
+  }
   shutdown_draw_engine();
   return 0;
 }

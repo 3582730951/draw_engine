@@ -4,6 +4,8 @@
 
 #include <android/native_window.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -13,6 +15,13 @@
 #include <unistd.h>
 #include <vector>
 #include <string>
+
+#if defined(__ANDROID__)
+#include <dirent.h>
+#include <jni.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
+#endif
 
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -288,6 +297,1436 @@ static bool has_library(const char* name) {
   }
   dlclose(handle);
   return true;
+}
+
+struct UiInputState {
+  bool down;
+  bool pressed;
+  bool released;
+  bool prev_down;
+  float x;
+  float y;
+};
+
+struct UiState {
+  UiInputState input;
+  DrawUiStyle style;
+  bool style_set;
+  uint32_t hot_id;
+  uint32_t active_id;
+  uint32_t drag_id;
+  float drag_off_x;
+  float drag_off_y;
+  int window_x;
+  int window_y;
+  int window_w;
+  int window_h;
+  int content_x;
+  int content_y;
+  int content_w;
+  int content_h;
+  uint32_t window_id;
+  bool in_window;
+  uint32_t combo_id;
+  bool combo_open;
+  uint32_t text_id;
+  int text_cursor;
+  uint32_t input_chars[64];
+  int input_char_count;
+  bool key_down[DRAW_UI_KEY_MAX + 1];
+  bool key_pressed[DRAW_UI_KEY_MAX + 1];
+};
+
+static UiState g_ui{};
+
+#if defined(__ANDROID__)
+struct UiImeState {
+  JavaVM* vm;
+  jobject context;
+  jobject view;
+  bool ready;
+};
+
+static UiImeState g_ime{};
+#endif
+
+static uint32_t ui_hash(const char* text) {
+  if (!text) {
+    return 0;
+  }
+  uint32_t hash = 2166136261u;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; ++p) {
+    hash ^= static_cast<uint32_t>(*p);
+    hash *= 16777619u;
+  }
+  return hash ? hash : 1u;
+}
+
+static bool ui_point_in_rect(float x, float y, int rx, int ry, int rw, int rh) {
+  return (x >= static_cast<float>(rx) &&
+          y >= static_cast<float>(ry) &&
+          x < static_cast<float>(rx + rw) &&
+          y < static_cast<float>(ry + rh));
+}
+
+static void ui_init_style() {
+  if (g_ui.style_set) {
+    return;
+  }
+  g_ui.style.window_bg = 0xCC1F1F1F;
+  g_ui.style.title_bg = 0xCC2C2C2C;
+  g_ui.style.border = 0xFF000000;
+  g_ui.style.text = 0xFFFFFFFF;
+  g_ui.style.button_bg = 0xFF3A3A3A;
+  g_ui.style.button_hover = 0xFF505050;
+  g_ui.style.button_active = 0xFF2A74FF;
+  g_ui.style.title_height = 36;
+  g_ui.style.padding = 10;
+  g_ui.style.border_size = 1;
+  g_ui.style_set = true;
+}
+
+void draw_ui_set_style(const DrawUiStyle* style) {
+  if (!style) {
+    return;
+  }
+  g_ui.style = *style;
+  g_ui.style_set = true;
+}
+
+void draw_ui_get_style(DrawUiStyle* out_style) {
+  if (!out_style) {
+    return;
+  }
+  ui_init_style();
+  *out_style = g_ui.style;
+}
+
+void draw_ui_set_touch(int down, float x, float y) {
+  g_ui.input.down = (down != 0);
+  g_ui.input.x = x;
+  g_ui.input.y = y;
+}
+
+void draw_ui_new_frame(void) {
+  ui_init_style();
+  g_ui.hot_id = 0;
+  g_ui.input.pressed = (!g_ui.input.prev_down && g_ui.input.down);
+  g_ui.input.released = (g_ui.input.prev_down && !g_ui.input.down);
+  g_ui.input.prev_down = g_ui.input.down;
+  g_ui.in_window = false;
+  g_ui.window_id = 0;
+  g_ui.input_char_count = 0;
+  for (int i = 0; i <= DRAW_UI_KEY_MAX; ++i) {
+    g_ui.key_pressed[i] = false;
+  }
+}
+
+int draw_ui_begin_window(const char* title,
+                         int* x,
+                         int* y,
+                         int w,
+                         int h,
+                         int flags) {
+  if (!g_engine.cpu_ctx || !x || !y || !title || !title[0]) {
+    return 0;
+  }
+  ui_init_style();
+
+  const int screen_w = draw_screen_width();
+  const int screen_h = draw_screen_height();
+  int win_w = (w > 0) ? w : (screen_w > 0 ? screen_w / 2 : 320);
+  int win_h = (h > 0) ? h : (screen_h > 0 ? screen_h / 3 : 200);
+  if (win_w < 160) {
+    win_w = 160;
+  }
+  if (win_h < 120) {
+    win_h = 120;
+  }
+
+  int win_x = *x;
+  int win_y = *y;
+  const int title_h = (flags & DRAW_UI_WINDOW_NO_TITLE) ? 0 : g_ui.style.title_height;
+  const bool movable = (flags & DRAW_UI_WINDOW_MOVABLE) != 0;
+  const uint32_t id = ui_hash(title);
+  if (movable && title_h > 0) {
+    if (g_ui.input.pressed &&
+        ui_point_in_rect(g_ui.input.x, g_ui.input.y, win_x, win_y, win_w, title_h)) {
+      g_ui.drag_id = id;
+      g_ui.active_id = id;
+      g_ui.drag_off_x = g_ui.input.x - static_cast<float>(win_x);
+      g_ui.drag_off_y = g_ui.input.y - static_cast<float>(win_y);
+    }
+    if (g_ui.drag_id == id && g_ui.input.down) {
+      win_x = static_cast<int>(g_ui.input.x - g_ui.drag_off_x + 0.5f);
+      win_y = static_cast<int>(g_ui.input.y - g_ui.drag_off_y + 0.5f);
+      if (screen_w > 0) {
+        if (win_x < 0) {
+          win_x = 0;
+        } else if (win_x + win_w > screen_w) {
+          win_x = screen_w - win_w;
+        }
+      }
+      if (screen_h > 0) {
+        if (win_y < 0) {
+          win_y = 0;
+        } else if (win_y + win_h > screen_h) {
+          win_y = screen_h - win_h;
+        }
+      }
+      *x = win_x;
+      *y = win_y;
+    }
+    if (g_ui.input.released && g_ui.drag_id == id) {
+      g_ui.drag_id = 0;
+      g_ui.active_id = 0;
+    }
+  }
+
+  if ((flags & DRAW_UI_WINDOW_NO_BG) == 0) {
+    draw_rect(win_x, win_y, win_w, win_h, 1, g_ui.style.window_bg);
+  }
+  if (title_h > 0) {
+    draw_rect(win_x, win_y, win_w, title_h, 1, g_ui.style.title_bg);
+  }
+  if ((flags & DRAW_UI_WINDOW_NO_BORDER) == 0) {
+    draw_rect(win_x, win_y, win_w, win_h, 0, g_ui.style.border);
+  }
+  if (title_h > 0 && (flags & DRAW_UI_WINDOW_NO_TITLE) == 0) {
+    const int text_x = win_x + g_ui.style.padding;
+    const int text_y = win_y + (title_h / 2) - 8;
+    draw_text(title, text_x + 1, text_y + 1, win_x + win_w, win_y + title_h,
+              0x80000000);
+    draw_text(title, text_x, text_y, win_x + win_w, win_y + title_h, g_ui.style.text);
+  }
+
+  g_ui.window_x = win_x;
+  g_ui.window_y = win_y;
+  g_ui.window_w = win_w;
+  g_ui.window_h = win_h;
+  g_ui.content_x = win_x + g_ui.style.padding;
+  g_ui.content_y = win_y + title_h + g_ui.style.padding;
+  g_ui.content_w = win_w - g_ui.style.padding * 2;
+  g_ui.content_h = win_h - title_h - g_ui.style.padding * 2;
+  g_ui.window_id = id;
+  g_ui.in_window = true;
+  return 1;
+}
+
+void draw_ui_end_window(void) {
+  g_ui.in_window = false;
+  g_ui.window_id = 0;
+}
+
+int draw_ui_button(const char* label, int x, int y, int w, int h) {
+  if (!g_engine.cpu_ctx || !label || !label[0]) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  int bx = base_x + x;
+  int by = base_y + y;
+  if (w <= 0) {
+    w = 100;
+  }
+  if (h <= 0) {
+    h = 30;
+  }
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, h);
+  if (hovered) {
+    g_ui.hot_id = id;
+  }
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  bool clicked = false;
+  if (g_ui.input.released && g_ui.active_id == id) {
+    clicked = hovered;
+    g_ui.active_id = 0;
+  }
+
+  uint32_t color = g_ui.style.button_bg;
+  if (g_ui.active_id == id && g_ui.input.down) {
+    color = g_ui.style.button_active;
+  } else if (hovered) {
+    color = g_ui.style.button_hover;
+  }
+  draw_rect(bx, by, w, h, 1, color);
+  draw_rect(bx, by, w, h, 0, g_ui.style.border);
+  const int text_x = bx + g_ui.style.padding;
+  const int text_y = by + (h / 2) - 8;
+  draw_text(label, text_x, text_y, bx + w - g_ui.style.padding, by + h,
+            g_ui.style.text);
+  return clicked ? 1 : 0;
+}
+
+void draw_ui_text(const char* text, int x, int y, uint32_t color) {
+  if (!g_engine.cpu_ctx || !text) {
+    return;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  int clip_x1 = base_x + x + (g_ui.in_window ? g_ui.content_w : 2048);
+  int clip_y1 = base_y + y + (g_ui.in_window ? g_ui.content_h : 2048);
+  draw_text(text, base_x + x, base_y + y, clip_x1, clip_y1, color);
+}
+
+void draw_ui_input_char(uint32_t codepoint) {
+  if (g_ui.input_char_count >= static_cast<int>(sizeof(g_ui.input_chars) /
+                                                sizeof(g_ui.input_chars[0]))) {
+    return;
+  }
+  g_ui.input_chars[g_ui.input_char_count++] = codepoint;
+}
+
+void draw_ui_input_key(int key, int down) {
+  if (key <= 0 || key > DRAW_UI_KEY_MAX) {
+    return;
+  }
+  const bool is_down = (down != 0);
+  if (is_down && !g_ui.key_down[key]) {
+    g_ui.key_pressed[key] = true;
+  }
+  g_ui.key_down[key] = is_down;
+}
+
+static float ui_clampf(float v, float lo, float hi) {
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+static int ui_utf8_encode(uint32_t codepoint, char* out, int out_size) {
+  if (!out || out_size < 4) {
+    return 0;
+  }
+  if (codepoint <= 0x7Fu) {
+    out[0] = static_cast<char>(codepoint);
+    return 1;
+  }
+  if (codepoint <= 0x7FFu) {
+    out[0] = static_cast<char>(0xC0u | ((codepoint >> 6) & 0x1Fu));
+    out[1] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    return 2;
+  }
+  if (codepoint <= 0xFFFFu) {
+    out[0] = static_cast<char>(0xE0u | ((codepoint >> 12) & 0x0Fu));
+    out[1] = static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu));
+    out[2] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    return 3;
+  }
+  if (codepoint <= 0x10FFFFu) {
+    out[0] = static_cast<char>(0xF0u | ((codepoint >> 18) & 0x07u));
+    out[1] = static_cast<char>(0x80u | ((codepoint >> 12) & 0x3Fu));
+    out[2] = static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu));
+    out[3] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    return 4;
+  }
+  return 0;
+}
+
+static int ui_utf8_prev(const char* text, int pos) {
+  if (!text || pos <= 0) {
+    return 0;
+  }
+  int i = pos - 1;
+  while (i > 0 && (static_cast<unsigned char>(text[i]) & 0xC0u) == 0x80u) {
+    --i;
+  }
+  return i;
+}
+
+static int ui_utf8_next(const char* text, int len, int pos) {
+  if (!text || pos >= len) {
+    return len;
+  }
+  int i = pos + 1;
+  while (i < len && (static_cast<unsigned char>(text[i]) & 0xC0u) == 0x80u) {
+    ++i;
+  }
+  return i;
+}
+
+static int ui_utf8_count(const char* text, int bytes) {
+  if (!text || bytes <= 0) {
+    return 0;
+  }
+  int count = 0;
+  for (int i = 0; i < bytes; ++i) {
+    if ((static_cast<unsigned char>(text[i]) & 0xC0u) != 0x80u) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+static void ui_clear_input_events() {
+  g_ui.input_char_count = 0;
+  for (int i = 0; i <= DRAW_UI_KEY_MAX; ++i) {
+    g_ui.key_pressed[i] = false;
+  }
+}
+
+#if defined(__ANDROID__)
+static JNIEnv* ui_ime_get_env(bool* out_attached) {
+  if (out_attached) {
+    *out_attached = false;
+  }
+  if (!g_ime.vm) {
+    return nullptr;
+  }
+  JNIEnv* env = nullptr;
+  const jint res = g_ime.vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (res == JNI_OK && env) {
+    return env;
+  }
+  if (g_ime.vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+    if (out_attached) {
+      *out_attached = true;
+    }
+    return env;
+  }
+  return nullptr;
+}
+
+static void ui_ime_detach(bool attached) {
+  if (attached && g_ime.vm) {
+    g_ime.vm->DetachCurrentThread();
+  }
+}
+
+static void ui_ime_request(bool show) {
+  if (!g_ime.ready) {
+    return;
+  }
+  draw_ui_ime_show(show ? 1 : 0);
+}
+#endif
+
+int draw_ui_input_text(const char* label,
+                       int x,
+                       int y,
+                       int w,
+                       char* buffer,
+                       int buffer_size) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !buffer || buffer_size <= 1) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 60) {
+    w = 200;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int field_y = label_y + 18;
+  const int field_h = 26;
+  const int bx = base_x + x;
+  const int by = field_y;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, field_h);
+  if (g_ui.input.pressed && hovered) {
+    if (g_ui.text_id != id) {
+      g_ui.text_id = id;
+      g_ui.text_cursor = static_cast<int>(strlen(buffer));
+#if defined(__ANDROID__)
+      ui_ime_request(true);
+#endif
+    }
+  } else if (g_ui.input.pressed && g_ui.text_id == id && !hovered) {
+    g_ui.text_id = 0;
+#if defined(__ANDROID__)
+    ui_ime_request(false);
+#endif
+  }
+
+  bool changed = false;
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+  const bool active = (g_ui.text_id == id);
+  const uint32_t bg = active ? g_ui.style.button_hover : g_ui.style.button_bg;
+  draw_rect(bx, by, w, field_h, 1, bg);
+  draw_rect(bx, by, w, field_h, 0, g_ui.style.border);
+  draw_text(buffer,
+            bx + g_ui.style.padding,
+            by + 4,
+            bx + w - g_ui.style.padding,
+            by + field_h,
+            g_ui.style.text);
+
+  int len = static_cast<int>(strlen(buffer));
+  if (g_ui.text_cursor > len) {
+    g_ui.text_cursor = len;
+  }
+  if (active) {
+    if (g_ui.key_pressed[DRAW_UI_KEY_LEFT]) {
+      g_ui.text_cursor = ui_utf8_prev(buffer, g_ui.text_cursor);
+    } else if (g_ui.key_pressed[DRAW_UI_KEY_RIGHT]) {
+      g_ui.text_cursor = ui_utf8_next(buffer, len, g_ui.text_cursor);
+    }
+    if (g_ui.key_pressed[DRAW_UI_KEY_HOME]) {
+      g_ui.text_cursor = 0;
+    } else if (g_ui.key_pressed[DRAW_UI_KEY_END]) {
+      g_ui.text_cursor = len;
+    }
+    if (g_ui.key_pressed[DRAW_UI_KEY_BACKSPACE] && g_ui.text_cursor > 0) {
+      const int prev = ui_utf8_prev(buffer, g_ui.text_cursor);
+      memmove(buffer + prev, buffer + g_ui.text_cursor, len - g_ui.text_cursor + 1);
+      g_ui.text_cursor = prev;
+      len = static_cast<int>(strlen(buffer));
+      changed = true;
+    }
+    if (g_ui.key_pressed[DRAW_UI_KEY_DELETE] && g_ui.text_cursor < len) {
+      const int next = ui_utf8_next(buffer, len, g_ui.text_cursor);
+      memmove(buffer + g_ui.text_cursor, buffer + next, len - next + 1);
+      len = static_cast<int>(strlen(buffer));
+      changed = true;
+    }
+    if (g_ui.input_char_count > 0) {
+      for (int i = 0; i < g_ui.input_char_count; ++i) {
+        const uint32_t cp = g_ui.input_chars[i];
+        if (cp == 0 || cp == '\n' || cp == '\r' || cp == '\t') {
+          continue;
+        }
+        char tmp[4];
+        const int add = ui_utf8_encode(cp, tmp, static_cast<int>(sizeof(tmp)));
+        if (add <= 0) {
+          continue;
+        }
+        if (len + add >= buffer_size) {
+          continue;
+        }
+        memmove(buffer + g_ui.text_cursor + add,
+                buffer + g_ui.text_cursor,
+                len - g_ui.text_cursor + 1);
+        memcpy(buffer + g_ui.text_cursor, tmp, static_cast<size_t>(add));
+        g_ui.text_cursor += add;
+        len += add;
+        changed = true;
+      }
+    }
+    const int caret_chars = ui_utf8_count(buffer, g_ui.text_cursor);
+    const int caret_x = bx + g_ui.style.padding + caret_chars * 8;
+    draw_line(caret_x, by + 4, caret_x, by + field_h - 4, g_ui.style.text);
+  }
+  return changed ? 1 : 0;
+}
+
+int draw_ui_radio(const char* label, int x, int y, int value, int* current) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !current) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int radius = 9;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int hit_w = radius * 2 + 6;
+  const int hit_h = radius * 2 + 6;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8)) ^
+      static_cast<uint32_t>(value);
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, hit_w, hit_h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  int changed = 0;
+  if (g_ui.input.released && g_ui.active_id == id) {
+    if (hovered && *current != value) {
+      *current = value;
+      changed = 1;
+    }
+    g_ui.active_id = 0;
+  }
+  const int cx = bx + radius + 2;
+  const int cy = by + radius + 2;
+  draw_circle(cx, cy, radius, g_ui.style.border);
+  if (*current == value) {
+    for (int r = radius - 3; r > 0; --r) {
+      draw_circle(cx, cy, r, g_ui.style.button_active);
+    }
+  }
+  draw_text(label,
+            bx + hit_w + g_ui.style.padding,
+            by + 2,
+            bx + hit_w + 320,
+            by + hit_h,
+            g_ui.style.text);
+  return changed;
+}
+
+int draw_ui_listbox(const char* label,
+                    int x,
+                    int y,
+                    int w,
+                    int h,
+                    const char* const* items,
+                    int item_count,
+                    int* current) {
+  if (!g_engine.cpu_ctx || !label || !items || item_count <= 0 || !current) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 60) {
+    w = 200;
+  }
+  const int item_h = 22;
+  if (h <= 0) {
+    h = item_h * item_count + 6;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int list_y = label_y + 18;
+  const int bx = base_x + x;
+  const int by = list_y;
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+  draw_rect(bx, by, w, h, 1, g_ui.style.window_bg);
+  draw_rect(bx, by, w, h, 0, g_ui.style.border);
+
+  int changed = 0;
+  int y_cursor = by + 3;
+  for (int i = 0; i < item_count; ++i) {
+    const int item_y = y_cursor + i * item_h;
+    const bool hovered =
+        ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx + 2, item_y, w - 4, item_h);
+    const uint32_t id =
+        ui_hash(items[i]) ^ (g_ui.window_id * 16777619u) ^
+        static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8)) ^
+        static_cast<uint32_t>(i);
+    if (g_ui.input.pressed && hovered) {
+      g_ui.active_id = id;
+    }
+    if (g_ui.input.released && g_ui.active_id == id) {
+      if (hovered && *current != i) {
+        *current = i;
+        changed = 1;
+      }
+      g_ui.active_id = 0;
+    }
+    uint32_t color = g_ui.style.button_bg;
+    if (*current == i) {
+      color = g_ui.style.button_active;
+    } else if (hovered) {
+      color = g_ui.style.button_hover;
+    }
+    draw_rect(bx + 2, item_y, w - 4, item_h - 1, 1, color);
+    draw_text(items[i] ? items[i] : "",
+              bx + g_ui.style.padding,
+              item_y + 3,
+              bx + w - g_ui.style.padding,
+              item_y + item_h,
+              g_ui.style.text);
+  }
+  return changed;
+}
+
+int draw_ui_combo(const char* label,
+                  int x,
+                  int y,
+                  int w,
+                  const char* const* items,
+                  int item_count,
+                  int* current) {
+  if (!g_engine.cpu_ctx || !label || !items || item_count <= 0 || !current) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 60) {
+    w = 200;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int box_y = label_y + 18;
+  const int box_h = 26;
+  const int bx = base_x + x;
+  const int by = box_y;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, box_h);
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+
+  if (g_ui.input.pressed && hovered) {
+    if (g_ui.combo_open && g_ui.combo_id == id) {
+      g_ui.combo_open = false;
+      g_ui.combo_id = 0;
+    } else {
+      g_ui.combo_open = true;
+      g_ui.combo_id = id;
+    }
+  }
+
+  draw_rect(bx, by, w, box_h, 1, g_ui.style.button_bg);
+  draw_rect(bx, by, w, box_h, 0, g_ui.style.border);
+  const int cur_index = (*current >= 0 && *current < item_count) ? *current : 0;
+  const char* cur_label = items[cur_index] ? items[cur_index] : "";
+  draw_text(cur_label,
+            bx + g_ui.style.padding,
+            by + 4,
+            bx + w - g_ui.style.padding,
+            by + box_h,
+            g_ui.style.text);
+  draw_text("v",
+            bx + w - g_ui.style.padding - 8,
+            by + 4,
+            bx + w,
+            by + box_h,
+            g_ui.style.text);
+
+  int changed = 0;
+  if (g_ui.combo_open && g_ui.combo_id == id) {
+    const int item_h = 22;
+    const int list_h = item_h * item_count + 6;
+    const int list_x = bx;
+    const int list_y = by + box_h + 4;
+    draw_rect(list_x, list_y, w, list_h, 1, g_ui.style.window_bg);
+    draw_rect(list_x, list_y, w, list_h, 0, g_ui.style.border);
+    for (int i = 0; i < item_count; ++i) {
+      const int item_y = list_y + 3 + i * item_h;
+      const bool item_hover =
+          ui_point_in_rect(g_ui.input.x, g_ui.input.y, list_x + 2, item_y, w - 4, item_h);
+      const uint32_t item_id = id ^ static_cast<uint32_t>(i + 1);
+      if (g_ui.input.pressed && item_hover) {
+        g_ui.active_id = item_id;
+      }
+      if (g_ui.input.released && g_ui.active_id == item_id) {
+        if (item_hover && *current != i) {
+          *current = i;
+          changed = 1;
+        }
+        g_ui.active_id = 0;
+        g_ui.combo_open = false;
+        g_ui.combo_id = 0;
+      }
+      uint32_t color = g_ui.style.button_bg;
+      if (*current == i) {
+        color = g_ui.style.button_active;
+      } else if (item_hover) {
+        color = g_ui.style.button_hover;
+      }
+      draw_rect(list_x + 2, item_y, w - 4, item_h - 1, 1, color);
+      draw_text(items[i] ? items[i] : "",
+                list_x + g_ui.style.padding,
+                item_y + 3,
+                list_x + w - g_ui.style.padding,
+                item_y + item_h,
+                g_ui.style.text);
+    }
+    if (g_ui.input.pressed) {
+      const bool in_box = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, box_h);
+      const bool in_list =
+          ui_point_in_rect(g_ui.input.x, g_ui.input.y, list_x, list_y, w, list_h);
+      if (!in_box && !in_list) {
+        g_ui.combo_open = false;
+        g_ui.combo_id = 0;
+      }
+    }
+  }
+  return changed;
+}
+
+int draw_ui_tabs(int x,
+                 int y,
+                 int w,
+                 int h,
+                 const char* const* labels,
+                 int label_count,
+                 int* current) {
+  if (!g_engine.cpu_ctx || !labels || label_count <= 0 || !current) {
+    return 0;
+  }
+  ui_init_style();
+  if (h <= 0) {
+    h = 26;
+  }
+  if (w <= 0) {
+    w = label_count * 90;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  int tab_w = w / label_count;
+  if (tab_w < 60) {
+    tab_w = 60;
+  }
+  int changed = 0;
+  for (int i = 0; i < label_count; ++i) {
+    const int tx = bx + i * tab_w;
+    const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, tx, by, tab_w, h);
+    const uint32_t id =
+        ui_hash(labels[i] ? labels[i] : "") ^ (g_ui.window_id * 16777619u) ^
+        static_cast<uint32_t>(i);
+    if (g_ui.input.pressed && hovered) {
+      g_ui.active_id = id;
+    }
+    if (g_ui.input.released && g_ui.active_id == id) {
+      if (hovered && *current != i) {
+        *current = i;
+        changed = 1;
+      }
+      g_ui.active_id = 0;
+    }
+    uint32_t color = g_ui.style.button_bg;
+    if (*current == i) {
+      color = g_ui.style.button_active;
+    } else if (hovered) {
+      color = g_ui.style.button_hover;
+    }
+    draw_rect(tx, by, tab_w, h, 1, color);
+    draw_rect(tx, by, tab_w, h, 0, g_ui.style.border);
+    draw_text(labels[i] ? labels[i] : "",
+              tx + g_ui.style.padding,
+              by + 4,
+              tx + tab_w - g_ui.style.padding,
+              by + h,
+              g_ui.style.text);
+  }
+  return changed;
+}
+
+int draw_ui_checkbox(const char* label, int x, int y, int* value) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !value) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int box = 20;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, box, box);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  int toggled = 0;
+  if (g_ui.input.released && g_ui.active_id == id) {
+    if (hovered) {
+      *value = (*value == 0) ? 1 : 0;
+      toggled = 1;
+    }
+    g_ui.active_id = 0;
+  }
+  draw_rect(bx, by, box, box, 1, g_ui.style.button_bg);
+  draw_rect(bx, by, box, box, 0, g_ui.style.border);
+  if (*value) {
+    draw_rect(bx + 4, by + 4, box - 8, box - 8, 1, g_ui.style.button_active);
+  }
+  draw_text(label,
+            bx + box + g_ui.style.padding,
+            by + 2,
+            bx + box + 320,
+            by + box,
+            g_ui.style.text);
+  return toggled;
+}
+
+static float ui_calc_slider_t(int bx, int w) {
+  if (w <= 1) {
+    return 0.0f;
+  }
+  const float t = (g_ui.input.x - static_cast<float>(bx)) / static_cast<float>(w);
+  return ui_clampf(t, 0.0f, 1.0f);
+}
+
+int draw_ui_slider_int(const char* label,
+                       int x,
+                       int y,
+                       int w,
+                       int min_value,
+                       int max_value,
+                       int* value) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !value) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 40) {
+    w = 160;
+  }
+  if (min_value > max_value) {
+    const int tmp = min_value;
+    min_value = max_value;
+    max_value = tmp;
+  }
+  if (*value < min_value) {
+    *value = min_value;
+  } else if (*value > max_value) {
+    *value = max_value;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int slider_y = label_y + 18;
+  const int slider_h = 20;
+  const int bx = base_x + x;
+  const int by = slider_y;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, slider_h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  bool changed = false;
+  if (g_ui.active_id == id && g_ui.input.down) {
+    const float t = ui_calc_slider_t(bx, w);
+    const int new_value =
+        min_value + static_cast<int>((max_value - min_value) * t + 0.5f);
+    if (new_value != *value) {
+      *value = new_value;
+      changed = true;
+    }
+  }
+  if (g_ui.input.released && g_ui.active_id == id) {
+    g_ui.active_id = 0;
+  }
+
+  const float t = (max_value == min_value)
+                      ? 0.0f
+                      : (static_cast<float>(*value - min_value) /
+                         static_cast<float>(max_value - min_value));
+  const int fill_w = static_cast<int>(static_cast<float>(w) * t + 0.5f);
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+  draw_rect(bx, by, w, slider_h, 1, g_ui.style.button_bg);
+  draw_rect(bx, by, fill_w, slider_h, 1, g_ui.style.button_active);
+  draw_rect(bx, by, w, slider_h, 0, g_ui.style.border);
+  const int knob_w = 10;
+  int knob_x = bx + fill_w - knob_w / 2;
+  if (knob_x < bx) {
+    knob_x = bx;
+  } else if (knob_x + knob_w > bx + w) {
+    knob_x = bx + w - knob_w;
+  }
+  draw_rect(knob_x, by - 2, knob_w, slider_h + 4, 1, g_ui.style.button_hover);
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%d", *value);
+  draw_text(buf, bx + w - 48, by + 2, bx + w, by + slider_h, g_ui.style.text);
+  return changed ? 1 : 0;
+}
+
+int draw_ui_slider_float(const char* label,
+                         int x,
+                         int y,
+                         int w,
+                         float min_value,
+                         float max_value,
+                         float* value) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !value) {
+    return 0;
+  }
+  ui_init_style();
+  if (w <= 40) {
+    w = 160;
+  }
+  if (min_value > max_value) {
+    const float tmp = min_value;
+    min_value = max_value;
+    max_value = tmp;
+  }
+  if (*value < min_value) {
+    *value = min_value;
+  } else if (*value > max_value) {
+    *value = max_value;
+  }
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int label_x = base_x + x;
+  const int label_y = base_y + y;
+  const int slider_y = label_y + 18;
+  const int slider_h = 20;
+  const int bx = base_x + x;
+  const int by = slider_y;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, slider_h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  bool changed = false;
+  if (g_ui.active_id == id && g_ui.input.down) {
+    const float t = ui_calc_slider_t(bx, w);
+    const float new_value = min_value + (max_value - min_value) * t;
+    if (fabsf(new_value - *value) > 0.0001f) {
+      *value = new_value;
+      changed = true;
+    }
+  }
+  if (g_ui.input.released && g_ui.active_id == id) {
+    g_ui.active_id = 0;
+  }
+
+  const float t = (max_value == min_value)
+                      ? 0.0f
+                      : ((*value - min_value) / (max_value - min_value));
+  const int fill_w = static_cast<int>(static_cast<float>(w) * t + 0.5f);
+  draw_text(label, label_x, label_y, label_x + w, label_y + 16, g_ui.style.text);
+  draw_rect(bx, by, w, slider_h, 1, g_ui.style.button_bg);
+  draw_rect(bx, by, fill_w, slider_h, 1, g_ui.style.button_active);
+  draw_rect(bx, by, w, slider_h, 0, g_ui.style.border);
+  const int knob_w = 10;
+  int knob_x = bx + fill_w - knob_w / 2;
+  if (knob_x < bx) {
+    knob_x = bx;
+  } else if (knob_x + knob_w > bx + w) {
+    knob_x = bx + w - knob_w;
+  }
+  draw_rect(knob_x, by - 2, knob_w, slider_h + 4, 1, g_ui.style.button_hover);
+
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.2f", *value);
+  draw_text(buf, bx + w - 64, by + 2, bx + w, by + slider_h, g_ui.style.text);
+  return changed ? 1 : 0;
+}
+
+int draw_ui_toggle(const char* label, int x, int y, int* value) {
+  if (!g_engine.cpu_ctx || !label || !label[0] || !value) {
+    return 0;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int w = 52;
+  const int h = 24;
+  const uint32_t id =
+      ui_hash(label) ^ (g_ui.window_id * 16777619u) ^
+      static_cast<uint32_t>((x & 0xFF) | ((y & 0xFF) << 8));
+  const bool hovered = ui_point_in_rect(g_ui.input.x, g_ui.input.y, bx, by, w, h);
+  if (g_ui.input.pressed && hovered) {
+    g_ui.active_id = id;
+  }
+  int toggled = 0;
+  if (g_ui.input.released && g_ui.active_id == id) {
+    if (hovered) {
+      *value = (*value == 0) ? 1 : 0;
+      toggled = 1;
+    }
+    g_ui.active_id = 0;
+  }
+  const uint32_t bg = (*value != 0) ? g_ui.style.button_active : g_ui.style.button_bg;
+  draw_rect(bx, by, w, h, 1, bg);
+  draw_rect(bx, by, w, h, 0, g_ui.style.border);
+  const int knob = h - 6;
+  int knob_x = (*value != 0) ? (bx + w - knob - 3) : (bx + 3);
+  draw_rect(knob_x, by + 3, knob, knob, 1, g_ui.style.button_hover);
+  draw_text(label,
+            bx + w + g_ui.style.padding,
+            by + 2,
+            bx + w + 320,
+            by + h,
+            g_ui.style.text);
+  return toggled;
+}
+
+void draw_ui_progress(const char* label, int x, int y, int w, float value) {
+  if (!g_engine.cpu_ctx || !label) {
+    return;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  if (w <= 40) {
+    w = 200;
+  }
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  const int h = 18;
+  float v = ui_clampf(value, 0.0f, 1.0f);
+  const int fill_w = static_cast<int>(static_cast<float>(w) * v + 0.5f);
+  draw_text(label, bx, by - 16, bx + w, by, g_ui.style.text);
+  draw_rect(bx, by, w, h, 1, g_ui.style.button_bg);
+  draw_rect(bx, by, fill_w, h, 1, g_ui.style.button_active);
+  draw_rect(bx, by, w, h, 0, g_ui.style.border);
+}
+
+void draw_ui_separator(int x, int y, int w) {
+  if (!g_engine.cpu_ctx) {
+    return;
+  }
+  ui_init_style();
+  int base_x = g_ui.in_window ? g_ui.content_x : 0;
+  int base_y = g_ui.in_window ? g_ui.content_y : 0;
+  if (w <= 0) {
+    w = g_ui.in_window ? g_ui.content_w : 200;
+  }
+  const int bx = base_x + x;
+  const int by = base_y + y;
+  draw_line(bx, by, bx + w, by, g_ui.style.border);
+}
+
+#if defined(__ANDROID__)
+struct TouchReader {
+  int fd;
+  int max_x;
+  int max_y;
+  int slot;
+  bool down;
+  int raw_x;
+  int raw_y;
+};
+
+static TouchReader g_touch_reader{ -1, 0, 0, 0, false, 0, 0 };
+
+static bool test_abs_code(int fd, int code) {
+  unsigned long bits[(ABS_MAX + 1 + (sizeof(unsigned long) * 8 - 1)) /
+                     (sizeof(unsigned long) * 8)] = {};
+  const int res = ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(bits)), bits);
+  if (res < 0) {
+    return false;
+  }
+  const unsigned int idx = static_cast<unsigned int>(code) /
+                           (sizeof(unsigned long) * 8);
+  const unsigned int bit = static_cast<unsigned int>(code) %
+                           (sizeof(unsigned long) * 8);
+  return (bits[idx] & (1ul << bit)) != 0;
+}
+
+static bool open_touch_device(const char* path, TouchReader* out_reader) {
+  if (!path || !out_reader) {
+    return false;
+  }
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) {
+    return false;
+  }
+  if (!test_abs_code(fd, ABS_MT_POSITION_X) ||
+      !test_abs_code(fd, ABS_MT_POSITION_Y) ||
+      !test_abs_code(fd, ABS_MT_TRACKING_ID)) {
+    close(fd);
+    return false;
+  }
+  input_absinfo abs_x{};
+  input_absinfo abs_y{};
+  if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &abs_x) != 0 ||
+      ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &abs_y) != 0) {
+    close(fd);
+    return false;
+  }
+  out_reader->fd = fd;
+  out_reader->max_x = abs_x.maximum > 0 ? abs_x.maximum : 1;
+  out_reader->max_y = abs_y.maximum > 0 ? abs_y.maximum : 1;
+  out_reader->slot = 0;
+  out_reader->down = false;
+  out_reader->raw_x = 0;
+  out_reader->raw_y = 0;
+  return true;
+}
+
+static bool map_touch_to_logical(int raw_x,
+                                 int raw_y,
+                                 int max_x,
+                                 int max_y,
+                                 float* out_x,
+                                 float* out_y) {
+  const int logical_w = draw_screen_width();
+  const int logical_h = draw_screen_height();
+  if (logical_w <= 0 || logical_h <= 0 || max_x <= 0 || max_y <= 0) {
+    return false;
+  }
+  int phys_w = logical_w;
+  int phys_h = logical_h;
+  if (g_engine.rotation == 90 || g_engine.rotation == 270) {
+    phys_w = logical_h;
+    phys_h = logical_w;
+  }
+  const float sx = static_cast<float>(raw_x) / static_cast<float>(max_x);
+  const float sy = static_cast<float>(raw_y) / static_cast<float>(max_y);
+  float px = sx * static_cast<float>(phys_w);
+  float py = sy * static_cast<float>(phys_h);
+  float lx = px;
+  float ly = py;
+  switch (g_engine.rotation) {
+    case 90:
+      lx = py;
+      ly = static_cast<float>(phys_w) - 1.0f - px;
+      break;
+    case 180:
+      lx = static_cast<float>(phys_w) - 1.0f - px;
+      ly = static_cast<float>(phys_h) - 1.0f - py;
+      break;
+    case 270:
+      lx = static_cast<float>(phys_h) - 1.0f - py;
+      ly = px;
+      break;
+    default:
+      break;
+  }
+  if (lx < 0.0f) {
+    lx = 0.0f;
+  }
+  if (ly < 0.0f) {
+    ly = 0.0f;
+  }
+  if (lx > static_cast<float>(logical_w - 1)) {
+    lx = static_cast<float>(logical_w - 1);
+  }
+  if (ly > static_cast<float>(logical_h - 1)) {
+    ly = static_cast<float>(logical_h - 1);
+  }
+  *out_x = lx;
+  *out_y = ly;
+  return true;
+}
+#endif
+
+int draw_ui_touch_open(void) {
+#if !defined(__ANDROID__)
+  return DRAW_ENGINE_EFAILED;
+#else
+  if (g_touch_reader.fd >= 0) {
+    return DRAW_ENGINE_OK;
+  }
+  const char* env = getenv("DRAW_UI_TOUCH_EVENT");
+  if (env && env[0]) {
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/input/event%d", atoi(env));
+    if (open_touch_device(path, &g_touch_reader)) {
+      return DRAW_ENGINE_OK;
+    }
+  }
+  DIR* dir = opendir("/dev/input");
+  if (!dir) {
+    return DRAW_ENGINE_EFAILED;
+  }
+  dirent* ent = nullptr;
+  while ((ent = readdir(dir)) != nullptr) {
+    if (strncmp(ent->d_name, "event", 5) != 0) {
+      continue;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+    if (open_touch_device(path, &g_touch_reader)) {
+      closedir(dir);
+      return DRAW_ENGINE_OK;
+    }
+  }
+  closedir(dir);
+  return DRAW_ENGINE_EFAILED;
+#endif
+}
+
+void draw_ui_touch_close(void) {
+#if defined(__ANDROID__)
+  if (g_touch_reader.fd >= 0) {
+    close(g_touch_reader.fd);
+    g_touch_reader.fd = -1;
+  }
+#endif
+}
+
+int draw_ui_touch_poll(void) {
+#if !defined(__ANDROID__)
+  return DRAW_ENGINE_EFAILED;
+#else
+  if (g_touch_reader.fd < 0) {
+    return DRAW_ENGINE_ENOTINIT;
+  }
+  input_event events[32];
+  const ssize_t n = read(g_touch_reader.fd, events, sizeof(events));
+  if (n <= 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 0;
+    }
+    return DRAW_ENGINE_EFAILED;
+  }
+  if (n % static_cast<ssize_t>(sizeof(input_event)) != 0) {
+    return 0;
+  }
+  bool updated = false;
+  const size_t count = static_cast<size_t>(n) / sizeof(input_event);
+  for (size_t i = 0; i < count; ++i) {
+    const input_event& ev = events[i];
+    if (ev.type == EV_ABS) {
+      if (ev.code == ABS_MT_SLOT) {
+        g_touch_reader.slot = ev.value;
+      } else if (ev.code == ABS_MT_TRACKING_ID) {
+        if (g_touch_reader.slot == 0) {
+          g_touch_reader.down = (ev.value != -1);
+          updated = true;
+        }
+      } else if (ev.code == ABS_MT_POSITION_X) {
+        if (g_touch_reader.slot == 0) {
+          g_touch_reader.raw_x = ev.value;
+          updated = true;
+        }
+      } else if (ev.code == ABS_MT_POSITION_Y) {
+        if (g_touch_reader.slot == 0) {
+          g_touch_reader.raw_y = ev.value;
+          updated = true;
+        }
+      }
+    } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+      g_touch_reader.down = (ev.value != 0);
+      updated = true;
+    }
+  }
+  if (!updated) {
+    return 0;
+  }
+  float lx = 0.0f;
+  float ly = 0.0f;
+  if (!map_touch_to_logical(g_touch_reader.raw_x,
+                            g_touch_reader.raw_y,
+                            g_touch_reader.max_x,
+                            g_touch_reader.max_y,
+                            &lx,
+                            &ly)) {
+    return DRAW_ENGINE_EFAILED;
+  }
+  draw_ui_set_touch(g_touch_reader.down ? 1 : 0, lx, ly);
+  return 1;
+#endif
+}
+
+int draw_ui_ime_set_context(const DrawUiImeConfig* config) {
+#if !defined(__ANDROID__)
+  (void)config;
+  return DRAW_ENGINE_EFAILED;
+#else
+  if (!config || !config->java_vm || !config->context) {
+    return DRAW_ENGINE_EINVAL;
+  }
+  JavaVM* vm = reinterpret_cast<JavaVM*>(config->java_vm);
+  JNIEnv* env = reinterpret_cast<JNIEnv*>(config->jni_env);
+  bool attached = false;
+  if (!env) {
+    env = ui_ime_get_env(&attached);
+  }
+  if (!env) {
+    return DRAW_ENGINE_EFAILED;
+  }
+  if (g_ime.context) {
+    env->DeleteGlobalRef(g_ime.context);
+    g_ime.context = nullptr;
+  }
+  if (g_ime.view) {
+    env->DeleteGlobalRef(g_ime.view);
+    g_ime.view = nullptr;
+  }
+  g_ime.context = env->NewGlobalRef(reinterpret_cast<jobject>(config->context));
+  if (config->view) {
+    g_ime.view = env->NewGlobalRef(reinterpret_cast<jobject>(config->view));
+  }
+  g_ime.vm = vm;
+  g_ime.ready = (g_ime.context != nullptr);
+  ui_ime_detach(attached);
+  return g_ime.ready ? DRAW_ENGINE_OK : DRAW_ENGINE_EFAILED;
+#endif
+}
+
+int draw_ui_ime_show(int show) {
+#if !defined(__ANDROID__)
+  (void)show;
+  return DRAW_ENGINE_EFAILED;
+#else
+  if (!g_ime.ready || !g_ime.vm || !g_ime.context) {
+    return DRAW_ENGINE_ENOTINIT;
+  }
+  bool attached = false;
+  JNIEnv* env = ui_ime_get_env(&attached);
+  if (!env) {
+    return DRAW_ENGINE_EFAILED;
+  }
+  jclass context_cls = env->GetObjectClass(g_ime.context);
+  if (!context_cls) {
+    ui_ime_detach(attached);
+    return DRAW_ENGINE_EFAILED;
+  }
+  jmethodID get_service =
+      env->GetMethodID(context_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+  if (!get_service) {
+    env->DeleteLocalRef(context_cls);
+    ui_ime_detach(attached);
+    return DRAW_ENGINE_EFAILED;
+  }
+  jstring service_name = env->NewStringUTF("input_method");
+  jobject imm = env->CallObjectMethod(g_ime.context, get_service, service_name);
+  env->DeleteLocalRef(service_name);
+  env->DeleteLocalRef(context_cls);
+  if (!imm) {
+    ui_ime_detach(attached);
+    return DRAW_ENGINE_EFAILED;
+  }
+  jclass imm_cls = env->GetObjectClass(imm);
+  if (!imm_cls) {
+    env->DeleteLocalRef(imm);
+    ui_ime_detach(attached);
+    return DRAW_ENGINE_EFAILED;
+  }
+
+  if (show) {
+    if (g_ime.view) {
+      jmethodID show_soft_input =
+          env->GetMethodID(imm_cls, "showSoftInput", "(Landroid/view/View;I)Z");
+      if (show_soft_input) {
+        env->CallBooleanMethod(imm, show_soft_input, g_ime.view, 0);
+      }
+    } else {
+      jmethodID toggle =
+          env->GetMethodID(imm_cls, "toggleSoftInput", "(II)V");
+      if (toggle) {
+        env->CallVoidMethod(imm, toggle, 2, 0);
+      }
+    }
+  } else {
+    if (g_ime.view) {
+      jclass view_cls = env->GetObjectClass(g_ime.view);
+      if (view_cls) {
+        jmethodID get_token =
+            env->GetMethodID(view_cls, "getWindowToken", "()Landroid/os/IBinder;");
+        jobject token = nullptr;
+        if (get_token) {
+          token = env->CallObjectMethod(g_ime.view, get_token);
+        }
+        jmethodID hide_soft_input =
+            env->GetMethodID(imm_cls, "hideSoftInputFromWindow",
+                             "(Landroid/os/IBinder;I)Z");
+        if (hide_soft_input && token) {
+          env->CallBooleanMethod(imm, hide_soft_input, token, 0);
+        }
+        if (token) {
+          env->DeleteLocalRef(token);
+        }
+        env->DeleteLocalRef(view_cls);
+      }
+    } else {
+      jmethodID toggle =
+          env->GetMethodID(imm_cls, "toggleSoftInput", "(II)V");
+      if (toggle) {
+        env->CallVoidMethod(imm, toggle, 0, 0);
+      }
+    }
+  }
+
+  env->DeleteLocalRef(imm_cls);
+  env->DeleteLocalRef(imm);
+  ui_ime_detach(attached);
+  return DRAW_ENGINE_OK;
+#endif
 }
 
 static BackendType choose_best_backend() {
@@ -896,6 +2335,13 @@ static inline uint32_t color_to_rgba(uint32_t argb) {
          (static_cast<uint32_t>(b) << 16) |
          (static_cast<uint32_t>(g) << 8) |
          static_cast<uint32_t>(r);
+}
+
+uint32_t draw_color_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+  return (static_cast<uint32_t>(a) << 24) |
+         (static_cast<uint32_t>(r) << 16) |
+         (static_cast<uint32_t>(g) << 8) |
+         static_cast<uint32_t>(b);
 }
 
 static void mat4_identity(float* out) {

@@ -117,6 +117,76 @@ target_link_libraries(app PRIVATE midraw dl log)
   - 获取设备/后端能力。
 - `bool get_mode_is_need_set_fps(void)`
   - 自动模式下是否建议设置 fps。
+- `uint32_t draw_color_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a)`
+  - 生成引擎使用的颜色值（格式为 0xAARRGGBB）。
+  - 常用颜色可直接用 `DRAW_COLOR_*` 宏。
+
+### UI 窗口（类似 ImGui 的轻量立即模式）
+用于在透明画布上快速构建调试/控制窗口。所有 UI 绘制仍复用 `draw_*`，不引入新的渲染路径。
+
+使用要点：
+1) 在每帧 `draw_begin_frame()` 之后调用 `draw_ui_new_frame()`。
+2) 通过 `draw_ui_set_touch()` 提供触摸坐标（逻辑坐标），或使用可选触摸 helper。
+3) `draw_ui_begin_window()` / `draw_ui_end_window()` 包裹窗口内容。
+4) `draw_ui_button()` / `draw_ui_text()` 的坐标是相对于窗口内容区左上角。
+5) 若使用 `draw_ui_input_text()`，请先注入按键/字符（`draw_ui_input_key()` / `draw_ui_input_char()`），建议在 `draw_ui_new_frame()` 之后调用。
+6) 需要软键盘时，可配置 IME 上下文（见下方 `draw_ui_ime_*`）。
+
+API：
+- `void draw_ui_set_style(const DrawUiStyle* style)` / `void draw_ui_get_style(DrawUiStyle* out_style)`
+  - 设置/获取 UI 颜色与尺寸风格。
+- `void draw_ui_set_touch(int down, float x, float y)`
+  - 注入触摸状态（x/y 为逻辑坐标，down=1 表示按下）。
+- `void draw_ui_new_frame(void)`
+  - 每帧开始时调用，更新 UI 输入状态。
+- `int draw_ui_begin_window(const char* title, int* x, int* y, int w, int h, int flags)`
+  - 绘制窗口并处理拖拽，`x/y` 会在拖动时被更新。
+  - `flags`：`DRAW_UI_WINDOW_MOVABLE` / `DRAW_UI_WINDOW_NO_TITLE` / `DRAW_UI_WINDOW_NO_BORDER` / `DRAW_UI_WINDOW_NO_BG`。
+- `void draw_ui_end_window(void)`
+  - 结束窗口。
+- `int draw_ui_button(const char* label, int x, int y, int w, int h)`
+  - 绘制按钮并返回点击（1=点击）。
+- `void draw_ui_text(const char* text, int x, int y, uint32_t color)`
+  - 绘制文本。
+- `int draw_ui_radio(const char* label, int x, int y, int value, int* current)`
+  - 单选按钮，点击后把 `current` 设为 `value`。
+- `int draw_ui_listbox(const char* label, int x, int y, int w, int h, const char* const* items, int item_count, int* current)`
+  - 列表选择框。
+- `int draw_ui_combo(const char* label, int x, int y, int w, const char* const* items, int item_count, int* current)`
+  - 下拉选择框。
+- `int draw_ui_tabs(int x, int y, int w, int h, const char* const* labels, int label_count, int* current)`
+  - 标签页切换。
+- `int draw_ui_checkbox(const char* label, int x, int y, int* value)`
+  - 绘制复选框，点击切换 `value`（1=选中）。
+- `int draw_ui_slider_int(const char* label, int x, int y, int w, int min_value, int max_value, int* value)`
+  - 整数滑条，拖动更新 `value`。
+- `int draw_ui_slider_float(const char* label, int x, int y, int w, float min_value, float max_value, float* value)`
+  - 浮点滑条，拖动更新 `value`。
+- `int draw_ui_toggle(const char* label, int x, int y, int* value)`
+  - 开关控件（开关样式），点击切换 `value`。
+- `void draw_ui_progress(const char* label, int x, int y, int w, float value)`
+  - 进度条，`value` 为 0~1。
+- `void draw_ui_separator(int x, int y, int w)`
+  - 分割线。
+- `void draw_ui_input_char(uint32_t codepoint)` / `void draw_ui_input_key(int key, int down)`
+  - 注入字符与按键事件（参考 ImGui 输入队列风格）。
+  - 常用按键常量：`DRAW_UI_KEY_BACKSPACE` / `DRAW_UI_KEY_ENTER` / `DRAW_UI_KEY_LEFT` /
+    `DRAW_UI_KEY_RIGHT` / `DRAW_UI_KEY_HOME` / `DRAW_UI_KEY_END` / `DRAW_UI_KEY_DELETE` /
+    `DRAW_UI_KEY_TAB` / `DRAW_UI_KEY_ESCAPE`。
+- `int draw_ui_input_text(const char* label, int x, int y, int w, char* buffer, int buffer_size)`
+  - 文本输入框，返回 1 表示内容变更。
+- `int draw_ui_ime_set_context(const DrawUiImeConfig* config)`
+  - 设置 IME 上下文（`java_vm`/`context` 必填，`view` 可选）。
+- `int draw_ui_ime_show(int show)`
+  - 显示/隐藏软键盘；当 `draw_ui_input_text()` 获得焦点时会自动尝试显示（若已设置 IME）。
+
+可选触摸 helper（仅 Android，纯只读 /dev/input，不创建虚拟设备、不注入触摸）：
+- `int draw_ui_touch_open(void)`
+  - 打开触摸设备；可用环境变量 `DRAW_UI_TOUCH_EVENT` 指定 event 编号。
+- `int draw_ui_touch_poll(void)`
+  - 轮询触摸并自动调用 `draw_ui_set_touch()`，返回 1 表示状态更新。
+- `void draw_ui_touch_close(void)`
+  - 关闭触摸设备。
 
 ## 5. 低层 API（Midraw）
 
