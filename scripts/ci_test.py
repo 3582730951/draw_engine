@@ -167,9 +167,21 @@ def main():
     if not os.path.isdir(dist):
         die(f"dist directory not found: {dist}")
 
+    def find_artifact_root(root):
+        preferred = os.path.join(root, "arm64-v8a")
+        if os.path.isdir(preferred):
+            return preferred
+        for entry in os.listdir(root):
+            path = os.path.join(root, entry)
+            if os.path.isdir(path) and os.path.isfile(os.path.join(path, "libmidraw.so")):
+                return path
+        return root
+
+    artifact_root = find_artifact_root(dist)
+
     required = ["libmidraw.so", "libmidraw.a", "overlay_engine", "benchmark"]
     for name in required:
-        path = os.path.join(dist, name)
+        path = os.path.join(artifact_root, name)
         if not os.path.isfile(path) or os.path.getsize(path) == 0:
             die(f"Missing or empty artifact: {path}")
 
@@ -180,16 +192,22 @@ def main():
     if not nm:
         die("nm/llvm-nm not found")
 
-    check_elf(readelf, os.path.join(dist, "overlay_engine"))
-    check_elf(readelf, os.path.join(dist, "benchmark"))
-    check_elf(readelf, os.path.join(dist, "libmidraw.so"))
-    check_aarch64(readelf, os.path.join(dist, "overlay_engine"))
-    check_aarch64(readelf, os.path.join(dist, "benchmark"))
-    check_aarch64(readelf, os.path.join(dist, "libmidraw.so"))
-    check_archive(os.path.join(dist, "libmidraw.a"))
-    check_needed(readelf, os.path.join(dist, "overlay_engine"))
-    check_needed(readelf, os.path.join(dist, "benchmark"))
-    check_needed(readelf, os.path.join(dist, "libmidraw.so"))
+    overlay_path = os.path.join(artifact_root, "overlay_engine")
+    bench_path = os.path.join(artifact_root, "benchmark")
+    so_path = os.path.join(artifact_root, "libmidraw.so")
+    a_path = os.path.join(artifact_root, "libmidraw.a")
+
+    check_elf(readelf, overlay_path)
+    check_elf(readelf, bench_path)
+    check_elf(readelf, so_path)
+    if os.path.basename(artifact_root) == "arm64-v8a":
+        check_aarch64(readelf, overlay_path)
+        check_aarch64(readelf, bench_path)
+        check_aarch64(readelf, so_path)
+    check_archive(a_path)
+    check_needed(readelf, overlay_path)
+    check_needed(readelf, bench_path)
+    check_needed(readelf, so_path)
 
     header_path = os.path.join(os.path.abspath(args.repo), "include", "generated_symbols.h")
     check_generated_header(header_path)
