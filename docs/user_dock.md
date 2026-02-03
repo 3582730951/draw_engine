@@ -188,6 +188,47 @@ API：
 - `void draw_ui_touch_close(void)`
   - 关闭触摸设备。
 
+#### IME 备用接入示例（显示软键盘）
+> 说明：本接口只负责显示/隐藏软键盘，**文本字符仍需由你们在 Java 层获取并转发到 `draw_ui_input_char()`**。
+
+Java/Kotlin 侧：
+```java
+// Java
+public native void nativeSetImeContext(Context context, View view);
+
+@Override
+protected void onCreate(Bundle savedInstanceState) {
+  super.onCreate(savedInstanceState);
+  SurfaceView sv = new SurfaceView(this);
+  setContentView(sv);
+  nativeSetImeContext(this, sv);
+}
+```
+
+JNI 侧：
+```c
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_app_NativeBridge_nativeSetImeContext(JNIEnv* env,
+                                                      jobject thiz,
+                                                      jobject context,
+                                                      jobject view) {
+  JavaVM* vm = nullptr;
+  env->GetJavaVM(&vm);
+  DrawUiImeConfig cfg{};
+  cfg.java_vm = vm;
+  cfg.jni_env = env;
+  cfg.context = context;
+  cfg.view = view; // 可为空，但有 view 更稳定
+  draw_ui_ime_set_context(&cfg);
+}
+```
+
+在输入框获得焦点时引擎会自动尝试 `draw_ui_ime_show(1)`；必要时可手动调用：
+```c
+draw_ui_ime_show(1); // 显示
+draw_ui_ime_show(0); // 隐藏
+```
+
 ## 5. 低层 API（Midraw）
 
 适合需要直接控制 CPU 绘制的场景。
